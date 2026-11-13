@@ -38,3 +38,6 @@ eng.traineddata
 *.bak
 *.bak-*
 *.bak2-*
+
+# foliome fork
+__pycache__/
