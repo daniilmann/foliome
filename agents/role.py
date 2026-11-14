@@ -11,8 +11,8 @@
                         — запустить роль: Claude — `claude -p --agent foliome-<код>` из корня репозитория (файлы ролей
                           основной ветки), рабочая папка задачи — --cd; Codex — `codex exec` с моделью, effort, песочницей
                           и инструкциями флагами, без коннекторов ChatGPT. В журнал: запрос и ответ дословно, запрошенная
-                          и фактическая модель, SHA и файлы до и после. Фактическая модель не та или роль Codex породила
-                          субагента — код выхода 3.
+                          и фактическая модель, SHA и файлы до и после. Фактическая модель не та или есть находка
+                          (субагент, коннекторы, правка папки проверяющей ролью, корень Codex не найден) — код выхода 3.
   state --cd DIR        — отпечаток рабочей папки (HEAD и хеш изменений): O сверяет его до и после проверяющей роли.
   log --journal J --kind K --role CODE (--text T | --text-file F)
                         — записать в журнал решение оркестратора, вывод проверок или заметку.
@@ -357,14 +357,18 @@ def cmd_run(a):
         findings.append(f"в сессии роли коннекторы ChatGPT или MCP: {ctx.get('mcp_calls') or 'выданы'} (ADR-022 п. 6)")
     if role.get("review") and touched:
         findings.append("проверяющая роль изменила рабочую папку (ADR-022 п. 7)")
+    if side == "codex" and ctx.get("error"):  # без корня субагентов и коннекторы не проверить
+        findings.append(f"{ctx['error']} — проверка субагентов и коннекторов не проведена (ADR-022 п. 7)")
+    mismatch = ctx.get("model") != model or (side == "codex" and ctx.get("effort") != effort)
+    # находка и чужая модель важнее кода выхода роли: иначе их можно принять за «поставщик недоступен»
+    wrapper_exit = 3 if findings or mismatch else r.returncode
     append(a.journal, {
         "ts": started, "kind": "call", "role": code, "side": side, "agent": role["agent"], "user": me,
         "requested": {"model": model, "effort": effort, "sandbox": sandbox}, "actual": ctx,
         "reason": a.reason, "cwd": cwd, "before": before, "after": after, "changed_files": changed,
         "reviewer_touched_files": touched if role.get("review") else None, "findings": findings,
-        "exit": r.returncode, "prompt": prompt, "response": response,
+        "exit": r.returncode, "wrapper_exit": wrapper_exit, "prompt": prompt, "response": response,
     })
-    mismatch = ctx.get("model") != model or (side == "codex" and ctx.get("effort") != effort)
     print(f"роль {code} ({side}): {ctx.get('model')} / {ctx.get('effort')}; exit {r.returncode}; ответ — {out}")
     if mismatch:
         print(f"ВНИМАНИЕ: запрошено {model}/{effort}, фактически {ctx.get('model')}/{ctx.get('effort')} "
@@ -373,8 +377,7 @@ def cmd_run(a):
         print(f"ВНИМАНИЕ: {f} — это находка", file=sys.stderr)
     if r.returncode != 0:
         print(r.stderr[-2000:], file=sys.stderr)
-    # находка важнее кода выхода роли: иначе её можно принять за «поставщик недоступен»
-    sys.exit(3 if findings else (r.returncode or (3 if mismatch else 0)))
+    sys.exit(wrapper_exit)
 
 
 def cmd_state(a):
