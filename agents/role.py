@@ -10,8 +10,9 @@
            [--claude-unavailable | --codex-unavailable]
                         — запустить роль: Claude — `claude -p --agent foliome-<код>` из корня репозитория (файлы ролей
                           основной ветки), рабочая папка задачи — --cd; Codex — `codex exec` с моделью, effort, песочницей
-                          и инструкциями флагами. В журнал: запрос и ответ дословно, запрошенная и фактическая модель,
-                          SHA и файлы до и после. Фактическая модель не та — код выхода 3.
+                          и инструкциями флагами, без коннекторов ChatGPT. В журнал: запрос и ответ дословно, запрошенная
+                          и фактическая модель, SHA и файлы до и после. Фактическая модель не та или роль Codex породила
+                          субагента — код выхода 3.
   state --cd DIR        — отпечаток рабочей папки (HEAD и хеш изменений): O сверяет его до и после проверяющей роли.
   log --journal J --kind K --role CODE (--text T | --text-file F)
                         — записать в журнал решение оркестратора, вывод проверок или заметку.
@@ -185,26 +186,32 @@ def rollouts():
 
 
 def codex_context(new_files, cwd):
-    """Фактические модель, effort, песочница — из единственной новой сессии Codex с этой рабочей папкой."""
-    found = []
+    """Фактические модель, effort, песочница — из единственной новой корневой сессии Codex с этой рабочей папкой.
+    Новые сессии субагентов — списком subagents: ADR-022 п. 9 их запрещает, а флагами Codex 0.167 они не выключаются
+    (каталог моделей сервера задаёт multi_agent_version v2)."""
+    found, subagents = [], []
     for f in new_files:
-        ctx = None
+        ctx, sub = None, None
         for line in open(f, encoding="utf-8"):
             try:
                 o = json.loads(line)
             except ValueError:
                 continue
             p = o.get("payload") or {}
-            if o.get("type") == "turn_context" and ctx is None:
+            if o.get("type") == "session_meta" and sub is None:  # первая — своя; у субагента дальше идёт и родительская
+                sub = p.get("thread_source") == "subagent" or (isinstance(p.get("source"), dict) and "subagent" in p["source"])
+            elif o.get("type") == "turn_context" and ctx is None:
                 ctx = {"model": p.get("model"), "effort": p.get("effort"), "cwd": p.get("cwd"),
                        "sandbox": (p.get("sandbox_policy") or {}).get("type"), "rollout": f, "tokens": None}
             elif ctx and isinstance(p, dict) and p.get("type") == "token_count" and p.get("info"):
                 ctx["tokens"] = p["info"].get("total_token_usage")
-        if ctx and ctx["cwd"] == cwd:
+        if sub:
+            subagents.append(f)
+        elif ctx and ctx["cwd"] == cwd:
             found.append(ctx)
     if len(found) == 1:
-        return found[0]
-    return {"model": None, "effort": None, "sandbox": None, "rollout": None, "tokens": None,
+        return dict(found[0], subagents=subagents)
+    return {"model": None, "effort": None, "sandbox": None, "rollout": None, "tokens": None, "subagents": subagents,
             "error": f"новых сессий Codex с этой папкой: {len(found)}"}
 
 
@@ -213,7 +220,8 @@ def run_codex(role, code, model, effort, sandbox, prompt, cwd, out):
     if not os.path.exists(path):
         die(f"нет {os.path.relpath(path, ROOT)}: выполните build")
     di = open(path, encoding="utf-8").read() + "\n\n" + COMMON + f"\n\n## Оговорка роли {code}\n\n" + role["overlay"] + "\n"
-    cmd = ["codex", "exec", "--disable", "multi_agent", "-m", model, "-c", f'model_reasoning_effort="{effort}"',
+    # --disable apps: без коннекторов учётки ChatGPT (ADR-022 п. 6)
+    cmd = ["codex", "exec", "--disable", "multi_agent", "--disable", "apps", "-m", model, "-c", f'model_reasoning_effort="{effort}"',
            "-s", sandbox, "-c", "developer_instructions=" + json.dumps(di, ensure_ascii=False),
            "-C", cwd, "--skip-git-repo-check", "-o", out, "-"]
     before = rollouts()
@@ -303,15 +311,18 @@ def cmd_run(a):
         "exit": r.returncode, "prompt": prompt, "response": response,
     })
     mismatch = ctx.get("model") != model or (side == "codex" and ctx.get("effort") != effort)
+    spawned = bool(ctx.get("subagents"))
     print(f"роль {code} ({side}): {ctx.get('model')} / {ctx.get('effort')}; exit {r.returncode}; ответ — {out}")
     if mismatch:
         print(f"ВНИМАНИЕ: запрошено {model}/{effort}, фактически {ctx.get('model')}/{ctx.get('effort')} "
               f"{ctx.get('error', '')}", file=sys.stderr)
+    if spawned:
+        print(f"ВНИМАНИЕ: роль породила субагентов ({len(ctx['subagents'])}) — это находка (ADR-022 п. 9)", file=sys.stderr)
     if role.get("review") and touched:
         print("ВНИМАНИЕ: проверяющая роль изменила рабочую папку — это находка (ADR-022 п. 7)", file=sys.stderr)
     if r.returncode != 0:
         print(r.stderr[-2000:], file=sys.stderr)
-    sys.exit(r.returncode or (3 if mismatch or (role.get("review") and touched) else 0))
+    sys.exit(r.returncode or (3 if mismatch or spawned or (role.get("review") and touched) else 0))
 
 
 def cmd_state(a):
