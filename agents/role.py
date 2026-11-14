@@ -11,8 +11,10 @@
                         — запустить роль: Claude — `claude -p --agent foliome-<код>` из корня репозитория (файлы ролей
                           основной ветки), рабочая папка задачи — --cd; Codex — `codex exec` с моделью, effort, песочницей
                           и инструкциями флагами, без коннекторов ChatGPT. В журнал: запрос и ответ дословно, запрошенная
-                          и фактическая модель, SHA и файлы до и после. Фактическая модель не та или есть находка
-                          (субагент, коннекторы, правка папки проверяющей ролью, корень Codex не найден) — код выхода 3.
+                          и фактическая модель, SHA и файлы до и после. Фактическая модель или effort не те или есть
+                          находка (субагент, коннекторы, правка папки проверяющей ролью, корень Codex не найден) — код
+                          выхода 3. Поставщик недоступен (роль упала, модели и новых сессий нет) — код роли и
+                          unavailable в журнале.
   state --cd DIR        — отпечаток рабочей папки (HEAD и хеш изменений): O сверяет его до и после проверяющей роли.
   log --journal J --kind K --role CODE (--text T | --text-file F)
                         — записать в журнал решение оркестратора, вывод проверок или заметку.
@@ -357,17 +359,20 @@ def cmd_run(a):
         findings.append(f"в сессии роли коннекторы ChatGPT или MCP: {ctx.get('mcp_calls') or 'выданы'} (ADR-022 п. 6)")
     if role.get("review") and touched:
         findings.append("проверяющая роль изменила рабочую папку (ADR-022 п. 7)")
-    if side == "codex" and ctx.get("error"):  # без корня субагентов и коннекторы не проверить
+    # поставщик недоступен: роль упала, модели нет и ни одной новой сессии — код роли, O переходит по ADR-022 п. 8
+    unavailable = (r.returncode != 0 and ctx.get("model") is None
+                   and not ctx.get("subagents") and not ctx.get("other_sessions"))
+    if side == "codex" and ctx.get("error") and not unavailable:  # без корня субагентов и коннекторы не проверить
         findings.append(f"{ctx['error']} — проверка субагентов и коннекторов не проведена (ADR-022 п. 7)")
     mismatch = ctx.get("model") != model or (side == "codex" and ctx.get("effort") != effort)
     # находка и чужая модель важнее кода выхода роли: иначе их можно принять за «поставщик недоступен»
-    wrapper_exit = 3 if findings or mismatch else r.returncode
+    wrapper_exit = 3 if findings or (mismatch and not unavailable) else r.returncode
     append(a.journal, {
         "ts": started, "kind": "call", "role": code, "side": side, "agent": role["agent"], "user": me,
         "requested": {"model": model, "effort": effort, "sandbox": sandbox}, "actual": ctx,
         "reason": a.reason, "cwd": cwd, "before": before, "after": after, "changed_files": changed,
         "reviewer_touched_files": touched if role.get("review") else None, "findings": findings,
-        "exit": r.returncode, "wrapper_exit": wrapper_exit, "prompt": prompt, "response": response,
+        "unavailable": unavailable, "exit": r.returncode, "wrapper_exit": wrapper_exit, "prompt": prompt, "response": response,
     })
     print(f"роль {code} ({side}): {ctx.get('model')} / {ctx.get('effort')}; exit {r.returncode}; ответ — {out}")
     if mismatch:
