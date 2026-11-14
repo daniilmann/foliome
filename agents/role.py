@@ -32,6 +32,7 @@ CLAUDE_PLUGINS = os.path.expanduser("~/.claude/plugins/cache")
 CODEX_HOME = os.path.expanduser("~/.codex")
 READ_TOOLS = ["Read", "Grep", "Glob"]
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+SPAWN_TOOLS = {"Agent", "Task"}  # субагенты не порождают субагентов (ADR-022 п. 9)
 CODEX_ADAPTER = ("You are the agent below, adapted as a Codex role. Treat Claude Code tool names as capability hints; "
                  "use only tools available in this Codex session.\n\n")
 
@@ -110,7 +111,7 @@ def build_claude(code, role, agent, model, review, suffix=""):
     src = claude_def_path(agent)
     fm, body = split_frontmatter(open(src, encoding="utf-8").read())
     base = parse_tools(fm.get("tools"))
-    tools = base + [t for t in role.get("tools_add", []) if t not in base]
+    tools = [t for t in base + [t for t in role.get("tools_add", []) if t not in base] if t not in SPAWN_TOOLS]
     if review:
         tools = [t for t in tools if t not in WRITE_TOOLS] or list(READ_TOOLS)
     name = f"{PREFIX}{code.lower()}{suffix}"
@@ -185,34 +186,77 @@ def rollouts():
     return set(glob.glob(os.path.join(CODEX_HOME, "sessions", "*", "*", "*", "rollout-*.jsonl")))
 
 
-def codex_context(new_files, cwd):
-    """Фактические модель, effort, песочница — из единственной новой корневой сессии Codex с этой рабочей папкой.
-    Новые сессии субагентов — списком subagents: ADR-022 п. 9 их запрещает, а флагами Codex 0.167 они не выключаются
-    (каталог моделей сервера задаёт multi_agent_version v2)."""
-    found, subagents = [], []
-    for f in new_files:
-        ctx, sub = None, None
-        for line in open(f, encoding="utf-8"):
-            try:
-                o = json.loads(line)
-            except ValueError:
-                continue
-            p = o.get("payload") or {}
-            if o.get("type") == "session_meta" and sub is None:  # первая — своя; у субагента дальше идёт и родительская
-                sub = p.get("thread_source") == "subagent" or (isinstance(p.get("source"), dict) and "subagent" in p["source"])
-            elif o.get("type") == "turn_context" and ctx is None:
-                ctx = {"model": p.get("model"), "effort": p.get("effort"), "cwd": p.get("cwd"),
-                       "sandbox": (p.get("sandbox_policy") or {}).get("type"), "rollout": f, "tokens": None}
-            elif ctx and isinstance(p, dict) and p.get("type") == "token_count" and p.get("info"):
-                ctx["tokens"] = p["info"].get("total_token_usage")
-        if sub:
-            subagents.append(f)
-        elif ctx and ctx["cwd"] == cwd:
-            found.append(ctx)
-    if len(found) == 1:
-        return dict(found[0], subagents=subagents)
-    return {"model": None, "effort": None, "sandbox": None, "rollout": None, "tokens": None, "subagents": subagents,
-            "error": f"новых сессий Codex с этой папкой: {len(found)}"}
+def read_session(f):
+    """Файл сессии Codex: своя (первая) session_meta — у субагента дальше идёт и родительская, первый turn_context,
+    токены, имена вызванных инструментов и есть ли коннекторы ChatGPT среди выданных инструментов."""
+    s = {"rollout": f, "id": None, "cwd": None, "cli_version": None, "source": None, "subagent": False, "parent": None,
+         "model": None, "effort": None, "sandbox": None, "tokens": None, "calls": [], "connectors": False}
+    meta = turn = False
+    try:
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                p = o.get("payload") if isinstance(o, dict) else None
+                if not isinstance(p, dict):
+                    continue
+                if o.get("type") == "world_state" or p.get("role") == "developer":  # инструменты выдаёт сам Codex
+                    s["connectors"] = s["connectors"] or "mcp__codex_apps" in line
+                if o.get("type") == "session_meta" and not meta:
+                    meta = True
+                    src = p.get("source")
+                    sub = src.get("subagent") if isinstance(src, dict) else None
+                    spawn = sub.get("thread_spawn") if isinstance(sub, dict) else None
+                    s.update(id=p.get("id"), cwd=p.get("cwd"), cli_version=p.get("cli_version"), source=src,
+                             subagent=sub is not None or p.get("thread_source") == "subagent",
+                             parent=spawn.get("parent_thread_id") if isinstance(spawn, dict) else None)
+                elif o.get("type") == "turn_context" and not turn:
+                    turn = True
+                    s.update(model=p.get("model"), effort=p.get("effort"),
+                             sandbox=(p.get("sandbox_policy") or {}).get("type"))
+                elif p.get("type") == "token_count" and p.get("info"):
+                    s["tokens"] = p["info"].get("total_token_usage")
+                elif p.get("type") == "function_call":
+                    s["calls"].append(p.get("name"))
+    except OSError as e:  # файл удалён или недоступен — в журнал, а не падение до записи
+        s["error"] = str(e)
+    return s
+
+
+def codex_context(new_files, cwd, root_id):
+    """Фактические модель, effort, песочница — из корневой сессии запуска: по id из вывода codex exec, иначе единственная
+    новая не-субагентская сессия с этой папкой. Потомки корня по parent_thread_id (и вложенные) — subagents: ADR-022 п. 9
+    их запрещает, а флагами Codex 0.167 они не выключаются (каталог моделей сервера задаёт multi_agent_version v2).
+    Прочие новые сессии (параллельные запуски, служебные потоки, вложенный codex exec) — other_sessions, без находки."""
+    sessions = [read_session(f) for f in sorted(new_files)]
+    brief = lambda s: {k: s[k] for k in ("rollout", "id", "cwd", "source", "parent", "model", "effort")}
+    if root_id:
+        roots = [s for s in sessions if s["id"] == root_id]
+    else:
+        roots = [s for s in sessions if not s["subagent"] and s["cwd"] == cwd]
+    if len(roots) != 1:
+        return {"model": None, "effort": None, "sandbox": None, "rollout": None, "tokens": None, "subagents": [],
+                "other_sessions": [brief(s) for s in sessions],
+                "error": f"корневых сессий Codex этого запуска: {len(roots)}"}
+    mine, ids = [roots[0]], {roots[0]["id"]}
+    grown = True
+    while grown:
+        grown = False
+        for s in sessions:
+            if s not in mine and s["parent"] in ids:
+                mine.append(s)
+                ids.add(s["id"])
+                grown = True
+    root = roots[0]
+    return {"model": root["model"], "effort": root["effort"], "sandbox": root["sandbox"], "rollout": root["rollout"],
+            "tokens": root["tokens"], "cli_version": root["cli_version"],
+            "subagents": [brief(s) for s in mine[1:]], "other_sessions": [brief(s) for s in sessions if s not in mine],
+            # только корень: файл потомка повторяет историю родителя; вложенные порождения видны по файлам потомков
+            "spawn_calls": root["calls"].count("spawn_agent"),
+            "mcp_calls": sorted({c for s in mine for c in s["calls"] if c and c.startswith("mcp__")}),
+            "connectors": any(s["connectors"] for s in mine), "errors": [s["error"] for s in sessions if "error" in s]}
 
 
 def run_codex(role, code, model, effort, sandbox, prompt, cwd, out):
@@ -220,13 +264,15 @@ def run_codex(role, code, model, effort, sandbox, prompt, cwd, out):
     if not os.path.exists(path):
         die(f"нет {os.path.relpath(path, ROOT)}: выполните build")
     di = open(path, encoding="utf-8").read() + "\n\n" + COMMON + f"\n\n## Оговорка роли {code}\n\n" + role["overlay"] + "\n"
-    # --disable apps: без коннекторов учётки ChatGPT (ADR-022 п. 6)
+    # --disable apps: без коннекторов учётки ChatGPT (ADR-022 п. 6); после запуска сверяется по файлу сессии.
+    # --disable multi_agent в 0.167 субагентов v2 не выключает — их ловит codex_context.
     cmd = ["codex", "exec", "--disable", "multi_agent", "--disable", "apps", "-m", model, "-c", f'model_reasoning_effort="{effort}"',
            "-s", sandbox, "-c", "developer_instructions=" + json.dumps(di, ensure_ascii=False),
            "-C", cwd, "--skip-git-repo-check", "-o", out, "-"]
     before = rollouts()
     r = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
-    ctx = codex_context(rollouts() - before, cwd)
+    m = re.search(r"^session id: ([0-9a-f-]{36})$", r.stderr, re.M)
+    ctx = codex_context(rollouts() - before, cwd, m.group(1) if m else None)
     response = open(out, encoding="utf-8").read() if os.path.exists(out) else ""
     return r, ctx, response
 
@@ -303,26 +349,32 @@ def cmd_run(a):
     if bh and ah and bh != ah:
         changed = (git(cwd, "diff", "--name-only", f"{bh}..{ah}") or "").splitlines()
     touched = before != after
+    findings = []  # нарушения правил ADR-022 ролью; на стороне Claude субагенты и MCP закрыты списком инструментов
+    if ctx.get("subagents") or ctx.get("spawn_calls"):
+        findings.append(f"роль породила субагентов: сессий {len(ctx.get('subagents') or [])}, "
+                        f"вызовов spawn_agent {ctx.get('spawn_calls', 0)} (ADR-022 п. 9)")
+    if ctx.get("connectors") or ctx.get("mcp_calls"):
+        findings.append(f"в сессии роли коннекторы ChatGPT или MCP: {ctx.get('mcp_calls') or 'выданы'} (ADR-022 п. 6)")
+    if role.get("review") and touched:
+        findings.append("проверяющая роль изменила рабочую папку (ADR-022 п. 7)")
     append(a.journal, {
         "ts": started, "kind": "call", "role": code, "side": side, "agent": role["agent"], "user": me,
         "requested": {"model": model, "effort": effort, "sandbox": sandbox}, "actual": ctx,
         "reason": a.reason, "cwd": cwd, "before": before, "after": after, "changed_files": changed,
-        "reviewer_touched_files": touched if role.get("review") else None,
+        "reviewer_touched_files": touched if role.get("review") else None, "findings": findings,
         "exit": r.returncode, "prompt": prompt, "response": response,
     })
     mismatch = ctx.get("model") != model or (side == "codex" and ctx.get("effort") != effort)
-    spawned = bool(ctx.get("subagents"))
     print(f"роль {code} ({side}): {ctx.get('model')} / {ctx.get('effort')}; exit {r.returncode}; ответ — {out}")
     if mismatch:
         print(f"ВНИМАНИЕ: запрошено {model}/{effort}, фактически {ctx.get('model')}/{ctx.get('effort')} "
               f"{ctx.get('error', '')}", file=sys.stderr)
-    if spawned:
-        print(f"ВНИМАНИЕ: роль породила субагентов ({len(ctx['subagents'])}) — это находка (ADR-022 п. 9)", file=sys.stderr)
-    if role.get("review") and touched:
-        print("ВНИМАНИЕ: проверяющая роль изменила рабочую папку — это находка (ADR-022 п. 7)", file=sys.stderr)
+    for f in findings:
+        print(f"ВНИМАНИЕ: {f} — это находка", file=sys.stderr)
     if r.returncode != 0:
         print(r.stderr[-2000:], file=sys.stderr)
-    sys.exit(r.returncode or (3 if mismatch or spawned or (role.get("review") and touched) else 0))
+    # находка важнее кода выхода роли: иначе её можно принять за «поставщик недоступен»
+    sys.exit(3 if findings else (r.returncode or (3 if mismatch else 0)))
 
 
 def cmd_state(a):
