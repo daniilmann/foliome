@@ -32,6 +32,7 @@ REG = json.load(open(os.path.join(HERE, "roles.json"), encoding="utf-8"))
 COMMON = open(os.path.join(HERE, "common-overlay.md"), encoding="utf-8").read().strip()
 CLAUDE_PLUGINS = os.path.expanduser("~/.claude/plugins/cache")
 CODEX_HOME = os.path.expanduser("~/.codex")
+CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 READ_TOOLS = ["Read", "Grep", "Glob"]
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 SPAWN_TOOLS = {"Agent", "Task"}  # субагенты не порождают субагентов (ADR-022 п. 9)
@@ -359,6 +360,52 @@ def run_codex(role, code, model, effort, sandbox, prompt, cwd, out):
     return r, ctx, response
 
 
+def claude_root_model(session_id):
+    """Модели ответов корня Claude Code; формат закреплён синтетической фикстурой тестов.
+
+    Только projects/*/<session_id>.jsonl, без каталогов subagents и строк isSidechain.
+    Ошибка чтения или ответ без модели делает сверку неполной даже при других верных ответах.
+    """
+    ctx = {"model": None, "transcript": None}
+    if not isinstance(session_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", session_id):
+        return dict(ctx, error="не определён session_id корневого транскрипта Claude")
+    paths = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", session_id + ".jsonl"))
+    if len(paths) != 1:
+        return dict(ctx, error=f"корневых транскриптов Claude: {len(paths)}")
+    ctx["transcript"] = paths[0]
+    models, errors = set(), []
+    try:
+        with open(paths[0], encoding="utf-8") as fh:
+            for number, line in enumerate(fh, 1):
+                try:
+                    entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        raise ValueError("запись не объект")
+                except ValueError:
+                    errors.append(f"строка {number}: повреждён JSON")
+                    continue
+                if entry.get("isSidechain") is True or entry.get("type") != "assistant":
+                    continue
+                if entry.get("sessionId") != session_id:
+                    errors.append(f"строка {number}: другая или неизвестная сессия")
+                    continue
+                message = entry.get("message")
+                model = message.get("model") if isinstance(message, dict) else None
+                if not isinstance(model, str) or not model.strip():
+                    errors.append(f"строка {number}: нет модели ответа")
+                else:
+                    models.add(model)
+    except (OSError, UnicodeError) as exc:
+        errors.append(f"транскрипт не прочитан: {exc}")
+    models = sorted(models)
+    ctx["model"] = models[0] if len(models) == 1 else (models or None)
+    if not models:
+        errors.append("нет моделей ответов корня Claude")
+    if errors:
+        ctx["error"] = "; ".join(errors)
+    return ctx
+
+
 def run_claude(name, model, prompt, cwd):
     agent_file = os.path.join(OUT, f"{name}.md")
     if not os.path.exists(agent_file):
@@ -374,9 +421,12 @@ def run_claude(name, model, prompt, cwd):
         d = json.loads(r.stdout)
     except ValueError:
         d = {}
-    models = sorted((d.get("modelUsage") or {}).keys())
-    ctx = {"model": models[0] if len(models) == 1 else (models or None), "effort": fm.get("effort"),
-           "sandbox": None, "rollout": d.get("session_id"), "tokens": d.get("usage"), "cost_usd": d.get("total_cost_usd")}
+    if not isinstance(d, dict):
+        d = {}
+    usage = d.get("modelUsage")
+    ctx = dict(claude_root_model(d.get("session_id")), effort=fm.get("effort"),
+               sandbox=None, rollout=d.get("session_id"), tokens=d.get("usage"), cost_usd=d.get("total_cost_usd"),
+               service_models=sorted(usage) if isinstance(usage, dict) else [], model_usage=usage)
     return r, ctx, d.get("result") or ""
 
 
@@ -447,9 +497,12 @@ def cmd_run(a):
         findings.append("проверяющая роль изменила рабочую папку (ADR-022 п. 7)")
     # поставщик недоступен: роль упала, модели нет и ни одной новой сессии — код роли, O переходит по ADR-022 п. 8
     unavailable = (r.returncode != 0 and ctx.get("model") is None
+                   and not ctx.get("rollout") and not ctx.get("service_models") and not ctx.get("tokens")
                    and not ctx.get("subagents") and not ctx.get("other_sessions"))
     if side == "codex" and ctx.get("error") and not unavailable:  # без корня субагентов и коннекторы не проверить
         findings.append(f"{ctx['error']} — проверка субагентов и коннекторов не проведена (ADR-022 п. 7)")
+    if side != "codex" and ctx.get("error") and not unavailable:
+        findings.append(f"{ctx['error']} — модель корня Claude не проверена полностью (ADR-022 п. 7)")
     mismatch = ctx.get("model") != model or (side == "codex" and ctx.get("effort") != effort)
     # находка и чужая модель важнее кода выхода роли: иначе их можно принять за «поставщик недоступен»
     wrapper_exit = 3 if findings or (mismatch and not unavailable) else r.returncode
