@@ -6,7 +6,7 @@
   build [--fallback]    — собрать субагентов Claude в .claude/agents/ (model, effort, tools, maxTurns из реестра) и
                           инструкции ролей Codex в agents/codex/ — из определений плагинов ecc и voltagent учётки, где
                           идёт сборка. --fallback: ещё Claude-версии пишущих ролей (Codex недоступен).
-  run CODE --prompt-file F --journal J [--cd DIR] [--simple] [--effort E] [--sandbox S] [--reason R]
+  run CODE --prompt-file F --journal J --cd DIR [--simple] [--effort E] [--sandbox S] [--reason R]
            [--claude-unavailable | --codex-unavailable]
                         — запустить роль: Claude — `claude -p --agent foliome-<код>` из корня репозитория (файлы ролей
                           основной ветки), рабочая папка задачи — --cd; Codex — `codex exec` с моделью, effort, песочницей
@@ -62,22 +62,22 @@ def role_env():
     cfg = dev_config()
     if cfg:
         bin_dir = os.path.join(os.path.expanduser(cfg["docs"]), "tools", "openspec", "node_modules", ".bin")
-        env["PATH"] = env.get("PATH", "") + os.pathsep + bin_dir
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
     return env
 
 
 def session_check():
     """ADR-022 п. 7 (ADR-024 Б.7): перед ролью разработки — `tools/check.py session`; провал — отказ без запуска."""
     cfg = dev_config()
-    if not cfg:
-        die(f"нет настройки {DEV_CONFIG} с ключом docs — проверка session невозможна (ADR-024 А.1)")
+    if not cfg or not isinstance(cfg.get("code"), str):
+        die(f"нет настройки {DEV_CONFIG} с ключами docs и code — проверка session невозможна (ADR-024 А.1)")
     docs = os.path.expanduser(cfg["docs"])
     check = os.path.join(docs, "tools", "check.py")
     if not os.path.exists(check):
         die(f"нет {check} (ADR-024 п. 7)")
     try:
         r = subprocess.run([sys.executable, check, "session"], capture_output=True, text=True, env=role_env(),
-                           cwd=docs, timeout=300)
+                           cwd=os.path.expanduser(cfg["code"]), timeout=300)
     except subprocess.TimeoutExpired:
         die("check.py session не ответила за 300 с — роль не запускается")
     if r.returncode:
@@ -221,6 +221,32 @@ def git(cwd, *args):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def run_worktree(directory):
+    """Проверка происхождения обёртки и зарегистрированного ворктри (ADR-024 А.10.5–6)."""
+    cfg = dev_config()
+    if not cfg or not all(isinstance(cfg.get(k), str) and cfg[k] for k in ("docs", "code")):
+        die("для run нужны настройки docs и code")
+    clones = {k: os.path.realpath(os.path.expanduser(cfg[k])) for k in ("docs", "code")}
+    code = clones["code"]
+    if os.path.realpath(__file__) != os.path.join(code, "agents", "role.py") or os.getcwd() != code:
+        die("run запускается обёрткой основного клона code из этого клона")
+    cwd = os.path.abspath(os.path.expanduser(directory))
+    if cwd != os.path.realpath(cwd):
+        die("--cd не допускает обход через симлинк")
+    for clone in clones.values():
+        branch = git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD")
+        if not branch or cwd != os.path.join(clone + "-wt", branch):
+            continue
+        common = git(cwd, "rev-parse", "--git-common-dir")
+        registered = git(clone, "worktree", "list", "--porcelain", "-z")
+        top = git(cwd, "rev-parse", "--show-toplevel")
+        if (common and os.path.realpath(os.path.join(cwd, common)) == os.path.realpath(os.path.join(clone, ".git"))
+                and top and os.path.realpath(top) == cwd
+                and registered and "worktree " + cwd in registered.split("\0")):
+            return cwd
+    die("--cd должен быть зарегистрированным ворктри docs или code в <клон>-wt/<ветка>")
+
+
 def fingerprint(cwd):
     head = git(cwd, "rev-parse", "HEAD")
     if head is None:  # не репозиторий git: отпечаток по содержимому файлов
@@ -361,6 +387,7 @@ def append(journal, rec):
 
 
 def cmd_run(a):
+    cwd = run_worktree(a.cd)
     code = a.code
     role = dict(REG["roles"].get(code) or die(f"нет роли {code}"))
     me = user()
@@ -379,7 +406,6 @@ def cmd_run(a):
     if REG["p1_started"] or role.get("phase") != "design":  # то же условие, что у проверки учётки
         session_check()
     prompt = open(a.prompt_file, encoding="utf-8").read()
-    cwd = os.path.abspath(a.cd)
     secrets = os.path.realpath(os.path.dirname(DEV_CONFIG))
     if os.path.realpath(cwd) == secrets or secrets.startswith(os.path.realpath(cwd) + os.sep) \
             or os.path.realpath(cwd).startswith(secrets + os.sep):
@@ -460,21 +486,26 @@ def cmd_list(_):
         print(f"{code:3} {r['side']:6} {r['agent']:36} {r['model']:16} {r['effort']:6} {r['when']}")
 
 
-p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-sp = p.add_subparsers(dest="cmd", required=True)
-sp.add_parser("list").set_defaults(f=cmd_list)
-b = sp.add_parser("build"); b.add_argument("--fallback", action="store_true"); b.set_defaults(f=cmd_build)
-r = sp.add_parser("run"); r.add_argument("code"); r.add_argument("--prompt-file", required=True)
-r.add_argument("--journal", required=True); r.add_argument("--cd", default=ROOT); r.add_argument("--simple", action="store_true")
-r.add_argument("--effort", choices=["low", "medium", "high"])
-r.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
-r.add_argument("--reason"); r.add_argument("--out")
-fb = r.add_mutually_exclusive_group(); fb.add_argument("--claude-unavailable", action="store_true")
-fb.add_argument("--codex-unavailable", action="store_true"); r.set_defaults(f=cmd_run)
-st = sp.add_parser("state"); st.add_argument("--cd", default=ROOT); st.set_defaults(f=cmd_state)
-lg = sp.add_parser("log"); lg.add_argument("--journal", required=True)
-lg.add_argument("--kind", required=True, choices=["decision", "check", "note"])
-lg.add_argument("--role", required=True); g = lg.add_mutually_exclusive_group(required=True)
-g.add_argument("--text"); g.add_argument("--text-file"); lg.set_defaults(f=cmd_log)
-args = p.parse_args()
-args.f(args)
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("list").set_defaults(f=cmd_list)
+    b = sp.add_parser("build"); b.add_argument("--fallback", action="store_true"); b.set_defaults(f=cmd_build)
+    r = sp.add_parser("run"); r.add_argument("code"); r.add_argument("--prompt-file", required=True)
+    r.add_argument("--journal", required=True); r.add_argument("--cd", required=True); r.add_argument("--simple", action="store_true")
+    r.add_argument("--effort", choices=["low", "medium", "high"])
+    r.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
+    r.add_argument("--reason"); r.add_argument("--out")
+    fb = r.add_mutually_exclusive_group(); fb.add_argument("--claude-unavailable", action="store_true")
+    fb.add_argument("--codex-unavailable", action="store_true"); r.set_defaults(f=cmd_run)
+    st = sp.add_parser("state"); st.add_argument("--cd", default=ROOT); st.set_defaults(f=cmd_state)
+    lg = sp.add_parser("log"); lg.add_argument("--journal", required=True)
+    lg.add_argument("--kind", required=True, choices=["decision", "check", "note"])
+    lg.add_argument("--role", required=True); g = lg.add_mutually_exclusive_group(required=True)
+    g.add_argument("--text"); g.add_argument("--text-file"); lg.set_defaults(f=cmd_log)
+    args = p.parse_args(argv)
+    return args.f(args)
+
+
+if __name__ == "__main__":
+    main()
