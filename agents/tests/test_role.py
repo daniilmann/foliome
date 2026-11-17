@@ -35,6 +35,7 @@ class WorktreeTests(unittest.TestCase):
         self.addCleanup(self.enter.close)
         self.enter.enter_context(patch.object(role, "dev_config", return_value=self.cfg))
         self.enter.enter_context(patch.object(role, "__file__", str(Path(self.cfg["code"]) / "agents/role.py")))
+        self.enter.enter_context(patch.object(role, "ROOT", self.cfg["code"]))
         self.cwd = self.enter.enter_context(patch.object(role.os, "getcwd", return_value=self.cfg["code"]))
         self.enter.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
@@ -45,9 +46,36 @@ class WorktreeTests(unittest.TestCase):
         with patch.object(role, "__file__", str(self.base / "copy/agents/role.py")):
             with self.assertRaises(SystemExit):
                 role.run_worktree(self.trees["code"])
+        with patch.object(role, "ROOT", str(self.base / "copy")):
+            with self.assertRaises(SystemExit):
+                role.run_worktree(self.trees["code"])
         self.cwd.return_value = self.trees["code"]
         with self.assertRaises(SystemExit):
             role.run_worktree(self.trees["code"])
+
+    def test_run_rejects_wrapper_symlinks(self):
+        agents = Path(self.cfg["code"]) / "agents"
+        agents.mkdir()
+        for name in ("role.py", "roles.json", "common-overlay.md"):
+            (agents / name).write_bytes((Path(SPEC.origin).parent / name).read_bytes())
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind):
+                foreign = self.base / ("foreign-" + kind) / "agents"
+                foreign.parent.mkdir()
+                if kind == "file":
+                    foreign.mkdir()
+                    (foreign / "role.py").symlink_to(agents / "role.py")
+                    for name in ("roles.json", "common-overlay.md"):
+                        (foreign / name).write_bytes((agents / name).read_bytes())
+                else:
+                    foreign.symlink_to(agents, target_is_directory=True)
+                spec = importlib.util.spec_from_file_location("linked_role", foreign / "role.py")
+                linked_role = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(linked_role)
+                with patch.object(linked_role, "dev_config", return_value=self.cfg):
+                    with self.assertRaises(SystemExit):
+                        linked_role.run_worktree(self.trees["code"])
+                self.assertEqual(linked_role.ROOT, self.cfg["code"])
 
     def test_run_requires_task_worktree(self):
         for tree in self.trees.values():
@@ -210,13 +238,15 @@ class EscalationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name).resolve()
-        self.journal = self.base / "journal"
-        self.journal.mkdir()
+        self.journal = self.base / "foliome-journal" / "journal"
+        self.journal.mkdir(parents=True)
         self.output = self.base / "package.md"
         self.args = argparse.Namespace(journal_dir=str(self.journal), task=SYNTHETIC_TASK_NUMBER,
                                        out=str(self.output))
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(role.Path, "home", return_value=self.base))
+        self.stack.enter_context(patch.object(role, "DEV_CONFIG", str(self.base / ".config/foliome/dev.json")))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
         self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
 
@@ -302,7 +332,7 @@ class EscalationTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             role.cmd_escalate(self.args)
         self.assertFalse(self.output.exists())
-        self.args.journal_dir = str(self.base / f"t{foreign_task}-other")
+        self.args.journal_dir = str(self.journal.parent / f"t{foreign_task}-other")
         Path(self.args.journal_dir).mkdir()
         with self.assertRaises(SystemExit):
             role.cmd_escalate(self.args)
@@ -323,7 +353,7 @@ class EscalationTests(unittest.TestCase):
         with patch.object(role.os, "link", side_effect=OSError("синтетический сбой")), self.assertRaises(SystemExit):
             role.cmd_escalate(self.args)
         self.assertFalse(self.output.exists())
-        self.assertEqual(sorted(p.name for p in self.base.iterdir()), ["alias.md", "journal"])
+        self.assertEqual(sorted(p.name for p in self.base.iterdir()), ["alias.md", "foliome-journal"])
         self.assertEqual(original, {p: p.read_bytes() for p in original})
         publish = role.os.link
 
@@ -347,6 +377,75 @@ class EscalationTests(unittest.TestCase):
         (self.journal / "linked").symlink_to(self.base)
         with self.assertRaises(SystemExit):
             role.cmd_escalate(self.args)
+
+    def test_escalate_rejects_journal_outside_root(self):
+        outside = self.base / "foliome-journal-other"
+        outside.mkdir()
+        missing = self.journal.parent / "missing"
+        source = self.write("file.txt", "Синтетический источник\n")
+        for directory in (self.base, outside, missing, source):
+            self.args.journal_dir = str(directory)
+            with self.subTest(directory=directory), \
+                    patch.object(role, "escalation_package", return_value="") as package:
+                with self.assertRaises(SystemExit):
+                    role.cmd_escalate(self.args)
+                package.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_escalate_rejects_journal_symlinks(self):
+        alias = self.journal.parent / "alias"
+        alias.symlink_to(self.journal, target_is_directory=True)
+        ancestor = self.journal.parent / "ancestor"
+        ancestor.symlink_to(self.journal.parent, target_is_directory=True)
+        for directory in (alias, ancestor / self.journal.name):
+            self.args.journal_dir = str(directory)
+            with self.subTest(directory=directory), \
+                    patch.object(role, "escalation_package", return_value="") as package:
+                with self.assertRaises(SystemExit):
+                    role.cmd_escalate(self.args)
+                package.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_escalate_rejects_secret_directory_overlap(self):
+        for secrets in (self.base / ".config/foliome", self.journal,
+                        self.journal / ".config/foliome", self.journal.parent):
+            secrets.mkdir(parents=True, exist_ok=True)
+            directory = secrets if secrets == self.base / ".config/foliome" else self.journal
+            self.args.journal_dir = str(directory)
+            with self.subTest(secrets=secrets), \
+                    patch.object(role, "DEV_CONFIG", str(secrets / "dev.json")), \
+                    patch.object(role, "escalation_package", return_value="") as package:
+                with self.assertRaises(SystemExit):
+                    role.cmd_escalate(self.args)
+                package.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_escalate_rejects_linked_journal_root(self):
+        root = self.journal.parent
+        moved = self.base / "moved-journal"
+        root.rename(moved)
+        root.symlink_to(moved, target_is_directory=True)
+        for directory in (self.journal, moved / self.journal.name):
+            self.args.journal_dir = str(directory)
+            with self.subTest(directory=directory), \
+                    patch.object(role, "escalation_package", return_value="") as package:
+                with self.assertRaises(SystemExit):
+                    role.cmd_escalate(self.args)
+                package.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_escalate_rejects_hardlinked_sources(self):
+        self.prepare()
+        original = self.base / "source.txt"
+        original.write_text("Синтетический источник\n")
+        linked = self.journal / "nested/source.txt"
+        linked.parent.mkdir()
+        linked.hardlink_to(original)
+        self.assertGreater(linked.stat().st_nlink, 1)
+        with self.assertRaises(SystemExit):
+            role.cmd_escalate(self.args)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(original.read_text(), "Синтетический источник\n")
 
 
 if __name__ == "__main__":

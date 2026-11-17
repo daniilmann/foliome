@@ -25,14 +25,15 @@
                           Необязательный sources.json: task_number (число), task (файл), plan (файл),
                           change (каталог), problem (файл); пути относительно D, без выхода и симлинков.
                           Другие файлы тоже включаются дословно; пропуски и ошибки помечаются.
-                          D — журнал одной задачи; известный другой номер в нём — отказ.
+                          D — журнал одной задачи внутри ~/foliome-journal/, без симлинков и жёстких ссылок;
+                          известный другой номер в нём — отказ.
                           F — новый файл, ни один существующий источник не перезаписывается.
 Проверка учётки здесь — защита от ошибки, а не граница: границу держит учётка ОС (ADR-000, ADR-001).
 """
 import argparse, datetime, glob, hashlib, json, os, pwd, re, subprocess, sys, tempfile
 from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 HERE = os.path.join(ROOT, "agents")
 SNAP = os.path.join(HERE, "codex")
 OUT = os.path.join(ROOT, ".claude", "agents")
@@ -239,7 +240,9 @@ def run_worktree(directory):
         die("для run нужны настройки docs и code")
     clones = {k: os.path.realpath(os.path.expanduser(cfg[k])) for k in ("docs", "code")}
     code = clones["code"]
-    if os.path.realpath(__file__) != os.path.join(code, "agents", "role.py") or os.getcwd() != code:
+    wrapper = os.path.abspath(__file__)
+    if (ROOT != code or wrapper != os.path.realpath(wrapper)
+            or wrapper != os.path.join(code, "agents", "role.py") or os.getcwd() != code):
         die("run запускается обёрткой основного клона code из этого клона")
     cwd = os.path.abspath(os.path.expanduser(directory))
     if cwd != os.path.realpath(cwd):
@@ -598,6 +601,8 @@ def escalation_package(directory, task):
         try:
             # newline='' сохраняет CRLF первоисточника.
             with path.open(encoding="utf-8", newline="") as fh:
+                if os.fstat(fh.fileno()).st_nlink > 1:
+                    die(f"источник с жёсткими ссылками недопустим: {path.relative_to(directory)}")
                 sources[path.relative_to(directory).as_posix()] = fh.read()
         except (OSError, UnicodeError) as exc:
             gaps.append(f"{path.relative_to(directory)}: источник не прочитан: {exc}")
@@ -744,6 +749,11 @@ def cmd_escalate(a):
     out = Path(a.out).expanduser().absolute()
     if not directory.is_dir() or directory != directory.resolve():
         die("--journal-dir должен быть папкой журнала без симлинков")
+    secrets = Path(DEV_CONFIG).parent.resolve()
+    if directory.is_relative_to(secrets) or secrets.is_relative_to(directory):
+        die("--journal-dir пересекается с каталогом секретов")
+    if not directory.is_relative_to(Path.home().resolve() / "foliome-journal"):
+        die("--journal-dir должен быть внутри ~/foliome-journal/")
     if a.task <= 0:
         die("--task должен быть положительным номером")
     if out.exists() or out.is_symlink() or out.parent != out.parent.resolve():
