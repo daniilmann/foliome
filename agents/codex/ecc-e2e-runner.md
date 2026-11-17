@@ -85,7 +85,7 @@ npx playwright show-report                 # View HTML report
 ```typescript
 // Quarantine
 test('flaky: market search', async ({ page }) => {
-  test.fixme(true, 'Flaky - Issue #123')
+  test.fixme(true, 'Flaky - Issue #<n>')
 })
 
 // Identify flakiness

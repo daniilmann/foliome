@@ -37,6 +37,40 @@ WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 SPAWN_TOOLS = {"Agent", "Task"}  # субагенты не порождают субагентов (ADR-022 п. 9)
 CODEX_ADAPTER = ("You are the agent below, adapted as a Codex role. Treat Claude Code tool names as capability hints; "
                  "use only tools available in this Codex session.\n\n")
+DEV_CONFIG = os.path.expanduser("~/.config/foliome/dev.json")  # настройка `dev` вне кода (ADR-024 А.1)
+OPENSPEC_ENV = {"OPENSPEC_TELEMETRY": "0", "DO_NOT_TRACK": "1", "OPENSPEC_NO_UPDATE_CHECK": "1"}
+
+
+def dev_config():
+    try:
+        return json.load(open(DEV_CONFIG, encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def role_env():
+    """Окружение роли: без переменных SourceCraft (токена нет в окружении, ADR-022 п. 6 по ADR-024 Б.6),
+    с CLI OpenSpec репозитория документов в PATH и переменными ADR-024 А.1. Защита от ошибки, не граница."""
+    env = {k: v for k, v in os.environ.items() if "SOURCECRAFT" not in k.upper()}
+    env.update(OPENSPEC_ENV)
+    cfg = dev_config()
+    if cfg and cfg.get("docs"):
+        bin_dir = os.path.join(os.path.expanduser(cfg["docs"]), "tools", "openspec", "node_modules", ".bin")
+        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def session_check():
+    """ADR-022 п. 7 (ADR-024 Б.7): перед ролью разработки — `tools/check.py session`; провал — отказ без запуска."""
+    cfg = dev_config()
+    if not cfg or not cfg.get("docs"):
+        die(f"нет настройки {DEV_CONFIG} с ключом docs — проверка session невозможна (ADR-024 А.1)")
+    check = os.path.join(os.path.expanduser(cfg["docs"]), "tools", "check.py")
+    if not os.path.exists(check):
+        die(f"нет {check} (ADR-024 п. 7)")
+    r = subprocess.run([sys.executable, check, "session"], capture_output=True, text=True, env=role_env())
+    if r.returncode:
+        die("check.py session не прошла — роль не запускается (ADR-024 Б.7):\n" + (r.stdout + r.stderr).strip())
 
 
 def now():
@@ -126,15 +160,24 @@ def build_claude(code, role, agent, model, review, suffix=""):
         COMMON, "", f"## Оговорка роли {code}", "", role["overlay"], "", "## Исходное определение агента", "",
         body.strip(), ""])
     path = os.path.join(OUT, f"{name}.md")
-    open(path, "w", encoding="utf-8").write(text)
+    open(path, "w", encoding="utf-8").write(scrub(text))
     return path
+
+
+# Определения плагинов публикуются в этом публичном репозитории: ссылки на задачи с номером убираются,
+# иначе их ловит проверка публичного кода (ADR-024 п. 6, А.4 `public`).
+TASK_REF = re.compile(r"(?i)\b(задач\w*|issue|task)([^\w\n]{0,3})#?[0-9]+")
+
+
+def scrub(text):
+    return TASK_REF.sub(lambda m: m.group(1) + m.group(2) + "<n>", text)
 
 
 def build_codex(agent):
     """Инструкции роли Codex = определение того же агента из плагина Claude (TOML агентов Codex не нужны)."""
     _, body = split_frontmatter(open(claude_def_path(codex_to_claude_agent(agent)), encoding="utf-8").read())
     path = os.path.join(SNAP, f"{agent}.md")
-    open(path, "w", encoding="utf-8").write(CODEX_ADAPTER + body.strip() + "\n")
+    open(path, "w", encoding="utf-8").write(scrub(CODEX_ADAPTER + body.strip() + "\n"))
     return path
 
 
@@ -272,7 +315,7 @@ def run_codex(role, code, model, effort, sandbox, prompt, cwd, out):
            "-s", sandbox, "-c", "developer_instructions=" + json.dumps(di, ensure_ascii=False),
            "-C", cwd, "--skip-git-repo-check", "-o", out, "-"]
     before = rollouts()
-    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
+    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=role_env())
     m = re.search(r"^session id: ([0-9a-f-]{36})$", r.stderr, re.M)
     ctx = codex_context(rollouts() - before, cwd, m.group(1) if m else None)
     response = open(out, encoding="utf-8").read() if os.path.exists(out) else ""
@@ -288,7 +331,7 @@ def run_claude(name, model, prompt, cwd):
            "--allowedTools", *parse_tools(fm.get("tools"))]
     if cwd != ROOT:
         cmd += ["--add-dir", cwd]
-    env = dict(os.environ, ENABLE_CLAUDEAI_MCP_SERVERS="false")  # без коннекторов claude.ai (ADR-022 п. 6)
+    env = dict(role_env(), ENABLE_CLAUDEAI_MCP_SERVERS="false")  # без коннекторов claude.ai (ADR-022 п. 6)
     r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=ROOT, env=env)  # файлы ролей — из корня
     try:
         d = json.loads(r.stdout)
@@ -322,6 +365,8 @@ def cmd_run(a):
     if (a.effort and a.effort != role["effort"]) or (a.sandbox and a.sandbox != role.get("sandbox")):
         if not a.reason:
             die("отступ от реестра — только с --reason")
+    if role.get("phase") != "design":
+        session_check()
     prompt = open(a.prompt_file, encoding="utf-8").read()
     cwd = os.path.abspath(a.cd)
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.journal)), f"last-{code}.md")
