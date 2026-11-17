@@ -43,9 +43,11 @@ OPENSPEC_ENV = {"OPENSPEC_TELEMETRY": "0", "DO_NOT_TRACK": "1", "OPENSPEC_NO_UPD
 
 def dev_config():
     try:
-        return json.load(open(DEV_CONFIG, encoding="utf-8"))
+        with open(DEV_CONFIG, encoding="utf-8") as fh:
+            cfg = json.load(fh)
     except (OSError, ValueError):
         return None
+    return cfg if isinstance(cfg, dict) and isinstance(cfg.get("docs"), str) else None
 
 
 def role_env():
@@ -53,22 +55,31 @@ def role_env():
     с CLI OpenSpec репозитория документов в PATH и переменными ADR-024 А.1. Защита от ошибки, не граница."""
     env = {k: v for k, v in os.environ.items() if "SOURCECRAFT" not in k.upper()}
     env.update(OPENSPEC_ENV)
+    # git без credential helper и без запроса пароля: push и `git credential fill` — только у O (Б.8)
+    n = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+    env.update({"GIT_CONFIG_COUNT": str(n + 1), f"GIT_CONFIG_KEY_{n}": "credential.helper", f"GIT_CONFIG_VALUE_{n}": "",
+                "GIT_TERMINAL_PROMPT": "0"})
     cfg = dev_config()
-    if cfg and cfg.get("docs"):
+    if cfg:
         bin_dir = os.path.join(os.path.expanduser(cfg["docs"]), "tools", "openspec", "node_modules", ".bin")
-        env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+        env["PATH"] = env.get("PATH", "") + os.pathsep + bin_dir
     return env
 
 
 def session_check():
     """ADR-022 п. 7 (ADR-024 Б.7): перед ролью разработки — `tools/check.py session`; провал — отказ без запуска."""
     cfg = dev_config()
-    if not cfg or not cfg.get("docs"):
+    if not cfg:
         die(f"нет настройки {DEV_CONFIG} с ключом docs — проверка session невозможна (ADR-024 А.1)")
-    check = os.path.join(os.path.expanduser(cfg["docs"]), "tools", "check.py")
+    docs = os.path.expanduser(cfg["docs"])
+    check = os.path.join(docs, "tools", "check.py")
     if not os.path.exists(check):
         die(f"нет {check} (ADR-024 п. 7)")
-    r = subprocess.run([sys.executable, check, "session"], capture_output=True, text=True, env=role_env())
+    try:
+        r = subprocess.run([sys.executable, check, "session"], capture_output=True, text=True, env=role_env(),
+                           cwd=docs, timeout=300)
+    except subprocess.TimeoutExpired:
+        die("check.py session не ответила за 300 с — роль не запускается")
     if r.returncode:
         die("check.py session не прошла — роль не запускается (ADR-024 Б.7):\n" + (r.stdout + r.stderr).strip())
 
@@ -166,7 +177,7 @@ def build_claude(code, role, agent, model, review, suffix=""):
 
 # Определения плагинов публикуются в этом публичном репозитории: ссылки на задачи с номером убираются,
 # иначе их ловит проверка публичного кода (ADR-024 п. 6, А.4 `public`).
-TASK_REF = re.compile(r"(?i)\b(задач\w*|issue|task)([^\w\n]{0,3})#?[0-9]+")
+TASK_REF = re.compile(r"(?i)(задач\w{0,3}|issues?|tasks?)([^\w\n\"'`]{0,3})(?:#|№)?[0-9]+")  # как в check.py
 
 
 def scrub(text):
@@ -365,10 +376,14 @@ def cmd_run(a):
     if (a.effort and a.effort != role["effort"]) or (a.sandbox and a.sandbox != role.get("sandbox")):
         if not a.reason:
             die("отступ от реестра — только с --reason")
-    if role.get("phase") != "design":
+    if REG["p1_started"] or role.get("phase") != "design":  # то же условие, что у проверки учётки
         session_check()
     prompt = open(a.prompt_file, encoding="utf-8").read()
     cwd = os.path.abspath(a.cd)
+    secrets = os.path.realpath(os.path.dirname(DEV_CONFIG))
+    if os.path.realpath(cwd) == secrets or secrets.startswith(os.path.realpath(cwd) + os.sep) \
+            or os.path.realpath(cwd).startswith(secrets + os.sep):
+        die("рабочая папка роли содержит каталог токена (ADR-024 Б.6)")
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.journal)), f"last-{code}.md")
     for p in (a.journal, out):  # иначе запись журнала выглядела бы как правка проверяющей роли
         if any(os.path.realpath(p).startswith(os.path.realpath(d) + os.sep) for d in (cwd, ROOT)):
