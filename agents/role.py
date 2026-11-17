@@ -18,9 +18,19 @@
   state --cd DIR        — отпечаток рабочей папки (HEAD и хеш изменений): O сверяет его до и после проверяющей роли.
   log --journal J --kind K --role CODE (--text T | --text-file F)
                         — записать в журнал решение оркестратора, вывод проверок или заметку.
+  escalate --journal-dir D --task N --out F
+                        — пакет E из первоисточников одной задачи, без запуска роли.
+                          По умолчанию: task.txt, plan.md либо change/ целиком, problem.md (взгляд O),
+                          все *.jsonl и остальные файлы D — свидетельства, находки, ответы и решения.
+                          Необязательный sources.json: task_number (число), task (файл), plan (файл),
+                          change (каталог), problem (файл); пути относительно D, без выхода и симлинков.
+                          Другие файлы тоже включаются дословно; пропуски и ошибки помечаются.
+                          D — журнал одной задачи; известный другой номер в нём — отказ.
+                          F — новый файл, ни один существующий источник не перезаписывается.
 Проверка учётки здесь — защита от ошибки, а не граница: границу держит учётка ОС (ADR-000, ADR-001).
 """
-import argparse, datetime, glob, hashlib, json, os, pwd, re, subprocess, sys
+import argparse, datetime, glob, hashlib, json, os, pwd, re, subprocess, sys, tempfile
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.join(ROOT, "agents")
@@ -265,6 +275,28 @@ def fingerprint(cwd):
     return {"head": head, "changes": hashlib.sha256(changes.encode()).hexdigest()}
 
 
+def diff_output(cwd, *args, allowed=(0,)):
+    result = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True)
+    return {"patch": result.stdout if result.returncode in allowed else None,
+            "error": None if result.returncode in allowed else result.stderr}
+
+
+def worktree_diff(cwd):
+    """Снимок diff, включая неотслеживаемые файлы; тексты Git не обрезаются."""
+    result = diff_output(cwd, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--")
+    listing = subprocess.run(["git", "-C", cwd, "ls-files", "--others", "--exclude-standard", "-z"],
+                             capture_output=True, text=True)
+    untracked = listing.stdout if listing.returncode == 0 else None
+    result["untracked"] = {}
+    if untracked is None:
+        result["untracked_error"] = "не получен список неотслеживаемых файлов"
+    for path in (untracked or "").split("\0"):
+        if path:
+            result["untracked"][path] = diff_output(cwd, "diff", "--no-index", "--binary", "--no-ext-diff",
+                                                    "--no-textconv", "--", os.devnull, path, allowed=(0, 1))
+    return result
+
+
 def rollouts():
     return set(glob.glob(os.path.join(CODEX_HOME, "sessions", "*", "*", "*", "rollout-*.jsonl")))
 
@@ -465,6 +497,7 @@ def cmd_run(a):
         if any(os.path.realpath(p).startswith(os.path.realpath(d) + os.sep) for d in (cwd, ROOT)):
             die("журнал и ответ — вне репозитория и папки задачи (ADR-022 п. 7)")
     before = {"task": fingerprint(cwd), "root": fingerprint(ROOT)}
+    before_diff = worktree_diff(cwd)
     started = now()
     if side == "codex":
         model = REG["simple"]["codex"] if a.simple else role["model"]
@@ -482,10 +515,13 @@ def cmd_run(a):
         r, ctx, response = run_claude(name, model, prompt, cwd)
         open(out, "w", encoding="utf-8").write(response)
     after = {"task": fingerprint(cwd), "root": fingerprint(ROOT)}
+    after_diff = worktree_diff(cwd)
+    finished = now()
     changed = None
     bh, ah = before["task"]["head"], after["task"]["head"]
     if bh and ah and bh != ah:
         changed = (git(cwd, "diff", "--name-only", f"{bh}..{ah}") or "").splitlines()
+    committed = diff_output(cwd, "diff", "--binary", "--no-ext-diff", "--no-textconv", bh, ah, "--") if bh and ah else None
     touched = before != after
     findings = []  # нарушения правил ADR-022 ролью; на стороне Claude субагенты и MCP закрыты списком инструментов
     if ctx.get("subagents") or ctx.get("spawn_calls"):
@@ -507,9 +543,10 @@ def cmd_run(a):
     # находка и чужая модель важнее кода выхода роли: иначе их можно принять за «поставщик недоступен»
     wrapper_exit = 3 if findings or (mismatch and not unavailable) else r.returncode
     append(a.journal, {
-        "ts": started, "kind": "call", "role": code, "side": side, "agent": role["agent"], "user": me,
+        "ts": started, "finished_at": finished, "kind": "call", "role": code, "side": side, "agent": role["agent"], "user": me,
         "requested": {"model": model, "effort": effort, "sandbox": sandbox}, "actual": ctx,
         "reason": a.reason, "cwd": cwd, "before": before, "after": after, "changed_files": changed,
+        "diff": {"before": before_diff, "after": after_diff, "committed": committed},
         "reviewer_touched_files": touched if role.get("review") else None, "findings": findings,
         "unavailable": unavailable, "exit": r.returncode, "wrapper_exit": wrapper_exit, "prompt": prompt, "response": response,
     })
@@ -534,6 +571,202 @@ def cmd_log(a):
     print("записано")
 
 
+def literal(text):
+    """Блок без изменений текста, в том числе при наличии Markdown-ограждений в источнике."""
+    fence = "`" * max(3, 1 + max((len(m.group()) for m in re.finditer(r"`+", text)), default=0))
+    return fence + "\n" + text + ("" if text.endswith("\n") else "\n") + fence + "\n"
+
+
+def journal_files(directory, gaps):
+    files = []
+    def inaccessible(exc):
+        gaps.append(f"каталог источников не прочитан: {exc}")
+    for parent, dirs, names in os.walk(directory, onerror=inaccessible):
+        for name in sorted(dirs + names):
+            path = Path(parent) / name
+            if path.is_symlink():
+                die(f"источник через симлинк недопустим: {path.relative_to(directory)}")
+        files.extend(Path(parent) / name for name in sorted(names))
+    return sorted(files)
+
+
+def escalation_package(directory, task):
+    """Собрать текст в памяти до любой записи. Первичные файлы не меняются."""
+    sources, gaps = {}, []
+    paths = journal_files(directory, gaps)
+    for path in paths:
+        try:
+            # newline='' сохраняет CRLF первоисточника.
+            with path.open(encoding="utf-8", newline="") as fh:
+                sources[path.relative_to(directory).as_posix()] = fh.read()
+        except (OSError, UnicodeError) as exc:
+            gaps.append(f"{path.relative_to(directory)}: источник не прочитан: {exc}")
+    manifest = {}
+    if "sources.json" in sources:
+        try:
+            manifest = json.loads(sources["sources.json"])
+            if not isinstance(manifest, dict):
+                raise ValueError("ожидается объект")
+        except ValueError as exc:
+            gaps.append(f"sources.json повреждён: {exc}; используются стандартные имена")
+            manifest = {}
+    marker = re.match(r"^t(\d+)(?:-|$)", directory.name)
+    if marker and int(marker[1]) != task:
+        die("номер задачи не совпадает с папкой журнала")
+    if "task_number" in manifest and (type(manifest["task_number"]) is not int or manifest["task_number"] != task):
+        die("sources.json относится к другой задаче или содержит неверный task_number")
+    if not marker and "task_number" not in manifest:
+        gaps.append("принадлежность папки задаче не подтверждена именем или task_number; старые записи без номера")
+
+    def source(key, default):
+        name = manifest.get(key, default)
+        if not isinstance(name, str) or not name:
+            gaps.append(f"sources.json: неверный путь {key}")
+            return None
+        path = directory / name
+        if Path(name).is_absolute() or ".." in Path(name).parts:
+            die(f"источник {key} должен быть относительным путём внутри журнала")
+        if not path.resolve().is_relative_to(directory):
+            die(f"источник {key} выходит из журнала")
+        return path.relative_to(directory).as_posix()
+
+    task_source = source("task", "task.txt")
+    plan_source = source("plan", "plan.md")
+    change_source = source("change", "change")
+    problem_source = source("problem", "problem.md")
+    if task_source not in sources:
+        gaps.append("нет снимка задачи: " + str(task_source))
+    else:
+        heading = re.search(r"^\s*(?:\#{1,6}\s*)?(?:задача\s*:?\s*\#?|task\s*:?\s*\#?|\#)(\d+)\b",
+                            sources[task_source], re.I | re.M)
+        if heading and int(heading[1]) != task:
+            die("снимок задачи относится к другой задаче")
+    change_files = [name for name in sources if change_source and name.startswith(change_source.rstrip("/") + "/")]
+    if plan_source not in sources and not change_files:
+        gaps.append("нет плана или полного каталога изменения")
+    if problem_source not in sources:
+        gaps.append("нет файла текущей проблемы — взгляд O: " + str(problem_source))
+    for key, name in (("task", task_source), ("plan", plan_source), ("problem", problem_source), ("change", change_source)):
+        if key in manifest and name not in sources and not (key == "change" and change_files):
+            gaps.append(f"источник из sources.json отсутствует: {key} = {name}")
+    records = []
+    kinds = set()
+    for name, text in sources.items():
+        if not name.endswith(".jsonl"):
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            origin = f"{name}:{number}"
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("ожидается объект")
+            except ValueError as exc:
+                gaps.append(f"{origin}: повреждён JSONL: {exc}")
+                continue
+            for key in ("task", "task_number"):
+                if key in record and str(record[key]) != str(task):
+                    die(f"{origin}: запись относится к другой задаче")
+            kind = record.get("kind")
+            if isinstance(kind, str):
+                kinds.add(kind)
+            required = ["ts", "kind", "role"]
+            if kind == "call":
+                required += ["requested", "actual", "prompt", "before", "after", "diff", "response",
+                             "finished_at", "findings", "exit", "wrapper_exit"]
+                for key in ("requested", "actual"):
+                    value = record.get(key)
+                    if not isinstance(value, dict) or not value.get("model"):
+                        gaps.append(f"{origin}: отсутствует {key}.model")
+                for key in ("before", "after"):
+                    value = record.get(key)
+                    state = value.get("task") if isinstance(value, dict) else None
+                    if not isinstance(state, dict) or not state.get("head"):
+                        gaps.append(f"{origin}: отсутствует SHA {key}.task.head")
+                def diff_errors(value, location="diff"):
+                    if isinstance(value, dict):
+                        for key, item in value.items():
+                            if key.endswith("error") and item:
+                                gaps.append(f"{origin}: пробел {location}.{key}: {item}")
+                            else:
+                                diff_errors(item, location + "." + key)
+                diff_errors(record.get("diff"))
+            else:
+                required.append("text")
+            for key in required:
+                if key not in record or record[key] is None:
+                    gaps.append(f"{origin}: отсутствует {key}")
+            try:
+                timestamp = datetime.datetime.fromisoformat(record.get("ts", "").replace("Z", "+00:00"))
+                if timestamp.tzinfo is None:
+                    raise ValueError("нет часового пояса")
+                order = timestamp.timestamp()
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                gaps.append(f"{origin}: время не определено; запись после записей с известным временем")
+                order = float("inf")
+            records.append((order, origin, record, line))
+    for kind, label in (("call", "попытки ролей"), ("check", "выводы проверок"), ("decision", "решения O с причинами")):
+        if kind not in kinds:
+            gaps.append(f"не найдены записи {kind}: {label}; см. прочие первоисточники")
+    parts = [f"# Пакет эскалации E — задача {task}\n\n",
+             "Все источники ниже — дословно. Происхождение указано именем файла и строкой; "
+             "порядок записей — по времени, исходный порядок файлов сохранён отдельно.\n\n",
+             "## Пробелы журнала\n\n"]
+    parts.extend(("- " + gap + "\n") for gap in gaps)
+    if not gaps:
+        parts.append("Пропусков обязательных источников и полей не обнаружено.\n")
+
+    def include(title, names):
+        parts.append("\n## " + title + "\n\n")
+        for name in names:
+            if name in sources:
+                parts.extend(["### Источник: " + name + "\n\n", literal(sources[name])])
+
+    include("Задача", [task_source])
+    include("Технический план / изменение целиком", ([plan_source] if plan_source in sources else []) + change_files)
+    parts.append("\n## Попытки, проверки, находки, ответы и решения — по времени\n\n")
+    for _, origin, record, line in sorted(records, key=lambda item: item[0]):
+        parts.extend(["### Источник: " + origin + "\n\n", literal(line)])
+        for field in ("prompt", "response", "diff", "text"):
+            if field in record:
+                value = record[field]
+                value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+                parts.extend(["\n" + field + " (значение из записи дословно):\n\n", literal(value)])
+    include("Текущая проблема — взгляд O", [problem_source])
+    included = {task_source, problem_source, *change_files}
+    if plan_source in sources:
+        included.add(plan_source)
+    include("Прочие первоисточники и исходные журналы целиком", [name for name in sources if name not in included])
+    return "".join(parts)
+
+
+def cmd_escalate(a):
+    directory = Path(a.journal_dir).expanduser().absolute()
+    out = Path(a.out).expanduser().absolute()
+    if not directory.is_dir() or directory != directory.resolve():
+        die("--journal-dir должен быть папкой журнала без симлинков")
+    if a.task <= 0:
+        die("--task должен быть положительным номером")
+    if out.exists() or out.is_symlink() or out.parent != out.parent.resolve():
+        die("--out должен быть новым файлом без симлинков; исходники не перезаписываются")
+    package = escalation_package(directory, a.task)
+    temporary = None
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=out.parent, delete=False) as fh:
+            temporary = fh.name
+            fh.write(package)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # Атомарная публикация без перезаписи, даже если out появился после проверки.
+        os.link(temporary, out)
+    except OSError as exc:
+        die(f"пакет не записан: {exc}")
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+    print(f"пакет E: {out}")
+
+
 def cmd_list(_):
     for code, r in REG["roles"].items():
         print(f"{code:3} {r['side']:6} {r['agent']:36} {r['model']:16} {r['effort']:6} {r['when']}")
@@ -556,6 +789,9 @@ def main(argv=None):
     lg.add_argument("--kind", required=True, choices=["decision", "check", "note"])
     lg.add_argument("--role", required=True); g = lg.add_mutually_exclusive_group(required=True)
     g.add_argument("--text"); g.add_argument("--text-file"); lg.set_defaults(f=cmd_log)
+    es = sp.add_parser("escalate")
+    es.add_argument("--journal-dir", required=True); es.add_argument("--task", required=True, type=int)
+    es.add_argument("--out", required=True); es.set_defaults(f=cmd_escalate)
     args = p.parse_args(argv)
     return args.f(args)
 
