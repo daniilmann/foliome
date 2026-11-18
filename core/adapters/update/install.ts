@@ -46,42 +46,19 @@ const fs = require('node:fs/promises') as typeof import('node:fs/promises');
 const path = require('node:path') as typeof import('node:path');
 const crypto = require('node:crypto') as typeof import('node:crypto');
 const { DatabaseSync, backup } = require('node:sqlite') as typeof import('node:sqlite');
-const locks = new Set<string>();
 const shaPattern = /^[a-f0-9]{40}$/;
-
-async function exclusive<T>(file: string, work: () => Promise<T>): Promise<T> {
-  const key = path.resolve(file);
-  if (locks.has(key)) throw new Error('busy');
-  locks.add(key);
-  let db: InstanceType<typeof DatabaseSync> | undefined;
-  try {
-    const lockPath = `${key}.lease.sqlite`;
-    try {
-      const handle = await fs.open(lockPath, 'wx', 0o600);
-      await handle.close();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    }
-    const stat = await fs.lstat(lockPath);
-    if (
-      !stat.isFile() ||
-      stat.isSymbolicLink() ||
-      stat.nlink !== 1 ||
-      stat.uid !== process.getuid?.() ||
-      (stat.mode & 0o077) !== 0
-    )
-      throw new Error('lease');
-    db = new DatabaseSync(lockPath);
-    db.exec('BEGIN EXCLUSIVE');
-    return await work();
-  } finally {
-    try {
-      db?.close();
-    } finally {
-      locks.delete(key);
-    }
-  }
-}
+const installedReleases =
+  path.join(
+    require('node:os').userInfo().homedir,
+    'Library/Application Support/Foliome/app/releases',
+  ) + path.sep;
+const stateModule = __dirname.startsWith(installedReleases)
+  ? '/Library/Application Support/Foliome/base/activation-state.js'
+  : path.resolve(__dirname, '../../../base/activation-state.js');
+const { exclusive, marker } = require(stateModule) as {
+  exclusive: <T>(file: string, work: () => Promise<T>) => Promise<T>;
+  marker: (db: Database) => State | null;
+};
 async function readState(file: string): Promise<State> {
   const value: unknown = JSON.parse(await fs.readFile(file, 'utf8'));
   if (!value || typeof value !== 'object') throw new Error('state');
@@ -119,27 +96,6 @@ async function writeState(file: string, state: State): Promise<void> {
   } finally {
     await fs.rm(temp, { force: true });
   }
-}
-function marker(db: Database): State | null {
-  const exists = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'activation_state'")
-    .get();
-  if (!exists) return null;
-  const row = db
-    .prepare('SELECT current_sha, previous_sha FROM activation_state WHERE id = 1')
-    .get();
-  if (
-    !row ||
-    typeof row.current_sha !== 'string' ||
-    !shaPattern.test(row.current_sha) ||
-    !(
-      row.previous_sha === null ||
-      (typeof row.previous_sha === 'string' && shaPattern.test(row.previous_sha))
-    ) ||
-    row.current_sha === row.previous_sha
-  )
-    throw new Error('state');
-  return { current: row.current_sha, previous: row.previous_sha as string | null };
 }
 function setMarker(db: Database, state: State): void {
   db.exec(
