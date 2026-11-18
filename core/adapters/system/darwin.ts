@@ -39,6 +39,61 @@ async function entry(file: string) {
   if (acl.some(line => !/^\d+: /.test(line))) throw Error();
   return { type: stat.isDirectory() ? 'directory' : stat.isSocket() ? 'socket' : stat.isSymbolicLink() ? 'symlink' : 'file', uid: stat.uid, mode: stat.mode & 0o7777, links: stat.nlink, acl };
 }
+type SocketOptions = { path: string; handler(socket: import('node:net').Socket): void; configure(file: string): Promise<void> };
+async function openSocket(options: SocketOptions): Promise<{ ok: true; close(): Promise<void> } | { ok: false; code: 'unavailable' }> {
+  let ready = false;
+  const clients = new Set<import('node:net').Socket>();
+  const server = net.createServer({ pauseOnConnect: true }, socket => {
+    clients.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => clients.delete(socket));
+    if (!ready) socket.destroy();
+    else options.handler(socket);
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(options.path, () => { server.off('error', reject); resolve(); });
+    });
+  } catch { return { ok: false, code: 'unavailable' }; }
+  server.on('error', () => {});
+  let bound: Awaited<ReturnType<typeof fs.lstat>>;
+  try { bound = await fs.lstat(options.path); }
+  catch { server.unref(); return { ok: false, code: 'unavailable' }; }
+  const close = async () => {
+    ready = false;
+    for (const client of clients) client.destroy();
+    try {
+      const current = await fs.lstat(options.path);
+      if (!current.isSocket() || current.dev !== bound.dev || current.ino !== bound.ino) { server.unref(); return; }
+    } catch { server.unref(); return; }
+    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+  };
+  try {
+    await options.configure(options.path);
+    ready = true;
+    return { ok: true, close };
+  } catch {
+    await close();
+    return { ok: false, code: 'unavailable' };
+  }
+}
+function socketConfiguration(ownerUid: number, executorName: string) {
+  if (!Number.isSafeInteger(ownerUid) || ownerUid < 0 || !/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(executorName)) throw Error('boundary-config');
+  return async (file: string) => {
+    const original = await fs.lstat(file);
+    const same = (s: typeof original) => s.isSocket() && s.uid === ownerUid && s.nlink === 1 && s.dev === original.dev && s.ino === original.ino;
+    if (!same(original)) throw Error('boundary-permissions');
+    await command('/bin/chmod', ['-N', file]);
+    if (!same(await fs.lstat(file))) throw Error('boundary-permissions');
+    await command('/bin/chmod', ['600', file]);
+    if (!same(await fs.lstat(file))) throw Error('boundary-permissions');
+    await command('/bin/chmod', ['+a', `${executorName} allow write`, file]);
+    const observed = await entry(file);
+    const final = await fs.lstat(file);
+    if (!same(final) || observed.type !== 'socket' || observed.uid !== ownerUid || observed.links !== 1 || observed.mode !== 0o600 || observed.acl.length !== 1 || observed.acl[0] !== `0: user:${executorName} allow write` || (final.mode & 0o7777) !== 0o600) throw Error('boundary-permissions');
+  };
+}
 async function canary(): Promise<string> {
   return new Promise(resolve => {
     const socket = net.createConnection({ host: '192.0.2.1', port: 49151 });
@@ -58,10 +113,13 @@ async function runInstalledImpl(run: typeof runProgram) {
   const paths = { home: owner.homedir, app: path.join(root, 'app'), data, channel, socket: path.join(channel, 'core.sock'), database: path.join(data, 'core.db'), sshConfig: path.join(data, 'ssh_config'), config: path.join(data, 'config.json') };
   try {
     const parent = await entry(system);
-    if (parent.type !== 'directory' || parent.uid !== 0 || parent.mode !== 0o755 || parent.acl.length) throw Error();
+    if (parent.type !== 'directory' || parent.uid !== 0 || parent.mode !== 0o755 || parent.acl.length) return { ok: false as const, code: 'boundary-permissions' };
     const installed = await metadata();
+    if (installed.executorUid === owner.uid || installed.executorName === owner.username) throw Error();
     const uid = (await command('/usr/bin/dscl', ['.', '-read', `/Users/${installed.executorName}`, 'UniqueID'])).trim();
     if (uid !== `UniqueID: ${installed.executorUid}`) throw Error();
+    const channelEntry = await entry(channel);
+    if (channelEntry.type !== 'directory' || channelEntry.uid !== owner.uid || channelEntry.mode !== 0o700 || channelEntry.acl.length !== 1 || channelEntry.acl[0] !== `0: user:${installed.executorName} allow search`) return { ok: false as const, code: 'boundary-permissions' };
     const observe: Options['observeMacOS'] = async p => {
       const [home, app, dataEntry, channelEntry, socket, admin, rootEntry] = await Promise.all([
         entry(p.home), entry(p.app), entry(p.data), entry(p.channel), entry(p.socket), command('/usr/bin/dscl', ['.', '-read', '/Groups/admin', 'GroupMembership']), entry(system),
@@ -97,10 +155,14 @@ async function runInstalledImpl(run: typeof runProgram) {
     const { createInstalledKernel } = require('../../main.ts') as typeof import('../../main.ts');
     return await run({ argv: [], env: process.env, paths, ports: { observe, launchChrome, runProcess, createInstalledKernel: async options => {
       if (options.executorUid !== installed.executorUid) throw Error();
-      return createInstalledKernel(options);
+      return createInstalledKernel({ ...options, configureSocket: socketConfiguration(owner.uid, installed.executorName) });
     } } });
   } catch { return { ok: false as const, code: 'boundary-config' }; }
 }
 export declare const runInstalled: typeof runInstalledImpl;
-declare const exports: { runInstalled: typeof runInstalledImpl };
+export declare const openSystemSocket: typeof openSocket;
+export declare const createSocketConfiguration: typeof socketConfiguration;
+declare const exports: { runInstalled: typeof runInstalledImpl; openSystemSocket: typeof openSocket; createSocketConfiguration: typeof socketConfiguration };
 exports.runInstalled = runInstalledImpl;
+exports.openSystemSocket = openSocket;
+exports.createSocketConfiguration = socketConfiguration;

@@ -4,7 +4,8 @@ import type { prepareDomCollector } from './browser/collect-dom.ts';
 import type { attachOwnerWindow } from './ui/owner-window.ts';
 
 const { randomUUID } = require('node:crypto') as typeof import('node:crypto');
-const { mkdir, unlink } = require('node:fs/promises') as typeof import('node:fs/promises');
+const { mkdir } = require('node:fs/promises') as typeof import('node:fs/promises');
+const os = require('node:os') as typeof import('node:os');
 const path = require('node:path') as typeof import('node:path');
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 const { createActionProtocol } = require('./store/action-protocol.ts') as typeof import('./store/action-protocol.ts');
@@ -13,6 +14,7 @@ const { createAdmittedChannel } = require('./channel/admission.ts') as typeof im
 const { startExecutor } = require('./executor/start.ts') as typeof import('./executor/start.ts');
 const { prepareDomCollector: prepare } = require('./browser/collect-dom.ts') as typeof import('./browser/collect-dom.ts');
 const { attachOwnerWindow: attach } = require('./ui/owner-window.ts') as typeof import('./ui/owner-window.ts');
+const { openSystemSocket, createSocketConfiguration } = require('./system/darwin.ts') as typeof import('./system/darwin.ts');
 
 type Collector = Awaited<ReturnType<typeof prepareDomCollector>>;
 type Cdp = Parameters<typeof prepareDomCollector>[0];
@@ -33,6 +35,7 @@ type Options = {
   runProcess: Parameters<typeof startExecutor>[0]['run'];
   launchChrome(): Promise<Chrome>;
   peerUid?: (socket: Socket) => Promise<number>;
+  configureSocket?: (file: string) => Promise<void>;
   source: { url: string; sessionId: string; sourceId: string; accessId: string; instruction: string };
 };
 
@@ -52,7 +55,7 @@ async function createInstalled(options: Options) {
   let window: Awaited<ReturnType<typeof attachOwnerWindow>> | undefined;
   let running = false, closed = false, generation = 0;
   let worker: { stop(): void | Promise<void> } | undefined;
-  let socketOwned = false;
+  let channelClose: (() => Promise<void>) | undefined;
   let closePromise: Promise<void> | undefined;
   const sockets = new Set<Socket>();
   function stopWorker() {
@@ -83,11 +86,10 @@ async function createInstalled(options: Options) {
       try { await runtime?.shutdown(); } catch { /* Continue releasing resources. */ }
       await closeSource();
       for (const socket of sockets) socket.destroy();
-      if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+      await channelClose?.();
       try { await ownerContext?.close(); } catch { /* Continue releasing resources. */ }
       try { await ownerBrowser?.close(); } catch { /* Continue releasing resources. */ }
       db.close();
-      if (socketOwned) try { await unlink(options.paths.socket); } catch { /* Already removed. */ }
     })();
     return closePromise;
   }
@@ -175,7 +177,11 @@ async function createInstalled(options: Options) {
       })();
       return true;
     } });
-    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(options.paths.socket, () => { socketOwned = true; server.off('error', reject); resolve(); }); });
+    const configure = options.configureSocket ?? (process.platform === 'darwin' && options.executorUid === process.getuid?.() ? createSocketConfiguration(options.executorUid, os.userInfo().username) : undefined);
+    if (!configure) throw new Error('boundary-permissions');
+    const channel = await openSystemSocket({ path: options.paths.socket, configure, handler: socket => { server.emit('connection', socket); } });
+    if (!channel.ok) throw new Error('boundary-permissions');
+    channelClose = channel.close;
     return {
       openSource,
       ownerPage() { if (!owner) throw new Error('session-unavailable'); return owner; },

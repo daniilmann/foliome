@@ -82,7 +82,9 @@ async function runProgramImpl(options: { argv: string[]; env: NodeJS.ProcessEnv;
     await ports.createInstalledKernel({ paths: p, ownerName: os.userInfo().username, executorUid: config.executorUid, source: config.source,
       observeMacOS: ports.observe, launchChrome: ports.launchChrome, runProcess: ports.runProcess });
     return { ok: true };
-  } catch { return { ok: false, code: 'boundary-config' }; }
+  } catch (error) {
+    return { ok: false, code: error instanceof Error && error.message === 'boundary-permissions' ? 'boundary-permissions' : 'boundary-config' };
+  }
 }
 async function launchProgramImpl(options: { node: string; entry: string; home: string; tmpdir: string; run: (command: string, args: string[], options: { env: Record<string, never>; stdio: 'ignore' }) => Promise<number | null> }) {
   if (![options.node, options.entry, options.home, options.tmpdir].every(absolute)) throw Error('boundary-config');
