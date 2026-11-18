@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+[ "$#" -eq 0 ] || exit 1
+
+base='/Library/Application Support/Foliome/base'
+exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$base/node" \
+  --disable-sigusr1 "$base/launcher.js"

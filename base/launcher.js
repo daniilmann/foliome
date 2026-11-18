@@ -31,7 +31,7 @@ async function directory(p, uid, privateDir = true) {
     throw Error('directory');
 }
 async function openFile(p, uid, limit, privateFile = true) {
-  const h = await fs.open(p, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const h = await fs.open(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const s = await h.stat();
     const current = await fs.lstat(p);
@@ -138,11 +138,8 @@ async function launchAcceptedRelease({ home, systemRoot: root, run }) {
   const releases = path.join(app, 'releases');
   const accepted = path.join(data, 'accepted');
   const tmpdir = path.join(data, 'tmp');
-  for (const dir of [
-    home,
-    path.join(home, 'Library'),
-    path.join(home, 'Library/Application Support'),
-  ])
+  await directory(home, uid);
+  for (const dir of [path.join(home, 'Library'), path.join(home, 'Library/Application Support')])
     await directory(dir, uid, false);
   for (const dir of [userRoot, data, app, releases, accepted, tmpdir]) await directory(dir, uid);
   const base = path.join(root, 'base');
