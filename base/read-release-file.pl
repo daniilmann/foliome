@@ -10,6 +10,8 @@ $owner =~ /^\d+$/ or exit 1;
 my @parts = split m{/}, $relative, -1;
 @parts && !grep { !/\A[A-Za-z0-9._-]+\z/ || $_ eq '.' || $_ eq '..' || lc($_) eq '.git' } @parts or exit 1;
 sysopen(my $dir, $root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) or exit 1;
+my @root_stat = stat($dir);
+@root_stat && $root_stat[4] == $owner && -d $dir or exit 1;
 for my $index (0 .. $#parts) {
   my $flags = O_RDONLY | O_NOFOLLOW;
   $flags |= O_DIRECTORY if $index < $#parts;

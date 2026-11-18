@@ -7,6 +7,7 @@ type Common = {
   dbPath: string; stateFile: string; rootDir: string; releasesDir: string;
   selfCheck: (db: Database, sha: string) => void | Promise<void>;
   compatible: (db: Database, sha: string) => boolean | Promise<boolean>;
+  previousRoot?: { tree: Record<string, { gitBlob: string; sha256: string }>; allowedPaths: string[]; checkBoundary: (paths: { rootDir: string; stagingDir: string }) => void | Promise<void> };
 };
 type Accept = Common & {
   sha: string; allowed: boolean; sessionActive: boolean;
@@ -33,15 +34,15 @@ async function exclusive<T>(file: string, work: () => Promise<T>): Promise<T> {
     lock = await fs.open(`${key}.lock`, 'wx', 0o600);
     return await work();
   } finally {
-    if (lock) { await lock.close(); await fs.unlink(`${key}.lock`); }
-    locks.delete(key);
+    try { if (lock) { try { await lock.close(); } finally { await fs.unlink(`${key}.lock`); } } }
+    finally { locks.delete(key); }
   }
 }
 async function readState(file: string): Promise<State> {
   const value: unknown = JSON.parse(await fs.readFile(file, 'utf8'));
   if (!value || typeof value !== 'object') throw new Error('state');
   const state = value as State;
-  if (!shaPattern.test(state.current) || !(state.previous === null || shaPattern.test(state.previous))) throw new Error('state');
+  if (Object.keys(value).sort().join(',') !== 'current,previous' || typeof state.current !== 'string' || !shaPattern.test(state.current) || !(state.previous === null || (typeof state.previous === 'string' && shaPattern.test(state.previous))) || state.current === state.previous) throw new Error('state');
   return state;
 }
 async function writeState(file: string, state: State): Promise<void> {
@@ -61,6 +62,7 @@ exports.acceptUpdate = async function acceptUpdate(options) {
     await exclusive(options.stateFile, async () => {
       if (options.allowed !== true || options.sessionActive !== false || !shaPattern.test(options.sha)) throw new Error('refused');
       const state = await readState(options.stateFile);
+      if (options.sha === state.current) throw new Error('refused');
       const copy = await copyDatabase(options.dbPath);
       try {
         const check = new DatabaseSync(copy);
@@ -72,19 +74,23 @@ exports.acceptUpdate = async function acceptUpdate(options) {
           await options.selfCheck(check, options.sha);
         } finally { check.close(); }
       } finally { await fs.rm(copy, { force: true }); }
-      const db = new DatabaseSync(options.dbPath);
+      const temp = `${options.stateFile}.${crypto.randomBytes(16).toString('hex')}`;
+      await fs.writeFile(temp, JSON.stringify({ current: options.sha, previous: state.current }), { flag: 'wx', mode: 0o600 });
+      // A process killed between pointer publication and SQLite commit needs recovery.
+      let db: InstanceType<typeof DatabaseSync> | undefined;
       let stateChanged = false;
       try {
+        db = new DatabaseSync(options.dbPath);
         db.exec('BEGIN IMMEDIATE');
         await options.migrate(db);
-        await writeState(options.stateFile, { current: options.sha, previous: state.current });
+        await fs.rename(temp, options.stateFile);
         stateChanged = true;
         db.exec('COMMIT');
       } catch (e) {
-        try { db.exec('ROLLBACK'); } catch { /* no transaction */ }
+        try { db?.exec('ROLLBACK'); } catch { /* no transaction */ }
         if (stateChanged) await writeState(options.stateFile, state);
         throw e;
-      } finally { db.close(); }
+      } finally { db?.close(); await fs.rm(temp, { force: true }); }
     });
   } catch { throw new Error('update-failed'); }
 };
@@ -101,9 +107,13 @@ exports.restorePrevious = async function restorePrevious(options) {
           await options.selfCheck(check, state.previous);
         } finally { check.close(); }
       } finally { await fs.rm(copy, { force: true }); }
-      // This port has no independently verified previous tree or root verifier.
-      // Refuse activation until production supplies both.
-      throw new Error('unverified-root');
+      if (!options.previousRoot) throw new Error('unverified-root');
+      const temp = `${options.stateFile}.${crypto.randomBytes(16).toString('hex')}`;
+      try {
+        await fs.writeFile(temp, JSON.stringify({ current: state.previous, previous: null }), { flag: 'wx', mode: 0o600 });
+        const { installRoot } = require('../../../base/install-root.js') as { installRoot: (options: object) => Promise<void> };
+        await installRoot({ ...options.previousRoot, releaseDir: path.join(options.releasesDir, state.previous), rootDir: options.rootDir, sha: state.previous, selectedOnly: true, finalize: () => fs.rename(temp, options.stateFile) });
+      } finally { await fs.rm(temp, { force: true }); }
     });
   } catch { throw new Error('restore-failed'); }
 };
