@@ -20,16 +20,17 @@ type FrameFact = { index: number; host: string; foreign: boolean; unavailable: b
 type NodeFact = { n: number; frame: number; parent?: number; visible: boolean; role: string; text: string; state?: string; field?: 'empty' | 'filled' | 'sealed'; href?: string; attrs?: Record<string, string> };
 type Secret = { value: string; kind: 'login' | 'password' | 'code' };
 type Rect = { x: number; y: number; width: number; height: number };
-type Geometry = { rect: Rect; runs: Rect[]; mask: boolean };
-type Observation = { geometry: Geometry[]; width: number; height: number; revision: number; animationIds: string[]; viewportStable: boolean; maskAnimationActive: boolean; unsupported: boolean };
+type Geometry = { rect: Rect; runs: Rect[]; mask: boolean; button: boolean; ancestors: number[] };
+type Observation = { geometry: Geometry[]; width: number; height: number; revision: number; animationIds: string[]; animationTargets: (number | null)[]; viewportStable: boolean; maskAnimationActive: boolean; unsupported: boolean };
 type DocumentFacts = { url: string; title: string; nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[]; parents: (number | null)[]; identities: number[]; classes: ('blocked-payment' | 'blocked-change' | null)[]; semantics: string[]; secrets: Secret[]; embeds: { url: string; visible: boolean }[]; observation: Observation };
 
 // This expression is owned by the adapter and runs only in its isolated world.
 const expression = `(() => {
   const nodes = [], parents = [], identities = [], classes = [], semantics = [], secrets = [], embeds = [], geometry = [];
   const state = globalThis.__foliomeObservation || (globalThis.__foliomeObservation = (() => {
-    const state = { revision: 0, ids: new WeakMap(), next: 1 };
-    new MutationObserver(() => { state.revision++; }).observe(document, { subtree: true, attributes: true, childList: true, characterData: true });
+    const state = { revision: 0, ids: new WeakMap(), next: 1, watched: new WeakSet() };
+    state.observer = new MutationObserver(() => { state.revision++; });
+    state.observer.observe(document, { subtree: true, attributes: true, childList: true, characterData: true });
     for (const event of ['scroll', 'resize', 'pointerover', 'pointerout', 'focusin', 'transitionstart', 'animationstart'])
       addEventListener(event, () => { state.revision++; }, true);
     if (visualViewport) for (const event of ['scroll', 'resize']) visualViewport.addEventListener(event, () => { state.revision++; });
@@ -57,8 +58,11 @@ const expression = `(() => {
         style.offsetPath !== 'none' || style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth || '0') > 0 || (style.zoom !== '1' && style.zoom !== 'normal') || tag === 'USE' || tag === 'SVG') unsupported = true;
     const role = (element.getAttribute('role') || tag.toLowerCase()).toLowerCase();
     const closedField = element.isContentEditable || element.hasAttribute('contenteditable') || role === 'slider';
-    const field = closedField || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || fieldRoles.has(role);
-    let text = '';
+    const type = tag === 'INPUT' ? element.type.toLowerCase() : '';
+    const button = tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type);
+    const choice = tag === 'INPUT' && ['checkbox', 'radio'].includes(type);
+    const field = closedField || tag === 'INPUT' && !button && !choice || tag === 'SELECT' || tag === 'TEXTAREA' || fieldRoles.has(role);
+    let text = button ? element.value : '';
     if (!field) for (const child of element.childNodes) if (child.nodeType === 3) text += child.nodeValue || '';
     const fact = { visible, role, text };
     if (field) {
@@ -89,19 +93,66 @@ const expression = `(() => {
     const change = /(?:save|delete|remove|change|сохран|удал|измен)/iu.test(label) || tag === 'INPUT' && ['submit', 'reset'].includes(element.type) || tag === 'BUTTON' && element.type === 'submit';
     classes.push(payment ? 'blocked-payment' : change ? 'blocked-change' : null);
     const index = nodes.length; nodes.push(fact); parents.push(parent);
-    geometry.push({ rect: rectValue(rect), runs, mask: field || tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED' });
+    const ancestors = [];
+    for (let current = element; current; current = current.parentElement) {
+      if (!state.ids.has(current)) state.ids.set(current, state.next++);
+      ancestors.push(state.ids.get(current));
+    }
+    geometry.push({ rect: rectValue(rect), runs, button, ancestors, mask: field || tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED' });
     if (!field) for (const child of element.children) visit(child, visible ? index : parent, subtreeVisible);
   };
   if (!document.documentElement) throw new Error();
   visit(document.documentElement, null, true);
   const animations = document.getAnimations().filter(a => a.playState === 'running' || a.playState === 'pending');
   const animationIds = animations.map(a => { if (!state.ids.has(a)) state.ids.set(a, state.next++); return String(state.ids.get(a)); }).sort();
+  const animationTargets = animations.map(a => {
+    const target = a.effect instanceof KeyframeEffect ? a.effect.target : null;
+    return target instanceof Element && document.contains(target) && state.ids.has(target) ? state.ids.get(target) : null;
+  });
   const viewport = visualViewport;
   const viewportStable = !!viewport && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.width === innerWidth && viewport.height === innerHeight;
-  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, viewportStable, maskAnimationActive: animations.length > 0, unsupported } };
+  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported } };
 })()`;
 
 const worldName = 'foliome-dom-collector';
+// Invoked on the exact CDP-resolved root in the collector's isolated world.
+const shadowGeometry = `function() {
+  if (!(this instanceof ShadowRoot) || !this.host.isConnected || this.host.ownerDocument !== document) throw new Error();
+  const state = globalThis.__foliomeObservation;
+  if (!state || !state.ids.has(this.host)) throw new Error();
+  if (!state.watched.has(this)) {
+    state.observer.observe(this, { subtree: true, attributes: true, childList: true, characterData: true });
+    state.watched.add(this);
+  }
+  if (this.host.getAnimations({ subtree: true }).some(a => a.playState === 'running' || a.playState === 'pending')) throw new Error();
+  const rects = [], add = r => {
+    if (rects.length >= 20001) throw new Error();
+    rects.push({ x: r.x, y: r.y, width: r.width, height: r.height });
+  };
+  add(this.host.getBoundingClientRect());
+  let count = 0;
+  const visit = node => {
+    if (++count > 10000) throw new Error();
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (node.data) { const range = document.createRange(); range.selectNodeContents(node); for (const rect of range.getClientRects()) add(rect); }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) throw new Error();
+    const el = node, style = getComputedStyle(el);
+    if (!['DIV', 'SPAN', 'P', 'B', 'I', 'STRONG', 'EM', 'SMALL', 'BR'].includes(el.tagName) || el.shadowRoot ||
+        style.textShadow !== 'none' || style.boxShadow !== 'none' || style.filter !== 'none' ||
+        (style.webkitBoxReflect !== 'none' && style.webkitBoxReflect !== '') || style.transform !== 'none' || style.perspective !== 'none' ||
+        style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' || style.offsetPath !== 'none' ||
+        style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth || '0') > 0 ||
+        (style.zoom !== '1' && style.zoom !== 'normal') || style.clipPath !== 'none' || style.clip !== 'auto' ||
+        style.overflowX !== 'visible' || style.overflowY !== 'visible' || style.outlineStyle !== 'none') throw new Error();
+    for (const pseudo of ['::before', '::after']) { const content = getComputedStyle(el, pseudo).content; if (content !== 'none' && content !== 'normal') throw new Error(); }
+    add(el.getBoundingClientRect());
+    for (const child of el.childNodes) visit(child);
+  };
+  for (const child of this.childNodes) visit(child);
+  return { hostId: state.ids.get(this.host), rects };
+}`;
 const bindingName = '__foliomeLoginObservation';
 // Only this adapter-owned script can call the binding in the named isolated world.
 function observationScript(sourceHost: string, approvedHosts: ReadonlySet<string>): string {
@@ -361,12 +412,25 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
         // CDP exposes closed shadow roots without executing page-owned code.
         const dom = await bounded(() => cdp.send('DOM.getDocument', { depth: -1, pierce: true }));
         if (closed) throw new Error('internal');
-        const hasShadow = (value: unknown): boolean => {
-          if (Array.isArray(value)) return value.some(hasShadow);
-          if (!record(value)) return false;
-          return (Array.isArray(value.shadowRoots) && value.shadowRoots.some(root => !record(root) || root.shadowRootType !== 'user-agent')) || Object.entries(value).some(([key, child]) => key !== 'shadowRoots' && hasShadow(child));
+        const shadowRoots: number[] = [];
+        const findShadowHosts = (value: unknown): void => {
+          if (Array.isArray(value)) { for (const child of value) findShadowHosts(child); return; }
+          if (!record(value)) return;
+          if (Array.isArray(value.shadowRoots) && value.shadowRoots.some(root => !record(root) || root.shadowRootType !== 'user-agent')) {
+            for (const root of value.shadowRoots) {
+              if (!record(root)) throw new Error();
+              if (root.shadowRootType === 'user-agent') continue;
+              if (!Number.isSafeInteger(root.backendNodeId)) throw new Error();
+              shadowRoots.push(root.backendNodeId as number);
+              findShadowHosts(root);
+            }
+          }
+          for (const key of ['children', 'contentDocument']) if (value[key]) findShadowHosts(value[key]);
         };
-        if (!record(dom) || !record(dom.root) || hasShadow(dom) || facts.frames.some(frame => frame.index !== 0 && !frame.foreign) || observed.unsupported || observed.geometry.length !== rootNodeCount ||
+        if (!record(dom) || !record(dom.root)) throw new Error();
+        findShadowHosts(dom.root);
+        if (shadowRoots.length > 256) throw new Error();
+        if (observed.unsupported || observed.geometry.length !== rootNodeCount ||
             !Number.isSafeInteger(observed.width) || !Number.isSafeInteger(observed.height) || observed.width < 1 || observed.height < 1) throw new Error();
         const masks: Rect[] = [], labels: { x: number; y: number; number: number }[] = [];
         const elements = new Map(filtered.snapshot.elements.map(element => [element.n, element]));
@@ -378,16 +442,37 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           const bottom = Math.min(observed.height, Math.ceil(r.y + r.height + 4));
           if (right > x && bottom > y) masks.push({ x, y, width: right - x, height: bottom - y });
         };
+        const protectedNodes = new Set<number>();
+        for (const backendNodeId of shadowRoots) {
+          const resolved = await bounded(() => cdp.send('DOM.resolveNode', { backendNodeId, executionContextId: rootContext }));
+          if (!record(resolved) || !record(resolved.object) || typeof resolved.object.objectId !== 'string') throw new Error();
+          const objectId = resolved.object.objectId;
+          let result: unknown;
+          try { result = await bounded(() => cdp.send('Runtime.callFunctionOn', { objectId, functionDeclaration: shadowGeometry, returnByValue: true })); }
+          finally { await bounded(() => cdp.send('Runtime.releaseObject', { objectId })); }
+          if (!record(result) || result.exceptionDetails || !record(result.result) || !record(result.result.value)) throw new Error();
+          const value = result.result.value;
+          if (!Number.isSafeInteger(value.hostId) || !Array.isArray(value.rects) || value.rects.length > 20001) throw new Error();
+          const index = collected.rootIdentities.indexOf(value.hostId as number);
+          if (index < 0) throw new Error();
+          protectedNodes.add(index);
+          for (const rect of value.rects) { if (!record(rect)) throw new Error(); add(rect as unknown as Rect); }
+        }
         for (let i = 0; i < rootNodeCount; i++) {
           const node = facts.nodes[i], geometry = observed.geometry[i], element = elements.get(node.n);
-          if (geometry.mask) add(geometry.rect);
+          if (geometry.mask) { add(geometry.rect); protectedNodes.add(i); }
           // Comparing with the domain result also covers split secrets across nodes.
           const normalized = node.text.normalize('NFKC').replace(/\p{White_Space}/gu, ' ').replace(/[\p{Cf}\p{Cc}]/gu, '').replace(/ +/g, ' ');
-          if (!element || element.text !== normalized) for (const run of geometry.runs) add(run);
+          if (!element || element.text !== normalized) {
+            if (geometry.button) { add(geometry.rect); protectedNodes.add(i); }
+            else if (geometry.runs.length) { for (const run of geometry.runs) add(run); protectedNodes.add(i); }
+          }
           const r = geometry.rect;
           if (element && r.width > 0 && r.height > 0 && r.x < observed.width && r.y < observed.height && r.x + r.width > 0 && r.y + r.height > 0)
             labels.push({ x: Math.max(0, Math.floor(r.x)), y: Math.max(0, Math.floor(r.y)), number: element.n });
         }
+        observed.maskAnimationActive = !Array.isArray(observed.animationTargets) || observed.animationTargets.some(target =>
+          target === null || [...protectedNodes].some(index => observed.geometry[index].ancestors.includes(target)));
         plan = { masks, labels };
       } catch { plan = null; }
       if (closed) throw new Error('internal');
