@@ -34,7 +34,8 @@ type Options = {
   expectedUid: number;
   maxLineBytes: number;
   peerUid?: (socket: Socket) => Promise<number>;
-  onRequest: (request: Request) => unknown | Promise<unknown>;
+  onRequest?: (request: Request) => unknown | Promise<unknown>;
+  createHandler?: () => (request: Request) => unknown | Promise<unknown>;
   onDenied: (code: string) => void;
 };
 
@@ -89,7 +90,9 @@ function parseRequest(bytes: Buffer): Request {
 function create(options: Options): Server {
   if (!Number.isSafeInteger(options.expectedUid) || options.expectedUid < 0 || options.expectedUid > 0xffffffff ||
       !Number.isSafeInteger(options.maxLineBytes) || options.maxLineBytes < 1 || options.maxLineBytes > MAX_LINE_BYTES ||
-      typeof options.onRequest !== 'function' || typeof options.onDenied !== 'function' ||
+      (typeof options.onRequest !== 'function' && typeof options.createHandler !== 'function') ||
+      (options.onRequest !== undefined && typeof options.onRequest !== 'function') ||
+      (options.createHandler !== undefined && typeof options.createHandler !== 'function') || typeof options.onDenied !== 'function' ||
       (options.peerUid !== undefined && typeof options.peerUid !== 'function')) throw new TypeError('invalid channel options');
 
   const server = createServer({ pauseOnConnect: true }, (socket) => {
@@ -107,6 +110,10 @@ function create(options: Options): Server {
     Promise.resolve().then(() => (options.peerUid ?? systemPeerUid)(socket)).then((uid) => {
       if (closed) return;
       if (!Number.isSafeInteger(uid) || uid !== options.expectedUid) return deny('peerUid');
+      let handler: Options['onRequest'];
+      try { handler = options.createHandler ? options.createHandler() : options.onRequest; }
+      catch { return deny('handler'); }
+      if (typeof handler !== 'function') return deny('handler');
       socket.on('data', (chunk: Buffer) => {
         let start = 0;
         while (!closed && start < chunk.length) {
@@ -122,7 +129,7 @@ function create(options: Options): Server {
           socket.pause();
           pending = pending.then(async () => {
             if (closed) return;
-            const response = await options.onRequest(request);
+            const response = await handler(request);
             if (closed || response === undefined) return;
             const serialized = JSON.stringify(response);
             if (serialized === undefined) throw new Error('response');

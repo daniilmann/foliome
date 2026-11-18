@@ -16,7 +16,7 @@ function fixture() {
   const ports = {
     getTask: async (...args: unknown[]) => { calls.push(['getTask', ...args]); return ownerOpened ? { ok: true, task } : { ok: false, code: 'blocked' }; },
     getSnapshot: async (...args: unknown[]) => { calls.push(['getSnapshot', ...args]); return { ok: true, snapshot, image: { bytes, snapshotNumber: 1 } }; },
-    readText: async (...args: unknown[]) => { calls.push(['readText', ...args]); return { ok: true, text: 'synthetic text' }; },
+    readText: async (...args: unknown[]) => { calls.push(['readText', ...args]); return { ok: true, text: 'synthetic text', snapshot: { ...snapshot, snapshot: 2 }, image: { bytes, snapshotNumber: 2 } }; },
   };
   return { calls, ports, task, snapshot, bytes, open: () => { ownerOpened = true; } };
 }
@@ -150,5 +150,79 @@ test('скрывает ошибки портов и изолирует сост�
       assert.deepEqual(Object.keys(response.error).sort(), ['code', 'message']);
       assert.equal(typeof response.error.code, 'number');
     }
+  }
+});
+
+test('ping доступен до завершения рукопожатия', async () => {
+  const create = await loadMcp();
+  const f = fixture();
+  const handler = create(f.ports);
+  assert.deepEqual(await handler(request(2, 'ping')), { jsonrpc: '2.0', id: 2, result: {} });
+  assert.equal((await handler(init)).result.protocolVersion, '2025-11-25');
+  assert.deepEqual(await handler(request(3, 'ping')), { jsonrpc: '2.0', id: 3, result: {} });
+  assert.deepEqual(f.calls, []);
+});
+
+test('согласует поддерживаемую версию с клиентом старого протокола', async () => {
+  const create = await loadMcp();
+  const f = fixture();
+  const handler = create(f.ports);
+  const response = await handler(request(1, 'initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'synthetic-client', version: '1' } }));
+  assert.equal(response.result.protocolVersion, '2025-11-25');
+  assert.equal(await handler(initialized), undefined);
+  assert.deepEqual((await handler(request(2, 'ping'))).result, {});
+  assert.deepEqual(f.calls, []);
+});
+
+test('readText возвращает текст, следующий снимок и соответствующий PNG', async () => {
+  const create = await loadMcp();
+  const f = fixture();
+  const successor = { ...f.snapshot, snapshot: 2 };
+  const ports = { ...f.ports, readText: async () => ({ ok: true, text: 'synthetic text', snapshot: successor, image: { bytes: f.bytes, snapshotNumber: 2 } }) };
+  const handler = create(ports);
+  await handshake(handler);
+  const content = resultContent(await handler(call(2, 'readText', { snapshotNumber: 1, nodeNumber: 2 })));
+  assert.equal(content.length, 3);
+  assert.deepEqual(content[0], { type: 'text', text: 'synthetic text' });
+  assert.equal(content[1].type, 'text');
+  assert.deepEqual(JSON.parse(content[1].text), successor);
+  assert.deepEqual(content[2], { type: 'image', mimeType: 'image/png', data: f.bytes.toString('base64') });
+});
+
+test('readText и snapshot сообщают причину отсутствия PNG без изображения', async (t: any) => {
+  const create = await loadMcp();
+  for (const method of ['snapshot', 'readText']) {
+    for (const code of ['login-step', 'unstable', 'limit', 'error']) {
+      await t.test(`${method}: ${code}`, async () => {
+        const f = fixture();
+        const successor = { ...f.snapshot, snapshot: 2 };
+        const result = { ok: true, snapshot: successor, image: { code } };
+        const ports = { ...f.ports, getSnapshot: async () => result, readText: async () => ({ ...result, text: 'synthetic text' }) };
+        const handler = create(ports);
+        await handshake(handler);
+        const args = method === 'readText' ? { snapshotNumber: 1, nodeNumber: 2 } : {};
+        const content = resultContent(await handler(call(2, method, args)));
+        const offset = method === 'readText' ? 1 : 0;
+        assert.equal(content.length, offset + 2);
+        if (offset) assert.deepEqual(content[0], { type: 'text', text: 'synthetic text' });
+        assert.equal(content[offset].type, 'text');
+        assert.deepEqual(JSON.parse(content[offset].text), successor);
+        assert.deepEqual(content[offset + 1], { type: 'text', text: code });
+      });
+    }
+  }
+});
+
+test('причины отказа readText передаются фиксированными кодами', async (t: any) => {
+  const create = await loadMcp();
+  for (const [code, expected] of [['hidden', 'hidden'], ['disabled', 'disabled'], ['foreign-frame', 'foreign-frame'], ['stale', 'stale'], ['synthetic-unknown', 'internal']]) {
+    await t.test(code, async () => {
+      const f = fixture();
+      const handler = create({ ...f.ports, readText: async () => ({ ok: false, code }) });
+      await handshake(handler);
+      const response = await handler(call(2, 'readText', { snapshotNumber: 1, nodeNumber: 2 }));
+      assert.equal(response.result.isError, true);
+      assert.deepEqual(resultContent(response), [{ type: 'text', text: expected }]);
+    });
   }
 });
