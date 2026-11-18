@@ -3,6 +3,16 @@ const { filterTextSnapshot } = require('../../domain/snapshot-filter.ts') as typ
 type Cdp = {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
   detach(): Promise<void>;
+  on(event: 'Runtime.executionContextCreated', listener: (event: { context: { id: number; name: string; origin: string; auxData?: { frameId?: string } } }) => void): unknown;
+  on(event: 'Runtime.executionContextDestroyed', listener: (event: { executionContextId: number }) => void): unknown;
+  on(event: 'Runtime.executionContextsCleared', listener: () => void): unknown;
+  on(event: 'Runtime.bindingCalled', listener: (event: { name: string; payload: string; executionContextId: number }) => void): unknown;
+  on(event: 'Page.frameNavigated', listener: (event: { frame: { id: string; url: string } }) => void): unknown;
+  off(event: 'Runtime.executionContextCreated', listener: (event: { context: { id: number; name: string; origin: string; auxData?: { frameId?: string } } }) => void): unknown;
+  off(event: 'Runtime.executionContextDestroyed', listener: (event: { executionContextId: number }) => void): unknown;
+  off(event: 'Runtime.executionContextsCleared', listener: () => void): unknown;
+  off(event: 'Runtime.bindingCalled', listener: (event: { name: string; payload: string; executionContextId: number }) => void): unknown;
+  off(event: 'Page.frameNavigated', listener: (event: { frame: { id: string; url: string } }) => void): unknown;
 };
 type FrameTree = { frame: { id: string; url: string }; childFrames?: FrameTree[] };
 type FrameFact = { index: number; host: string; foreign: boolean; unavailable: boolean };
@@ -51,8 +61,9 @@ const expression = `(() => {
     if (!field) for (const child of element.childNodes) if (child.nodeType === 3) text += child.nodeValue || '';
     const fact = { visible, role, text };
     if (field) {
-      const value = !closedField && typeof element.value === 'string' ? element.value : '';
       const type = (element.getAttribute('type') || '').toLowerCase();
+      const textual = tag === 'TEXTAREA' || tag === 'INPUT' && ['', 'text', 'password', 'email', 'tel', 'url', 'search'].includes(type);
+      const value = !closedField && textual && visible && typeof element.value === 'string' ? element.value : '';
       fact.field = closedField || type === 'password' ? 'sealed' : value ? 'filled' : 'empty';
       if (value) secrets.push({ value, kind: type === 'password' ? 'password' : 'login' });
     }
@@ -83,6 +94,38 @@ const expression = `(() => {
 })()`;
 
 const worldName = 'foliome-dom-collector';
+const bindingName = '__foliomeLoginObservation';
+// Only this adapter-owned script can call the binding in the named isolated world.
+function observationScript(sourceHost: string, approvedHosts: ReadonlySet<string>): string {
+  return `(() => {
+    if (globalThis.__foliomeLoginInstalled) return;
+    const allowed = ${JSON.stringify([sourceHost, ...approvedHosts])};
+    const source = allowed[0];
+    let url; try { url = new URL(location.href); } catch { return; }
+    const hostname = url.hostname.toLowerCase().replace(/\\.$/, '');
+    if (url.protocol !== 'https:' || url.port || url.username || url.password ||
+        !(hostname === source || hostname.endsWith('.' + source) || allowed.includes(hostname))) return;
+    globalThis.__foliomeLoginInstalled = true;
+    const field = el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement &&
+      ['text', 'password', 'email', 'tel', 'url', 'search'].includes(el.type);
+    const send = (el, manual) => {
+      if (!field(el)) return;
+      if (!el.getClientRects().length) return;
+      for (let node = el; node; node = node.parentElement) {
+        const style = getComputedStyle(node);
+        if (node.hidden || node.inert || node.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) <= 0) return;
+      }
+      const type = el.type === 'password' ? 'password' : el.autocomplete === 'one-time-code' ? 'code' : 'login';
+      globalThis.${bindingName}(JSON.stringify({ manual, value: el.value, kind: type }));
+    };
+    const scan = () => { for (const el of document.querySelectorAll('input,textarea')) send(el, false); };
+    let manualSent = false;
+    for (const type of ['beforeinput', 'input', 'change', 'paste', 'keydown', 'pointerdown'])
+      addEventListener(type, event => { if (!event.isTrusted) return; if (!manualSent) { manualSent = true; globalThis.${bindingName}(JSON.stringify({ manual: true, value: '', kind: 'login' })); } send(event.target, true); if (type === 'keydown' && event.key === 'Enter') scan(); }, true);
+    for (const type of ['submit', 'click', 'pagehide'])
+      addEventListener(type, event => { if (event.isTrusted) scan(); }, true);
+  })()`;
+}
 const deadline = 5000;
 class NavigationError extends Error {}
 function bounded<T>(operation: () => Promise<T>): Promise<T> {
@@ -118,12 +161,58 @@ function trustedUrl(value: string, sourceHost: string, approvedHosts: ReadonlySe
 async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: readonly string[] }) {
   let closed = false;
   let scriptId: string | undefined;
+  const contexts = new Map<number, { frameId: string; origin: string }>();
+  const frameUrls = new Map<string, string>();
+  const history = new Map<string, Secret>();
+  let historySize = 0, overflow = false, manualInputSeen = false, observationFinished = false;
+  let sourceHost = '';
+  let approvedHosts = new Set<string>();
+  const remember = (secret: Secret) => {
+    if (observationFinished || !secret.value) return;
+    const key = secret.kind + '\0' + secret.value;
+    if (history.has(key)) return;
+    if (history.size >= 4096 || historySize + secret.value.length > 1024 * 1024) { overflow = true; return; }
+    history.set(key, secret);
+    historySize += secret.value.length;
+  };
+  const contextCreated = ({ context }: { context: { id: number; name: string; origin: string; auxData?: { frameId?: string } } }) => {
+    if (context.name === worldName && context.auxData?.frameId && trustedUrl(context.origin, sourceHost, approvedHosts)) contexts.set(context.id, { frameId: context.auxData.frameId, origin: context.origin });
+  };
+  const contextDestroyed = ({ executionContextId }: { executionContextId: number }) => { contexts.delete(executionContextId); };
+  const contextsCleared = () => { contexts.clear(); };
+  const frameNavigated = ({ frame }: { frame: { id: string; url: string } }) => { frameUrls.set(frame.id, frame.url); };
+  const bindingCalled = (event: { name: string; payload: string; executionContextId: number }) => {
+    if (closed || event.name !== bindingName) return;
+    const context = contexts.get(event.executionContextId);
+    const url = context && frameUrls.get(context.frameId);
+    if (!context || !url || !trustedUrl(url, sourceHost, approvedHosts) || new URL(url).origin !== context.origin) return;
+    try {
+      const data: unknown = JSON.parse(event.payload);
+      if (!record(data) || typeof data.manual !== 'boolean' || typeof data.value !== 'string' || !['login', 'password', 'code'].includes(String(data.kind))) { overflow = true; return; }
+      manualInputSeen ||= data.manual;
+      remember({ value: data.value, kind: data.kind as Secret['kind'] });
+    } catch { overflow = true; }
+  };
+  const removeListeners = () => {
+    if (typeof cdp.off !== 'function') return;
+    cdp.off('Runtime.executionContextCreated', contextCreated); cdp.off('Runtime.executionContextDestroyed', contextDestroyed);
+    cdp.off('Runtime.executionContextsCleared', contextsCleared); cdp.off('Runtime.bindingCalled', bindingCalled); cdp.off('Page.frameNavigated', frameNavigated);
+  };
   try {
     if (!config || !Array.isArray(config.approvedHosts ?? [])) throw new Error();
-    const sourceHost = configuredHost(config.sourceHost);
-    const approvedHosts = new Set((config.approvedHosts ?? []).map(configuredHost));
+    sourceHost = configuredHost(config.sourceHost);
+    approvedHosts = new Set((config.approvedHosts ?? []).map(configuredHost));
+    cdp.on('Runtime.executionContextCreated', contextCreated); cdp.on('Runtime.executionContextDestroyed', contextDestroyed);
+    cdp.on('Runtime.executionContextsCleared', contextsCleared); cdp.on('Runtime.bindingCalled', bindingCalled); cdp.on('Page.frameNavigated', frameNavigated);
     await bounded(() => cdp.send('Page.enable'));
-    const registered = await bounded(() => cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: 'void 0', worldName }));
+    const initial = await bounded(() => cdp.send('Page.getFrameTree'));
+    if (!record(initial)) throw new Error();
+    const rememberFrames = (frame: FrameTree) => { frameUrls.set(frame.frame.id, frame.frame.url); for (const child of frame.childFrames ?? []) rememberFrames(child); };
+    rememberFrames(tree(initial.frameTree));
+    await bounded(() => cdp.send('Runtime.enable'));
+    await bounded(() => cdp.send('Runtime.addBinding', { name: bindingName, executionContextName: worldName }));
+    const script = observationScript(sourceHost, approvedHosts);
+    const registered = await bounded(() => cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: script, worldName, runImmediately: true }));
     if (!record(registered) || typeof registered.identifier !== 'string') throw new Error();
     scriptId = registered.identifier;
     async function collect(snapshot: number) {
@@ -195,10 +284,20 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           return { facts: { snapshot, page, frames, nodes, secrets }, observation, rootNodeCount, rootContext };
         });
         if (closed) throw new Error();
+        if (overflow) throw new Error();
+        result.facts.secrets.push(...history.values());
         return result;
       } catch { throw new Error('internal'); }
     }
     return {
+    loginObservations() {
+      if (closed) throw new Error('internal');
+      return { manualInputSeen, hasKnownSecret: history.size > 0 || overflow };
+    },
+    finishLoginObservation() {
+      if (closed) throw new Error('internal');
+      observationFinished = true;
+    },
     async collectText(snapshot: number): Promise<unknown> {
       const { facts } = await collect(snapshot);
       if (closed) throw new Error('internal');
@@ -249,13 +348,14 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
+      removeListeners(); contexts.clear(); frameUrls.clear(); history.clear(); historySize = 0;
       let failed = false;
       try { if (scriptId) await bounded(() => cdp.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId })); } catch { failed = true; }
       try { await bounded(() => cdp.detach()); } catch { failed = true; }
       if (failed) throw new Error('internal');
     },
     };
-  } catch { try { await bounded(() => cdp.detach()); } catch {} throw new Error('internal'); }
+  } catch { closed = true; removeListeners(); contexts.clear(); frameUrls.clear(); history.clear(); try { await bounded(() => cdp.detach()); } catch {} throw new Error('internal'); }
 }
 
 export declare const prepareDomCollector: typeof prepare;

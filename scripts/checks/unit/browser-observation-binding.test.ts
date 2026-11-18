@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { EventEmitter } = require('node:events');
 
 class Deferred<T> {
   promise: Promise<T>;
@@ -37,11 +38,15 @@ function port() {
   const document = new Deferred<unknown>();
   let worlds = 0;
   let documents = 0;
+  const events = new EventEmitter();
   return {
     entered, document,
+    on: events.on.bind(events), off: events.off.bind(events),
     async send(method: string, params?: Record<string, unknown>): Promise<unknown> {
       switch (method) {
-        case 'Page.enable': return {};
+        case 'Page.enable':
+        case 'Runtime.enable':
+        case 'Runtime.addBinding': return {};
         case 'Page.addScriptToEvaluateOnNewDocument': return { identifier: 'script' };
         case 'Page.removeScriptToEvaluateOnNewDocument': return {};
         case 'Page.getFrameTree': return { frameTree: { frame: { id: 'root', url } } };
