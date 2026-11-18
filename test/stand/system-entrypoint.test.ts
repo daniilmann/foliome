@@ -21,8 +21,9 @@ const cleanEnv = () => ({ HOME: os.tmpdir(), PATH: '/usr/bin:/bin:/usr/sbin:/sbi
 async function fixture() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'system-entry-'));
   const home = path.join(dir, 'home');
-  const app = path.join(home, 'Library/Application Support/Foliome');
-  const data = path.join(app, 'data');
+  const homeRoot = path.join(home, 'Library/Application Support/Foliome');
+  const app = path.join(homeRoot, 'app');
+  const data = path.join(homeRoot, 'data');
   const channel = path.join(dir, 'channel');
   await fs.mkdir(data, { recursive: true, mode: 0o700 });
   await fs.mkdir(channel, { mode: 0o700 });
@@ -35,8 +36,8 @@ function evidence() {
   return {
     ownerUid: 501, ownerName: 'synthetic-owner', executorName: 'synthetic-executor',
     home: dir(0o700), app: dir(0o700), data: dir(0o700),
-    channel: { ...dir(0o700, ['0: user:synthetic-executor allow search']), uid: 0 },
-    socket: { type: 'socket', uid: 501, mode: 0o600, links: 1, acl: ['0: user:synthetic-executor allow read,write'] },
+    channel: dir(0o700, ['0: user:synthetic-executor allow search']),
+    socket: { type: 'socket', uid: 501, mode: 0o600, links: 1, acl: ['0: user:synthetic-executor allow write'] },
     adminMembers: ['root', 'synthetic-owner'], canary: 'refused',
   };
 }
@@ -52,7 +53,7 @@ test('наблюдение ОС допускает только ожидаемы
   assert.equal(result.canary, 'refused');
   for (const [key, change] of [
     ['home', { uid: 502 }], ['app', { mode: 0o777 }], ['data', { type: 'symlink' }],
-    ['channel', { uid: 501 }], ['channel', { acl: [] }],
+    ['channel', { uid: 0 }], ['channel', { acl: [] }],
     ['channel', { acl: [...good.channel.acl, '1: user:other allow search'] }],
     ['channel', { acl: ['0: user:synthetic-executor allow search,write'] }],
     ['socket', { type: 'file' }], ['socket', { mode: 0o666 }],
