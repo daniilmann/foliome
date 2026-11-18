@@ -344,3 +344,208 @@ async function failedUpdates() {
     }
   }
 }
+
+// Proposed trusted ports: lifecycle({ phase, db }) pauses acceptance at
+// 'before-commit' (inside the live transaction) and 'after-commit' (before any
+// file mirror publication). launchVerified holds the same gate as acceptance,
+// reconciles durable state and verifies the selected release before execute.
+// These callbacks are supplied by the stand, never by an incoming release.
+const { fork } = require('node:child_process');
+const recoveryChild = String.raw`
+const assert = require('node:assert/strict');
+const { DatabaseSync } = require('node:sqlite');
+const { acceptUpdate, launchVerified } = require(process.argv[1]);
+const f = JSON.parse(process.argv[2]);
+const mode = process.argv[3];
+const target = process.argv[4];
+const sha = process.argv[5];
+let status = 'waiting';
+const send = (message) => process.send(message);
+const waitFor = (word) => new Promise((resolve) => {
+  const receive = (message) => {
+    if (message === word) { process.off('message', receive); resolve(); }
+  };
+  process.on('message', receive);
+});
+process.on('message', (message) => { if (message === 'probe') send({ event: 'probe', status }); });
+function snapshot(db) {
+  return {
+    version: db.prepare('PRAGMA user_version').get().user_version,
+    rows: db.prepare('SELECT id, label FROM entries ORDER BY id').all().map((row) => ({ ...row })),
+    columns: db.prepare('PRAGMA table_info(entries)').all().map((row) => row.name),
+  };
+}
+function live() {
+  const db = new DatabaseSync(f.dbPath, { readOnly: true });
+  try { return snapshot(db); } finally { db.close(); }
+}
+async function run() {
+  if (mode === 'accept') {
+    let migrations = 0;
+    let checked = false;
+    await acceptUpdate({ ...f, sha, allowed: true, sessionActive: false,
+      migrate(db) {
+        migrations++;
+        db.exec("ALTER TABLE entries ADD COLUMN note TEXT; INSERT INTO entries (id, label) VALUES (2, 'synthetic migrated'); PRAGMA user_version = 2;");
+      },
+      compatible(db, selected) { return selected === sha && snapshot(db).version === 2; },
+      selfCheck(db, selected) {
+        assert.equal(selected, sha);
+        assert.equal(migrations, 1);
+        assert.equal(snapshot(db).version, 2);
+        assert.equal(live().version, 1);
+        db.exec("UPDATE entries SET label = 'copy only' WHERE id = 1");
+        assert.equal(live().rows[0].label, 'synthetic original');
+        checked = true;
+      },
+      async lifecycle({ phase, db }) {
+        if (phase !== target) return;
+        assert.equal(checked, true);
+        assert.equal(migrations, 2);
+        const observed = snapshot(db);
+        send({ event: 'boundary', phase, observed });
+        await waitFor('ack');
+        send({ event: 'parked', phase });
+        await new Promise(() => {});
+      },
+    });
+    send({ event: 'finished' });
+  } else {
+    send({ event: 'started' });
+    try {
+      await launchVerified({ ...f,
+        async verify(selected, db) {
+          status = 'verifying';
+          send({ event: 'verify', selected, observed: snapshot(db) });
+          if (mode === 'recovery') {
+            await waitFor('verify-ack');
+            status = 'verified';
+          }
+          return true;
+        },
+        execute(selected, db) {
+          send({ event: 'execute', selected, observed: snapshot(db) });
+          assert.equal(status, 'verified');
+          status = 'executed';
+        },
+      });
+      send({ event: 'finished' });
+    } catch (error) {
+      status = 'blocked';
+      send({ event: 'blocked', message: String(error && error.message) });
+    }
+  }
+}
+run().catch((error) => { send({ event: 'error', message: String(error && error.stack) }); process.exitCode = 1; });
+`;
+
+type ChildMessage = {
+  event: string;
+  phase?: string;
+  selected?: string;
+  observed?: unknown;
+  status?: string;
+  message?: string;
+};
+function recoveryProcess(f: Awaited<ReturnType<typeof updateFixture>>, mode: string, phase = '') {
+  const child = fork(
+    '-e',
+    [
+      recoveryChild,
+      path.resolve('core/adapters/update/install.ts'),
+      JSON.stringify(f),
+      mode,
+      phase,
+      nextSha,
+    ],
+    {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    },
+  );
+  const queue: ChildMessage[] = [];
+  let wake: (() => void) | undefined;
+  child.on('message', (message: ChildMessage) => {
+    queue.push(message);
+    wake?.();
+  });
+  child.on('exit', () => wake?.());
+  return {
+    child,
+    async next(): Promise<ChildMessage> {
+      while (queue.length === 0) {
+        if (child.exitCode !== null || child.signalCode !== null)
+          throw new Error(`child exited: ${child.exitCode ?? child.signalCode}`);
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('child handshake timed out')), 8_000);
+          wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        wake = undefined;
+      }
+      return queue.shift()!;
+    },
+    async stop() {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      child.kill('SIGKILL');
+      await exited;
+    },
+  };
+}
+
+for (const phase of ['before-commit', 'after-commit']) {
+  test(
+    `восстанавливает согласованную активацию после аварийной остановки: ${phase}`,
+    { timeout: 10_000 },
+    async () => {
+      const f = await updateFixture();
+      const accepting = recoveryProcess(f, 'accept', phase);
+      let concurrent: ReturnType<typeof recoveryProcess> | undefined;
+      let fresh: ReturnType<typeof recoveryProcess> | undefined;
+      try {
+        const boundary = await accepting.next();
+        assert.equal(boundary.event, 'boundary', JSON.stringify(boundary));
+        assert.equal(boundary.phase, phase);
+        assert.deepEqual(boundary.observed, migrated);
+        assert.deepEqual(data(f.dbPath), phase === 'before-commit' ? original : migrated);
+        accepting.child.send('ack');
+        assert.equal((await accepting.next()).event, 'parked');
+
+        // A competing launch must either wait at the gate or reject, never execute.
+        concurrent = recoveryProcess(f, 'concurrent');
+        assert.equal((await concurrent.next()).event, 'started');
+        concurrent.child.send('probe');
+        const probe = await concurrent.next();
+        assert.ok(probe.event === 'probe' || probe.event === 'blocked', JSON.stringify(probe));
+        if (probe.event === 'probe') assert.equal(probe.status, 'waiting');
+        await concurrent.stop();
+        await accepting.stop();
+
+        fresh = recoveryProcess(f, 'recovery');
+        assert.equal((await fresh.next()).event, 'started');
+        const verification = await fresh.next();
+        const expectedSha = phase === 'before-commit' ? currentSha : nextSha;
+        const expectedData = phase === 'before-commit' ? original : migrated;
+        assert.equal(verification.event, 'verify', JSON.stringify(verification));
+        assert.equal(verification.selected, expectedSha);
+        assert.deepEqual(verification.observed, expectedData);
+        fresh.child.send('probe');
+        assert.deepEqual(await fresh.next(), { event: 'probe', status: 'verifying' });
+        fresh.child.send('verify-ack');
+        const execution = await fresh.next();
+        assert.equal(execution.event, 'execute', JSON.stringify(execution));
+        assert.equal(execution.selected, expectedSha);
+        assert.deepEqual(execution.observed, expectedData);
+        assert.equal((await fresh.next()).event, 'finished');
+        assert.deepEqual(data(f.dbPath), expectedData);
+      } finally {
+        await fresh?.stop();
+        await concurrent?.stop();
+        await accepting.stop();
+        await fs.rm(f.dir, { recursive: true, force: true });
+      }
+    },
+  );
+}
