@@ -17,6 +17,9 @@ export declare const createPreparationRuntime: typeof create;
 declare const exports: { createPreparationRuntime: typeof create };
 
 function create(ports: Ports, scope: Scope) {
+  const listeners = new Set<() => void>();
+  const changed = () => { for (const listener of listeners) { try { listener(); } catch { /* UI failures do not affect the protocol. */ } } };
+  const rows = Object.assign(() => ports.protocol.list(), { subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; } });
   let current: Session | undefined;
   let lifecycle: Promise<void> = Promise.resolve();
   let failed = false;
@@ -105,6 +108,17 @@ function create(ports: Ports, scope: Scope) {
       return pinned && active(pinned) ? pinned : undefined;
     };
     return createPreparationMcp({
+      async unsupported(_category) {
+        const session = get();
+        if (!session || !session.observation || session.number < 1) return;
+        try {
+          ports.protocol.appendVerdict({ ...scope, sessionId: session.sessionId, snapshotNumber: session.number, nodeNumber: null, method: 'other', actionClass: 'unknown', decision: 'blocked', reason: 'unsupported' });
+          changed();
+        } catch {
+          if (current === session) void closeSource().catch(() => {});
+          return { ok: false as const, code: 'protocol-unavailable' as const };
+        }
+      },
       async getTask() { return get() ? { ok: true, task: { type: 'preparation', sourceId: scope.sourceId, instruction: scope.instruction } } : unavailable(); },
       async getSnapshot() { const session = get(); return session ? snapshot(session) : unavailable(); },
       async readText(args) {
@@ -120,6 +134,7 @@ function create(ports: Ports, scope: Scope) {
             protocol: ports.protocol, onProtocolUnavailable: () => { void closeSource().catch(() => {}); },
           });
           const result = await reader.read({ method: 'readText', actionClass: 'read', ...args }, session.observation);
+          changed();
           if (!result.ok) return result;
           return { ok: true as const, text: result.data.text ?? '', snapshot: result.data.snapshot, image: result.data.image };
         } catch { return { ok: false as const, code: 'internal' as const }; }
@@ -127,6 +142,6 @@ function create(ports: Ports, scope: Scope) {
       },
     });
   }
-  return { open, closeSource, shutdown: closeSource, confirmLogin, observeSnapshot, createHandler, rows: () => ports.protocol.list() };
+  return { open, closeSource, shutdown: closeSource, confirmLogin, observeSnapshot, createHandler, rows };
 }
 exports.createPreparationRuntime = create;

@@ -9,6 +9,7 @@ type Ports = {
   getTask(): Promise<Failure | { ok: true; task: { type: 'preparation'; sourceId: string; instruction: string } }>;
   getSnapshot(): Promise<Failure | SnapshotResult>;
   readText(args: ReadArgs): Promise<Failure | (SnapshotResult & { text: string })>;
+  unsupported?(category: 'unsupported'): Promise<Failure | void>;
 };
 export declare const createPreparationMcp: typeof create;
 declare const exports: { createPreparationMcp: typeof create };
@@ -72,6 +73,11 @@ function create(ports: Ports) {
       if (message.method !== 'tools/call') return error(METHOD);
       const p = message.params;
       if (!fields(p, ['name', 'arguments'], ['name']) || typeof p.name !== 'string') return error(INVALID);
+      if (p.name !== 'current_task' && p.name !== 'snapshot' && p.name !== 'readText') {
+        const result = await ports.unsupported?.('unsupported');
+        if (result && !result.ok && result.code === 'protocol-unavailable') return reply({ content: [{ type: 'text', text: result.code }], isError: true });
+        return error(METHOD);
+      }
       const args = Object.hasOwn(p, 'arguments') ? p.arguments : {};
       if (!fields(args, p.name === 'readText' ? ['snapshotNumber', 'nodeNumber', 'options'] : [], p.name === 'readText' ? ['snapshotNumber', 'nodeNumber'] : [])) return error(INVALID);
       let result: Awaited<ReturnType<Ports['getTask']>> | Awaited<ReturnType<Ports['getSnapshot']>> | Awaited<ReturnType<Ports['readText']>>;

@@ -19,11 +19,11 @@ type Context = {
   route(url: string, handler: (route: Route) => Promise<void>): Promise<void>;
   routeWebSocket(url: string, handler: (socket: { close(): void | Promise<void> }) => void): Promise<void>;
 };
-type Page = { mainFrame(): object; on(event: 'close', listener: () => void): unknown };
+type Page = { mainFrame(): object; on(event: 'close', listener: () => void): unknown; goto(url: string): Promise<unknown> };
 type Options = Readonly<{
   context: Context;
   page: Page;
-  rows: () => readonly Row[];
+  rows: (() => readonly Row[]) & { subscribe?: (listener: () => void) => () => void };
   onLoginComplete: (sessionId: string) => boolean;
 }>;
 
@@ -71,9 +71,26 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
   const usedNonces = new Set<string>();
   let pending: Pending | null = null;
   let closed = false;
+  let updating = false;
+  let dirty = false;
+  let unsubscribe: (() => void) | undefined;
+
+  function refresh(): void {
+    if (closed) return;
+    dirty = true;
+    if (updating) return;
+    updating = true;
+    void (async () => {
+      while (dirty && !closed) {
+        dirty = false;
+        try { await page.goto(`${origin}/`); } catch { /* Window may have closed. */ }
+      }
+    })().finally(() => { updating = false; });
+  }
 
   function close(): void {
     closed = true;
+    unsubscribe?.();
     pending = null;
     confirmation.close();
   }
@@ -127,7 +144,8 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
     }
     try { await route.abort(); } catch { /* The request may already be gone. */ }
   });
-  return { begin, close };
+  unsubscribe = rows.subscribe?.(refresh);
+  return { begin, close, refresh };
 }
 
 exports.attachOwnerWindow = attach;
