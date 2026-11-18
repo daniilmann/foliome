@@ -74,6 +74,7 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
   let updating = false;
   let dirty = false;
   let unsubscribe: (() => void) | undefined;
+  let status = '';
 
   function refresh(): void {
     if (closed) return;
@@ -125,7 +126,7 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
         const table = renderProtocol(rows());
         if (closed) throw new Error('refused');
         const form = pending === null ? '' : `<form method="post" action="${endpoint}"><input type="hidden" name="sessionId" value="${escapeAttribute(pending.sessionId)}"><input type="hidden" name="nonce" value="${escapeAttribute(pending.nonce)}"><button type="submit">Вход завершён, продолжить</button></form>`;
-        await route.fulfill({ status: 200, headers, body: `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}</body></html>` });
+        await route.fulfill({ status: 200, headers, body: `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}<p>${escapeAttribute(status)}</p></body></html>` });
         return;
       }
       if (request.method() === 'POST' && url === `${origin}${endpoint}`) {
@@ -145,7 +146,7 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
     try { await route.abort(); } catch { /* The request may already be gone. */ }
   });
   unsubscribe = rows.subscribe?.(refresh);
-  return { begin, close, refresh };
+  return { begin, close, refresh, cancel() { pending = null; confirmation.close(); refresh(); }, setStatus(value: string) { status = value; refresh(); } };
 }
 
 exports.attachOwnerWindow = attach;

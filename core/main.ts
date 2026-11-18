@@ -14,7 +14,7 @@ type Ports = { browser: Browser; protocol: ReturnType<typeof createActionProtoco
 type Scope = { sessionId: string; sourceId: string; accessId: string; instruction: string };
 type Session = { sessionId: string; ready: boolean; confirmed: boolean; number: number; busy: boolean; observation?: Awaited<ReturnType<Collector['observeTargets']>> & Pick<Scope, 'sessionId' | 'sourceId' | 'accessId'> };
 export declare const createPreparationRuntime: typeof create;
-declare const exports: { createPreparationRuntime: typeof create };
+declare const exports: { createPreparationRuntime: typeof create; createInstalledKernel: typeof createInstalled };
 
 function create(ports: Ports, scope: Scope) {
   const listeners = new Set<() => void>();
@@ -58,7 +58,7 @@ function create(ports: Ports, scope: Scope) {
     if (!session?.ready || session.confirmed || id !== session.sessionId) return false;
     try { ports.browser.finishLoginObservation(); session.confirmed = true; return true; } catch { return false; }
   }
-  function active(session: Session) { return current === session && session.ready && session.confirmed; }
+  function active(session: Session) { return current === session && session.ready && session.confirmed && ports.executorRunning(); }
   async function capture(session: Session, number: number) {
     return captureCabinetSnapshot({
       collect: () => ports.browser.collectFrame(number), capturePng: () => ports.browser.capturePng(), now: ports.now, sleep: ports.sleep,
@@ -145,3 +145,8 @@ function create(ports: Ports, scope: Scope) {
   return { open, closeSource, shutdown: closeSource, confirmLogin, observeSnapshot, createHandler, rows };
 }
 exports.createPreparationRuntime = create;
+
+
+const { createInstalledKernel: createInstalled } = require('./adapters/installed-kernel.ts') as typeof import('./adapters/installed-kernel.ts');
+export declare const createInstalledKernel: typeof createInstalled;
+exports.createInstalledKernel = createInstalled;
