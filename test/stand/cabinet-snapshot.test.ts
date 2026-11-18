@@ -691,10 +691,59 @@ test('закрытый shadow host и разрешённый фрейм не р�
   });
 });
 
+test('снимок соответствует наблюдаемой области при несовпадении размеров и прокрутке', { timeout: 60_000 }, async (t: any) => {
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  await t.test('отклоняет PNG другого размера, сохраняя текст', async () => {
+    const { ports, observation, deviations } = syntheticPorts();
+    ports.collect = async () => ({ ...observation(), viewport: { x: 0, y: 0, width: 2, height: 2 } });
+    const result = await captureCabinetSnapshot(ports, () => session, 1000);
+    assert.equal(result.ok, true);
+    assert.equal(result.snapshot.snapshot, 11);
+    assert.ok(JSON.stringify(result.snapshot).includes('Synthetic marker'));
+    assert.deepEqual(result.image, { code: 'error' });
+    assert.equal(deviations.at(-1)?.code, 'error');
+  });
+
+  await t.test('снимает только прокрученную область и закрашивает поле', async () => {
+    await measuredPage(`
+      <style>body{height:660px} #above{left:0;top:0;width:480px;height:400px;background:rgb(20,30,220)}
+      #visible{left:0;top:400px;width:480px;height:260px;background:rgb(210,160,20)}</style>
+      <div id="above"></div><div id="visible"></div>
+      <input id="mask" type="password" value="synthetic-value" style="left:60px;top:450px;width:100px;height:30px;background:rgb(240,30,50)">
+      <div id="bottom" style="left:400px;top:640px;width:20px;height:20px;background:rgb(20,100,220)"></div>`, async ({ page, capture, decode, collector }: any) => {
+      await page.locator('#bottom').scrollIntoViewIfNeeded();
+      const viewport = await page.evaluate(() => ({ x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }));
+      assert.deepEqual(viewport, { x: 0, y: 400, width: 480, height: 260 });
+      assert.deepEqual((await collector.collectFrame(51)).viewport, viewport);
+      const before = await decode(await capture.raw());
+      assert.equal(before.width, viewport.width); assert.equal(before.height, viewport.height);
+      assert.deepEqual(pixelAt(before, 300, 100), [210, 160, 20, 255]);
+      assert.deepEqual(pixelAt(before, 410, 250), [20, 100, 220, 255]);
+      const box = await page.locator('#mask').boundingBox();
+      const bottom = await page.locator('#bottom').boundingBox();
+      assert.ok(box && bottom);
+      const contains = (area: any, x: number, y: number) => x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height;
+      for (let y = 0; y < viewport.height; y++) for (let x = 0; x < viewport.width; x++) {
+        if (!contains(box, x, y)) assert.deepEqual(pixelAt(before, x, y), contains(bottom, x, y) ? [20, 100, 220, 255] : [210, 160, 20, 255], `raw pixel ${x},${y}`);
+      }
+      const result = await capture.result();
+      assert.equal(result.ok, true);
+      assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+      const after = await decode(result.image.bytes);
+      assert.equal(after.width, viewport.width); assert.equal(after.height, viewport.height);
+      const labels = await numberedLabelAreas(page);
+      assertRectBlack(after, box, labels);
+      for (let y = 0; y < viewport.height; y++) for (let x = 0; x < viewport.width; x++) {
+        if (!contains(box, x, y) && !isNumberedLabelPixel(x, y, labels)) assert.deepEqual(pixelAt(after, x, y), pixelAt(before, x, y), `protected pixel ${x},${y}`);
+      }
+    });
+  });
+});
+
 async function measuredPage(body: string, run: (fixture: any) => Promise<void>) {
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
-  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const { captureCabinetSnapshot, captureViewportPng } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
   const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
   try {
     const context = await browser.newContext({ viewport: { width: 480, height: 260 }, deviceScaleFactor: 1, serviceWorkers: 'block' });
@@ -711,7 +760,7 @@ async function measuredPage(body: string, run: (fixture: any) => Promise<void>) 
       const collector = await prepareDomCollector(cdp, { sourceHost: 'cabinet.invalid', approvedHosts: [] });
       try {
         await page.goto(`${origin}/overview`, { waitUntil: 'load' });
-        const raw = async () => Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })).data, 'base64');
+        const raw = async (viewport?: any) => captureViewportPng(cdp, viewport ?? (await collector.collectFrame(51)).viewport);
         const timer = clock();
         const result = () => captureCabinetSnapshot({ collect: () => collector.collectFrame(51), capturePng: raw, now: timer.now, sleep: timer.sleep, recordDeviation: async () => {} }, () => session, 600);
         const decoder = await context.newPage();
@@ -719,9 +768,9 @@ async function measuredPage(body: string, run: (fixture: any) => Promise<void>) 
           const image = new Image(); image.src = `data:image/png;base64,${encoded}`; await image.decode();
           const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
           const ctx = canvas.getContext('2d')!; ctx.drawImage(image, 0, 0);
-          return { width: image.width, data: Array.from(ctx.getImageData(0, 0, image.width, image.height).data) };
+          return { width: image.width, height: image.height, data: Array.from(ctx.getImageData(0, 0, image.width, image.height).data) };
         }, bytes.toString('base64'));
-        await run({ page, capture: { raw, result }, decode });
+        await run({ page, collector, capture: { raw, result }, decode });
       } finally { await collector.close(); }
     } finally { await context.close(); }
   } finally { await browser.close(); }
