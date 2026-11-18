@@ -39,9 +39,67 @@ async function entry(file: string) {
   if (acl.some(line => !/^\d+: /.test(line))) throw Error();
   return { type: stat.isDirectory() ? 'directory' : stat.isSocket() ? 'socket' : stat.isSymbolicLink() ? 'symlink' : 'file', uid: stat.uid, mode: stat.mode & 0o7777, links: stat.nlink, acl };
 }
-type SocketOptions = { path: string; handler(socket: import('node:net').Socket): void; configure(file: string): Promise<void> };
+type SocketOptions = { path: string; handler(socket: import('node:net').Socket): void; configure(file: string): Promise<void>; recoverStale?: boolean };
+type Stat = Awaited<ReturnType<typeof fs.lstat>>;
+const sameSocket = (a: Stat, b: Stat) => a.isSocket() && b.isSocket() && a.dev === b.dev && a.ino === b.ino;
+async function socketLease(file: string, lost: () => void): Promise<() => Promise<void>> {
+  const { createHash } = require('node:crypto') as typeof import('node:crypto');
+  const name = createHash('sha256').update(path.basename(file)).digest('hex').slice(0, 24);
+  const lock = path.join(path.dirname(file), `.lock-${name}`);
+  const handle = await fs.open(lock, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    const stat = await handle.stat();
+    const current = await fs.lstat(lock);
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.nlink !== 1 || (stat.mode & 0o7777) !== 0o600 || stat.dev !== current.dev || stat.ino !== current.ino) throw Error();
+    child = spawn('/usr/bin/perl', ['-e', 'open(my $f, "+<&=3") or exit 1; flock($f, 6) or exit 1; $|=1; print "locked\n"; while (sysread(STDIN, my $b, 256)) {}'], { env: {}, stdio: ['pipe', 'pipe', 'ignore', handle.fd] });
+    const processChild = child;
+    processChild.stdin!.on('error', () => {});
+    await new Promise<void>((resolve, reject) => {
+      let output = '';
+      const timer = setTimeout(() => finish(false), 1000);
+      const finish = (ok: boolean) => { clearTimeout(timer); processChild.stdout!.off('data', data); processChild.off('exit', fail); processChild.off('error', fail); ok ? resolve() : reject(Error()); };
+      const fail = () => finish(false);
+      const data = (chunk: Buffer) => { output += chunk.toString(); if (output === 'locked\n') finish(true); else if (!'locked\n'.startsWith(output)) finish(false); };
+      processChild.stdout!.on('data', data);
+      processChild.once('exit', fail);
+      processChild.once('error', fail);
+    });
+    const after = await fs.lstat(lock);
+    if (after.dev !== stat.dev || after.ino !== stat.ino || !after.isFile() || after.uid !== stat.uid || after.nlink !== 1 || (after.mode & 0o7777) !== 0o600) throw Error();
+    let releasing = false;
+    processChild.once('exit', () => { if (!releasing) lost(); });
+    if (processChild.exitCode !== null || processChild.signalCode !== null) throw Error();
+    await handle.close();
+    return async () => {
+      releasing = true;
+      if (processChild.exitCode !== null || processChild.signalCode !== null) return;
+      await new Promise<void>(resolve => { processChild.once('exit', () => resolve()); processChild.stdin!.end(); });
+    };
+  } catch (error) {
+    child?.kill();
+    await handle.close();
+    throw error;
+  }
+}
+async function refused(file: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = net.createConnection(file);
+    let done = false;
+    const finish = (value: boolean) => { if (done) return; done = true; socket.destroy(); resolve(value); };
+    socket.setTimeout(500, () => finish(false));
+    socket.once('connect', () => finish(false));
+    socket.once('error', error => finish((error as NodeJS.ErrnoException).code === 'ECONNREFUSED'));
+  });
+}
 async function openSocket(options: SocketOptions): Promise<{ ok: true; close(): Promise<void> } | { ok: false; code: 'unavailable' }> {
+  let release: (() => Promise<void>) | undefined;
+  let stageDir: string | undefined;
+  let stage: string | undefined;
+  let bound: Stat | undefined;
   let ready = false;
+  let leaseLost = false;
+  let closePromise: Promise<void> | undefined;
   const clients = new Set<import('node:net').Socket>();
   const server = net.createServer({ pauseOnConnect: true }, socket => {
     clients.add(socket);
@@ -50,27 +108,49 @@ async function openSocket(options: SocketOptions): Promise<{ ok: true; close(): 
     if (!ready) socket.destroy();
     else options.handler(socket);
   });
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(options.path, () => { server.off('error', reject); resolve(); });
-    });
-  } catch { return { ok: false, code: 'unavailable' }; }
   server.on('error', () => {});
-  let bound: Awaited<ReturnType<typeof fs.lstat>>;
-  try { bound = await fs.lstat(options.path); }
-  catch { server.unref(); return { ok: false, code: 'unavailable' }; }
-  const close = async () => {
+  const close = () => closePromise ??= (async () => {
     ready = false;
     for (const client of clients) client.destroy();
-    try {
-      const current = await fs.lstat(options.path);
-      if (!current.isSocket() || current.dev !== bound.dev || current.ino !== bound.ino) { server.unref(); return; }
-    } catch { server.unref(); return; }
     if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
-  };
+    if (bound) {
+      try { if (sameSocket(bound, await fs.lstat(options.path))) await fs.unlink(options.path); } catch { /* Preserve anything we cannot identify. */ }
+    }
+    if (stageDir) { try { await fs.rmdir(stageDir); } catch { /* Leave unexpected entries untouched. */ } }
+    await release?.();
+  })();
   try {
-    await options.configure(options.path);
+    release = await socketLease(options.path, () => { leaseLost = true; if (ready) void close(); });
+    let existing: Stat | undefined;
+    try { existing = await fs.lstat(options.path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (existing) {
+      if (!options.recoverStale || !existing.isSocket() || existing.uid !== process.getuid?.() || existing.nlink !== 1 || !await refused(options.path)) throw Error();
+      const current = await fs.lstat(options.path);
+      if (leaseLost || !sameSocket(existing, current) || current.uid !== existing.uid || current.nlink !== 1) throw Error();
+      await fs.unlink(options.path);
+    }
+    stageDir = await fs.mkdtemp(path.join(path.dirname(options.path), '.s'));
+    await fs.chmod(stageDir, 0o700);
+    stage = path.join(stageDir, 's');
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(stage!, () => { server.off('error', reject); resolve(); });
+    });
+    bound = await fs.lstat(stage);
+    if (!bound.isSocket() || bound.uid !== process.getuid?.() || bound.nlink !== 1) throw Error();
+    await options.configure(stage);
+    const configured = await fs.lstat(stage);
+    if (!sameSocket(bound, configured) || configured.uid !== bound.uid || configured.nlink !== 1) throw Error();
+    if (leaseLost) throw Error();
+    await fs.link(stage, options.path);
+    const published = await fs.lstat(options.path);
+    const staged = await fs.lstat(stage);
+    if (!sameSocket(bound, published) || !sameSocket(bound, staged) || published.nlink !== 2 || staged.nlink !== 2 || published.uid !== bound.uid) throw Error();
+    await fs.unlink(stage);
+    const final = await fs.lstat(options.path);
+    if (!sameSocket(bound, final) || final.uid !== bound.uid || final.nlink !== 1) throw Error();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (leaseLost) throw Error();
     ready = true;
     return { ok: true, close };
   } catch {

@@ -179,7 +179,7 @@ async function createInstalled(options: Options) {
     } });
     const configure = options.configureSocket ?? (process.platform === 'darwin' && options.executorUid === process.getuid?.() ? createSocketConfiguration(options.executorUid, os.userInfo().username) : undefined);
     if (!configure) throw new Error('boundary-permissions');
-    const channel = await openSystemSocket({ path: options.paths.socket, configure, handler: socket => { server.emit('connection', socket); } });
+    const channel = await openSystemSocket({ path: options.paths.socket, configure, recoverStale: true, handler: socket => { server.emit('connection', socket); } });
     if (!channel.ok) throw new Error('boundary-permissions');
     channelClose = channel.close;
     return {
