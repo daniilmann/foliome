@@ -94,6 +94,7 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
   let retakes = 0;
   let flags: readonly SnapshotDeviationFlag[] = [];
   let snapshot: Filtered | undefined;
+  let collectingText = false;
   const record = async (code: DeviationCode): Promise<boolean> => {
     if (!snapshot) return false;
     try {
@@ -116,11 +117,13 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
   try {
     while (true) {
       if (!currentSession()) return revoked();
+      collectingText = true;
       const first = await bounded(() => { if (!currentSession()) throw new SessionRevoked(); return ports.collect(); }, remaining());
       const session = currentSession();
       if (!session) return revoked();
       const filtered = filterTextSnapshot(first.facts);
       if (!filtered.ok) return { ok: false, code: 'internal' };
+      collectingText = false;
       snapshot = filtered.snapshot;
       const login = decidePngGate({ ...session, stable: true, withinLimits: true, maskApplied: true });
       if (!login.ok) return login.code === 'login-step' ? { ok: true, snapshot, image: { code: 'login-step' } } : await fail(login.code);
@@ -132,11 +135,13 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
         return ports.capturePng();
       }, remaining());
       if (!currentSession()) return revoked();
+      collectingText = true;
       const second = await bounded(() => { if (!currentSession()) throw new SessionRevoked(); return ports.collect(); }, remaining());
       const latest = currentSession();
       if (!latest) return revoked();
       const checked = filterTextSnapshot(second.facts);
       if (!checked.ok) return { ok: false, code: 'internal' };
+      collectingText = false;
       if (!validFrame(second) || !validPlan(second.plan)) return await fail('error');
       const differences: SnapshotDeviationFlag[] = [];
       if (!isDeepStrictEqual(baseline.facts, second.facts) || !isDeepStrictEqual(baseline.binding, second.binding)) differences.push('flow');
@@ -168,6 +173,7 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
   } catch (error) {
     try {
       if (error instanceof SessionRevoked || !currentSession()) return revoked();
+      if (collectingText) return { ok: false, code: 'internal' };
       return await fail(error instanceof Deadline ? 'unstable' : 'error');
     } catch { return { ok: false, code: 'internal' }; }
   }
