@@ -9,6 +9,7 @@ const { filterTextSnapshot } = require('../../domain/snapshot-filter.ts') as typ
 const { decidePngGate } = require('../../domain/png-gate.ts') as typeof import('../../domain/png-gate.ts');
 const { protectPng } = require('./png.ts') as typeof import('./png.ts');
 
+export type Viewport = Readonly<{ x: number; y: number; width: number; height: number }>;
 type Session = Omit<PngGateFacts, 'stable' | 'maskApplied' | 'withinLimits'>;
 type Frame = Readonly<{
   facts: unknown;
@@ -16,6 +17,7 @@ type Frame = Readonly<{
   binding?: Binding;
   revision: number;
   animationIds: readonly string[];
+  viewport?: Viewport;
   viewportStable: boolean;
   maskAnimationActive: boolean;
 }>;
@@ -32,7 +34,7 @@ type Deviation = Readonly<{
 }>;
 type Ports = Readonly<{
   collect: () => Promise<Frame>;
-  capturePng: () => Promise<Buffer>;
+  capturePng: (viewport?: Viewport) => Promise<Buffer>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   recordDeviation: (entry: Deviation) => Promise<void>;
@@ -42,7 +44,21 @@ type Image = { code: 'login-step' | 'unstable' | 'limit' | 'error' } | { bytes: 
 type Result = { ok: true; snapshot: Filtered; image: Image; binding?: Binding } | { ok: false; code: 'internal' | 'protocol-unavailable' | 'session-revoked' };
 
 export declare const captureCabinetSnapshot: typeof capture;
-declare const exports: { captureCabinetSnapshot: typeof capture };
+export declare const captureViewportPng: typeof captureViewport;
+declare const exports: { captureCabinetSnapshot: typeof capture; captureViewportPng: typeof captureViewport };
+
+function validViewport(viewport: Viewport): boolean {
+  return !!viewport && [viewport.x, viewport.y, viewport.width, viewport.height].every(Number.isSafeInteger) &&
+    viewport.x >= 0 && viewport.y >= 0 && viewport.width > 0 && viewport.height > 0 &&
+    Number.isSafeInteger(viewport.x + viewport.width) && Number.isSafeInteger(viewport.y + viewport.height);
+}
+
+async function captureViewport(cdp: { send(method: string, params?: Record<string, unknown>): Promise<unknown> }, viewport?: Viewport): Promise<Buffer> {
+  if (!viewport || !validViewport(viewport) || viewport.width > 1600 || viewport.height > 1200) throw new Error('viewport');
+  const result = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false, clip: { ...viewport, scale: 1 } });
+  if (!result || typeof result !== 'object' || !('data' in result) || typeof result.data !== 'string') throw new Error('capture');
+  return Buffer.from(result.data, 'base64');
+}
 
 class Deadline extends Error {}
 class SessionRevoked extends Error {}
@@ -129,10 +145,13 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
       if (!login.ok) return login.code === 'login-step' ? { ok: true, snapshot, image: { code: 'login-step' } } : await fail(login.code);
       if (!validFrame(first) || !validPlan(first.plan)) return await fail('error');
       const baseline = structuredClone(first);
+      if (baseline.viewport !== undefined && !validViewport(baseline.viewport)) return await fail('error');
+      if (baseline.viewport && (baseline.viewport.width > 1600 || baseline.viewport.height > 1200)) return await fail('limit');
+      if (!baseline.viewportStable) return await fail('error');
       if (!currentSession()) return revoked();
       const bytes = await bounded(() => {
         if (!currentSession()) throw new SessionRevoked();
-        return ports.capturePng();
+        return ports.capturePng(baseline.viewport);
       }, remaining());
       if (!currentSession()) return revoked();
       collectingText = true;
@@ -149,7 +168,7 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
       if (baseline.maskAnimationActive || second.maskAnimationActive ||
         !isDeepStrictEqual([...baseline.animationIds].sort(), [...second.animationIds].sort())) differences.push('animations');
       if (baseline.revision !== second.revision) differences.push('observer');
-      if (!baseline.viewportStable || !second.viewportStable) differences.push('visualViewport');
+      if (!baseline.viewportStable || !second.viewportStable || !isDeepStrictEqual(baseline.viewport, second.viewport)) differences.push('visualViewport');
       flags = differences;
       if (flags.length !== 0) {
         retakes++;
@@ -161,7 +180,7 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
         continue;
       }
       if (!validPlan(baseline.plan)) return await fail('error');
-      const protectedImage = protectPng(bytes, baseline.plan);
+      const protectedImage = protectPng(bytes, baseline.plan, baseline.viewport);
       if (remaining() <= 0) return await fail('unstable');
       if (!protectedImage.ok) return await fail(protectedImage.code);
       const finalSession = currentSession();
@@ -180,3 +199,5 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
 }
 
 exports.captureCabinetSnapshot = capture;
+
+exports.captureViewportPng = captureViewport;

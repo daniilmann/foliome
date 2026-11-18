@@ -21,7 +21,8 @@ type NodeFact = { n: number; frame: number; parent?: number; visible: boolean; r
 type Secret = { value: string; kind: 'login' | 'password' | 'code' };
 type Rect = { x: number; y: number; width: number; height: number };
 type Geometry = { rect: Rect; runs: Rect[]; mask: boolean; button: boolean; ancestors: number[] };
-type Observation = { geometry: Geometry[]; width: number; height: number; revision: number; animationIds: string[]; animationTargets: (number | null)[]; viewportStable: boolean; maskAnimationActive: boolean; unsupported: boolean };
+type Viewport = { x: number; y: number; width: number; height: number };
+type Observation = { viewport: Viewport; geometry: Geometry[]; width: number; height: number; revision: number; animationIds: string[]; animationTargets: (number | null)[]; viewportStable: boolean; maskAnimationActive: boolean; unsupported: boolean };
 type DocumentFacts = { url: string; title: string; nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[]; parents: (number | null)[]; identities: number[]; classes: ('blocked-payment' | 'blocked-change' | null)[]; semantics: string[]; secrets: Secret[]; embeds: { url: string; visible: boolean }[]; observation: Observation };
 
 // This expression is owned by the adapter and runs only in its isolated world.
@@ -110,8 +111,8 @@ const expression = `(() => {
     return target instanceof Element && document.contains(target) && state.ids.has(target) ? state.ids.get(target) : null;
   });
   const viewport = visualViewport;
-  const viewportStable = !!viewport && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.width === innerWidth && viewport.height === innerHeight;
-  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported } };
+  const viewportStable = !!viewport && devicePixelRatio === 1 && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.pageLeft === scrollX && viewport.pageTop === scrollY && viewport.width === innerWidth && viewport.height === innerHeight;
+  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported } };
 })()`;
 
 const worldName = 'foliome-dom-collector';
@@ -434,12 +435,12 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
             !Number.isSafeInteger(observed.width) || !Number.isSafeInteger(observed.height) || observed.width < 1 || observed.height < 1) throw new Error();
         const masks: Rect[] = [], labels: { x: number; y: number; number: number }[] = [];
         const elements = new Map(filtered.snapshot.elements.map(element => [element.n, element]));
-        const add = (r: Rect) => {
+        const add = (r: Rect, padding = 4) => {
           if (![r.x, r.y, r.width, r.height].every(Number.isFinite)) throw new Error();
           if (r.width <= 0 || r.height <= 0) return;
-          const x = Math.max(0, Math.floor(r.x - 4)), y = Math.max(0, Math.floor(r.y - 4));
-          const right = Math.min(observed.width, Math.ceil(r.x + r.width + 4));
-          const bottom = Math.min(observed.height, Math.ceil(r.y + r.height + 4));
+          const x = Math.max(0, Math.floor(r.x - padding)), y = Math.max(0, Math.floor(r.y - padding));
+          const right = Math.min(observed.width, Math.ceil(r.x + r.width + padding));
+          const bottom = Math.min(observed.height, Math.ceil(r.y + r.height + padding));
           if (right > x && bottom > y) masks.push({ x, y, width: right - x, height: bottom - y });
         };
         const protectedNodes = new Set<number>();
@@ -460,7 +461,7 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
         }
         for (let i = 0; i < rootNodeCount; i++) {
           const node = facts.nodes[i], geometry = observed.geometry[i], element = elements.get(node.n);
-          if (geometry.mask) { add(geometry.rect); protectedNodes.add(i); }
+          if (geometry.mask) { add(geometry.rect, node.role === 'input' && node.field && observed.viewport ? 0 : 4); protectedNodes.add(i); }
           // Comparing with the domain result also covers split secrets across nodes.
           const normalized = node.text.normalize('NFKC').replace(/\p{White_Space}/gu, ' ').replace(/[\p{Cf}\p{Cc}]/gu, '').replace(/ +/g, ' ');
           if (!element || element.text !== normalized) {
@@ -476,7 +477,7 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
         plan = { masks, labels };
       } catch { plan = null; }
       if (closed) throw new Error('internal');
-      return { facts, plan, binding, revision: observed.revision, animationIds: [`document:${rootContext}`, ...observed.animationIds], viewportStable: observed.viewportStable, maskAnimationActive: observed.maskAnimationActive };
+      return { facts, plan, binding, viewport: observed.viewport ?? { x: NaN, y: NaN, width: NaN, height: NaN }, revision: observed.revision, animationIds: [`document:${rootContext}`, ...observed.animationIds], viewportStable: observed.viewportStable, maskAnimationActive: observed.maskAnimationActive };
     },
     async close(): Promise<void> {
       if (closed) return;

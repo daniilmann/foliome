@@ -17,6 +17,7 @@ const { attachOwnerWindow: attach } = require('./ui/owner-window.ts') as typeof 
 const { openSystemSocket, createSocketConfiguration } = require('./system/darwin.ts') as typeof import('./system/darwin.ts');
 
 type Collector = Awaited<ReturnType<typeof prepareDomCollector>>;
+const { captureViewportPng } = require('./browser/capture-snapshot.ts') as typeof import('./browser/capture-snapshot.ts');
 type Cdp = Parameters<typeof prepareDomCollector>[0];
 type OwnerContext = Parameters<typeof attachOwnerWindow>[0]['context'];
 type OwnerPage = Parameters<typeof attachOwnerWindow>[0]['page'];
@@ -126,7 +127,7 @@ async function createInstalled(options: Options) {
       readObservedTarget: (...args) => collector!.readObservedTarget(...args),
       loginObservations: () => collector!.loginObservations(),
       finishLoginObservation: () => collector!.finishLoginObservation(),
-      async capturePng() { const result = await cdp!.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }) as { data: string }; return Buffer.from(result.data, 'base64'); },
+      capturePng: viewport => captureViewportPng(cdp!, viewport),
     };
     const { createPreparationRuntime: createRuntime } = require('../main.ts') as typeof import('../main.ts');
     runtime = createRuntime({ browser, protocol, store, now: Date.now, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), executorRunning: () => running && !closed }, options.source);

@@ -118,7 +118,7 @@ function predictor(image: Image, row: number, column: number, filter: number): n
   }
 }
 
-function decode(bytes: Buffer): DecodedPng {
+function decode(bytes: Buffer, expected?: Readonly<{ width: number; height: number }>): DecodedPng {
   if (!bytes.subarray(0, signature.length).equals(signature)) return { ok: false, code: "error" };
   const header = readChunk(bytes, signature.length);
   if (!header || header.type !== "IHDR" || header.data.length !== 13) {
@@ -141,6 +141,7 @@ function decode(bytes: Buffer): DecodedPng {
   ) {
     return { ok: false, code: "error" };
   }
+  if (expected && (width !== expected.width || height !== expected.height)) return { ok: false, code: "error" };
   if (width > maxWidth || height > maxHeight) return { ok: false, code: "limit" };
 
   const compressed = readImageData(bytes, header.end);
@@ -299,10 +300,10 @@ function encode(image: Image): ProtectedPng {
   return { ok: true, bytes };
 }
 
-function protect(input: Buffer, plan: PngPlan): ProtectedPng {
+function protect(input: Buffer, plan: PngPlan, expected?: Readonly<{ width: number; height: number }>): ProtectedPng {
   try {
     if (!Buffer.isBuffer(input)) return { ok: false, code: "error" };
-    const decoded = decode(input);
+    const decoded = decode(input, expected);
     if (!decoded.ok) return decoded;
     if (!applyPlan(decoded.image, plan)) return { ok: false, code: "error" };
     return encode(decoded.image);

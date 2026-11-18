@@ -8,7 +8,7 @@ const { createControlledRead } = require('./use-cases/controlled-read.ts') as ty
 
 type Collector = Awaited<ReturnType<typeof prepareDomCollector>>;
 type Browser = Pick<Collector, 'collectFrame' | 'observeTargets' | 'readObservedTarget' | 'loginObservations' | 'finishLoginObservation'> & {
-  openSource(): Promise<void>; closeSource(): Promise<void>; capturePng(): Promise<Buffer>;
+  openSource(): Promise<void>; closeSource(): Promise<void>; capturePng(viewport?: import('./adapters/browser/capture-snapshot.ts').Viewport): Promise<Buffer>;
 };
 type Ports = { browser: Browser; protocol: ReturnType<typeof createActionProtocol>; store: ReturnType<typeof createTextSnapshotStore>; now(): number; sleep(ms: number): Promise<void>; executorRunning(): boolean };
 type Scope = { sessionId: string; sourceId: string; accessId: string; instruction: string };
@@ -61,7 +61,7 @@ function create(ports: Ports, scope: Scope) {
   function active(session: Session) { return current === session && session.ready && session.confirmed && ports.executorRunning(); }
   async function capture(session: Session, number: number) {
     return captureCabinetSnapshot({
-      collect: () => ports.browser.collectFrame(number), capturePng: () => ports.browser.capturePng(), now: ports.now, sleep: ports.sleep,
+      collect: () => ports.browser.collectFrame(number), capturePng: viewport => ports.browser.capturePng(viewport), now: ports.now, sleep: ports.sleep,
       recordDeviation: async entry => { if (!active(session)) throw new Error('session-revoked'); ports.protocol.appendSnapshotDeviation({ ...scope, sessionId: session.sessionId, ...entry }); },
     }, () => ({ sessionId: session.sessionId, sessionActive: active(session), loginStep: !session.confirmed,
       ...(active(session) ? ports.browser.loginObservations() : { manualInputSeen: false, hasKnownSecret: false }), hasNonEmptyFields: false,
