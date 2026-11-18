@@ -16,7 +16,7 @@ const facts = (snapshot: number) => ({
 });
 const frame = (snapshot: number, revision = 1, mask = rect) => ({
   facts: facts(snapshot), plan: { masks: [mask], labels: [] }, revision,
-  animationIds: [] as string[], viewportStable: true,
+  animationIds: [] as string[], maskAnimationActive: false, viewportStable: true,
 });
 
 async function stand(run: (fixture: any) => Promise<void>) {
@@ -73,21 +73,114 @@ function checkDeviation(entry: any, code: string, snapshotNumber: number) {
   assert.doesNotMatch(JSON.stringify(entry), /Synthetic marker|data:image|Buffer/);
 }
 
+function syntheticPng() {
+  const { crc32, deflateSync } = require('node:zlib');
+  const chunk = (name: string, data: Buffer) => {
+    const type = Buffer.from(name);
+    const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
+    const checksum = Buffer.alloc(4); checksum.writeUInt32BE(crc32(Buffer.concat([type, data])));
+    return Buffer.concat([length, type, data, checksum]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(1, 0); header.writeUInt32BE(1, 4);
+  header[8] = 8; header[9] = 6;
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', header),
+    chunk('IDAT', deflateSync(Buffer.from([0, 255, 0, 0, 255]))), chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+// The properties let the previous object-based implementation reach the same phases.
+// The agreed interface consumes the function and reads the current session each time.
+function sessionGetter(get: () => typeof session) {
+  return Object.assign(get, session);
+}
+
+function syntheticPorts() {
+  const timer = clock();
+  const deviations: any[] = [];
+  const observation = () => frame(11, 1, { x: 0, y: 0, width: 1, height: 1 });
+  return {
+    timer, deviations, observation,
+    ports: { collect: async () => observation(), capturePng: async () => syntheticPng(),
+      now: timer.now, sleep: timer.sleep, recordDeviation: async (entry: any) => { deviations.push(entry); } },
+  };
+}
+
+test('отзывает результат при изменении сессии во время capture или второго collect', async (t: any) => {
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  for (const phase of ['capture', 'second collect']) for (const change of ['id', 'inactive']) {
+    await t.test(`${phase}: ${change}`, async () => {
+      const { ports, observation } = syntheticPorts();
+      let current = session;
+      const revoke = () => { current = change === 'id'
+        ? { ...session, sessionId: 'other-synthetic-session', completion: { ...session.completion, sessionId: 'other-synthetic-session' } }
+        : { ...session, sessionActive: false }; };
+      let collects = 0;
+      ports.collect = async () => { if (++collects === 2 && phase === 'second collect') revoke(); return observation(); };
+      ports.capturePng = async () => { if (phase === 'capture') revoke(); return syntheticPng(); };
+      const result = await captureCabinetSnapshot(ports, sessionGetter(() => current), 1000);
+      assert.deepEqual(result, { ok: false, code: 'session-revoked' });
+    });
+  }
+});
+
+test('анимация маски в одной фазе требует пересъёмки до стабильного кадра', async (t: any) => {
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  for (const phase of [1, 2]) await t.test(`фаза ${phase}`, async () => {
+    const { ports, timer, deviations, observation } = syntheticPorts();
+    let collects = 0; let captures = 0;
+    ports.collect = async () => ({ ...observation(), animationIds: ['same-animation'], maskAnimationActive: ++collects === phase });
+    ports.capturePng = async () => { captures++; return syntheticPng(); };
+    const result = await captureCabinetSnapshot(ports, sessionGetter(() => session), 1000);
+    assert.equal(result.ok, true);
+    assert.ok(Buffer.isBuffer(result.image.bytes));
+    assert.equal(captures, 2);
+    assert.deepEqual(timer.sleeps, [300]);
+    assert.equal(deviations.length, 1);
+    checkDeviation(deviations[0], 'retake', 11);
+  });
+});
+
+test('продолжающаяся анимация маски после срока даёт unstable без PNG', async (t: any) => {
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  for (const phase of [1, 2]) await t.test(`фаза ${phase}`, async () => {
+    const { ports, timer, deviations, observation } = syntheticPorts();
+    let collects = 0; let captures = 0;
+    ports.collect = async () => ({ ...observation(), animationIds: ['same-animation'], maskAnimationActive: (++collects % 2 === (phase === 1 ? 1 : 0)) });
+    ports.capturePng = async () => { captures++; return syntheticPng(); };
+    const result = await captureCabinetSnapshot(ports, sessionGetter(() => session), 600);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.image, { code: 'unstable' });
+    assert.ok(captures >= 2);
+    assert.ok(timer.sleeps.length >= 1 && timer.sleeps.every((ms: number) => ms === 300));
+    assert.equal(deviations.at(-1).code, 'unstable');
+    for (const entry of deviations) checkDeviation(entry, entry.code, 11);
+  });
+});
+
+test('ошибка первого вызова часов возвращает internal без исключения', async () => {
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const { ports } = syntheticPorts();
+  ports.now = () => { throw new Error('synthetic clock failure'); };
+  assert.deepEqual(await captureCabinetSnapshot(ports, sessionGetter(() => session), 1000), { ok: false, code: 'internal' });
+});
+
 test('подавляет PNG после первого ввода и после допустимого завершения входа выдаёт текст протокол и PNG с одинаковым номером и проверяет закраску по пикселям', { timeout: 60_000 }, async () => {
-  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts');
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
   const { createActionProtocol } = await import('../../core/adapters/store/action-protocol.ts');
   const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
   await stand(async ({ capturePng, pixels, captures }: any) => {
     const timer = clock();
     const deviations: any[] = [];
     const ports = { collect: async () => frame(7), capturePng, now: timer.now, sleep: timer.sleep, recordDeviation: async (entry: any) => { deviations.push(entry); } };
-    const suppressed = await captureCabinetSnapshot(ports, { ...session, loginStep: true, completion: null }, 1000);
+    const suppressed = await captureCabinetSnapshot(ports, () => ({ ...session, loginStep: true, completion: null }), 1000);
     assert.equal(suppressed.ok, true);
     assert.deepEqual(suppressed.image, { code: 'login-step' });
     assert.equal(captures(), 0);
     assert.deepEqual(deviations, []);
 
-    const result = await captureCabinetSnapshot(ports, session, 1000);
+    const result = await captureCabinetSnapshot(ports, () => session, 1000);
     assert.equal(result.ok, true);
     const filtered = filterTextSnapshot(facts(7));
     assert.equal(filtered.ok, true);
@@ -111,7 +204,7 @@ test('подавляет PNG после первого ввода и после 
 });
 
 test('переснимает нестабильный кадр и протоколирует отклонения без исходного изображения', { timeout: 60_000 }, async () => {
-  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts');
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
   const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
   await stand(async ({ capturePng, captures }: any) => {
     const timer = clock();
@@ -123,7 +216,7 @@ test('переснимает нестабильный кадр и протоко
       capturePng, now: timer.now, sleep: timer.sleep,
       recordDeviation: async (entry: any) => { deviations.push(entry); },
     };
-    const result = await captureCabinetSnapshot(ports, session, 1000);
+    const result = await captureCabinetSnapshot(ports, () => session, 1000);
     assert.equal(result.ok, true);
     assert.deepEqual(result.snapshot, filterTextSnapshot(changed.facts).snapshot);
     assert.equal(result.image.snapshotNumber, 8);
@@ -138,7 +231,7 @@ test('переснимает нестабильный кадр и протоко
     const timeoutDeviations: any[] = [];
     let revision = 0;
     const before = captures();
-    const unstable = await captureCabinetSnapshot({ ...ports, collect: async () => frame(9, ++revision, { ...rect, x: 20 + revision % 2 }), now: timeoutClock.now, sleep: timeoutClock.sleep, recordDeviation: async (entry: any) => { timeoutDeviations.push(entry); } }, session, 600);
+    const unstable = await captureCabinetSnapshot({ ...ports, collect: async () => frame(9, ++revision, { ...rect, x: 20 + revision % 2 }), now: timeoutClock.now, sleep: timeoutClock.sleep, recordDeviation: async (entry: any) => { timeoutDeviations.push(entry); } }, () => session, 600);
     assert.equal(unstable.ok, true);
     assert.deepEqual(unstable.snapshot, filterTextSnapshot(facts(9)).snapshot);
     assert.deepEqual(unstable.image, { code: 'unstable' });
@@ -148,7 +241,7 @@ test('переснимает нестабильный кадр и протоко
     assert.equal(timeoutDeviations.at(-1).code, 'unstable');
     for (const entry of timeoutDeviations) checkDeviation(entry, entry.code, 9);
 
-    const denied = await captureCabinetSnapshot({ ...ports, collect: async () => frame(10, ++revision), recordDeviation: async () => { throw new Error('synthetic protocol failure'); } }, session, 1000);
+    const denied = await captureCabinetSnapshot({ ...ports, collect: async () => frame(10, ++revision), recordDeviation: async () => { throw new Error('synthetic protocol failure'); } }, () => session, 1000);
     assert.deepEqual(denied, { ok: false, code: 'protocol-unavailable' });
   });
 });
