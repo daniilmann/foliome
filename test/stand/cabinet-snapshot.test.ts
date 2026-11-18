@@ -107,8 +107,7 @@ function syntheticPorts() {
   };
 }
 
-// Partial 3.5: DOM collection and filtering only; storage and selector checks remain open.
-test('выдаёт и хранит фильтрованный текст и проверяет условия селектора по маскам', { timeout: 60_000 }, async (t: any) => {
+test('собирает видимый DOM в изолированном мире указанного источника', { timeout: 60_000 }, async (t: any) => {
   const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
   const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
   const { randomBytes } = require('node:crypto');
@@ -174,7 +173,8 @@ test('выдаёт и хранит фильтрованный текст и пр
         });
         await t.test('contenteditable оставляет состояние поля без содержимого', () => {
           assert.equal(output.includes('Editable private marker'), false);
-          const editable = snapshot.elements.find((item: any) => item.attrs?.['aria-label'] === 'Editable field');
+          assert.equal(output.includes('Editable field'), false);
+          const editable = snapshot.elements.find((item: any) => item.role === 'textbox');
           assert.ok(editable);
           assert.ok(['filled', 'sealed'].includes(editable.field));
           assert.equal(editable.text, '');
