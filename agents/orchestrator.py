@@ -17,7 +17,9 @@ import role
 
 
 SESSION_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+TOOL_DIGEST = re.compile(r"[0-9a-f]{40}")
 STARTUP_TIMEOUT = 45
+STARTUP_ACK = "FOLIOME_SESSION_READY"
 
 
 class StartupRejected(Exception):
@@ -44,21 +46,34 @@ def apply_world_state(previous, payload):
     return effective
 
 
-def world_state_before(path, offset):
-    state = None
+def update_inventory(inventory, kind, payload):
+    if kind == "world_state":
+        inventory["state"] = apply_world_state(inventory.get("state"), payload)
+    elif kind == "response_item" and payload.get("type") == "additional_tools":
+        tools = payload.get("tools")
+        if isinstance(tools, list):
+            inventory.setdefault("tools", []).extend(tools)
+        else:
+            inventory["tool_inventory_invalid"] = True
+
+
+def inventory_before(path, offset):
+    """Replay the same session's declarations: unchanged inventories are omitted on resume."""
+    inventory = {}
     with path.open("rb") as trace:
         while trace.tell() < offset:
             line = trace.readline()
             if not line or not line.endswith(b"\n") or trace.tell() > offset:
-                return None
+                raise StartupRejected("журнал продолжения изменился")
             row = json.loads(line)
-            if isinstance(row, dict) and row.get("type") == "world_state":
-                state = apply_world_state(state, row.get("payload") or {})
-    return state
+            payload = row.get("payload") if isinstance(row, dict) else None
+            if isinstance(payload, dict):
+                update_inventory(inventory, row.get("type"), payload)
+    return inventory
 
 
-def startup_evidence(path, marker, offset=0, prior_world=None):
-    """Read tool and model evidence for the turn with this launch's user marker."""
+def startup_evidence(path, marker, offset=0, prior_inventory=None):
+    """Read the current probe and reconstruct its inventory from complete and incremental records."""
     with path.open(encoding="utf-8") as trace:
         meta = json.loads(trace.readline())
         session = meta.get("payload") if isinstance(meta, dict) else None
@@ -69,8 +84,10 @@ def startup_evidence(path, marker, offset=0, prior_world=None):
                 return None
             trace.seek(offset)
 
+        inventory = dict(prior_inventory or {})
+        if "tools" in inventory:
+            inventory["tools"] = list(inventory["tools"])
         turn = {}
-        world = prior_world
         for line in trace:
             if not line.endswith("\n"):
                 break
@@ -79,34 +96,24 @@ def startup_evidence(path, marker, offset=0, prior_world=None):
             if not isinstance(payload, dict):
                 continue
             kind = row.get("type")
+            update_inventory(inventory, kind, payload)
             if kind == "event_msg" and payload.get("type") == "task_started":
                 turn = {"id": payload.get("turn_id")}
-            elif kind == "world_state":
-                world = apply_world_state(world, payload)
-                if world is None:
-                    turn.pop("state", None)
-                else:
-                    turn["state"] = world
+            elif (kind == "event_msg" and payload.get("type") == "task_complete"
+                  and turn.get("id") and payload.get("turn_id") == turn["id"] and turn.get("matched")):
+                turn["ack"] = payload.get("last_agent_message")
+                return session, {**inventory, **turn}
             elif kind == "turn_context" and payload.get("turn_id") == turn.get("id"):
                 turn["context"] = payload
             elif kind == "response_item":
                 item_type = payload.get("type")
-                if item_type == "additional_tools":
-                    tools = payload.get("tools")
-                    if isinstance(tools, list):
-                        turn.setdefault("tools", []).extend(tools)
-                    else:
-                        turn["tool_inventory_invalid"] = True
-                elif payload.get("role") == "user":
+                if payload.get("role") == "user":
                     if any(isinstance(item, dict) and isinstance(item.get("text"), str)
                            and item["text"].splitlines()[:1] == [marker]
                            for item in payload.get("content") or ()):
                         turn["matched"] = True
-                elif turn.get("id") and turn.get("matched") and (
-                    payload.get("role") == "assistant" or item_type in ("reasoning", "function_call", "custom_tool_call")
-                ):
-                    # Startup tool declarations apply to the model's first output in this turn.
-                    return session, turn
+                elif isinstance(item_type, str) and item_type.endswith("_call") and turn.get("matched"):
+                    return session, {**inventory, **turn, "tool_called": True}
     return None
 
 
@@ -115,6 +122,8 @@ def verify_evidence(session, turn, settings, cwd, resume_id):
     if (not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id)
             or (resume_id and session_id != resume_id)):
         raise StartupRejected("журнал относится к другой сессии")
+    if turn.get("tool_called") or turn.get("ack") != STARTUP_ACK:
+        raise StartupRejected("проверочный ход Codex должен завершиться ответом без вызова инструментов")
     context = turn.get("context") or {}
     if context.get("cwd") != str(cwd):
         raise StartupRejected("сессия запущена из другого каталога")
@@ -124,7 +133,9 @@ def verify_evidence(session, turn, settings, cwd, resume_id):
     top_level = state.get("top_level_tools") if isinstance(state, dict) else None
     tools = turn.get("tools")
     if (not isinstance(state, dict) or state.get("apps_instructions") is not False
-            or not isinstance(top_level, dict) or not top_level
+            or not isinstance(top_level, dict) or not {"functions", "functions.exec"} <= top_level.keys()
+            or any(not name or not isinstance(digest, str) or not TOOL_DIGEST.fullmatch(digest)
+                   for name, digest in top_level.items())
             or turn.get("tool_inventory_invalid") or not isinstance(tools, list)
             or any(not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not tool["name"]
                    for tool in tools)
@@ -165,7 +176,7 @@ def save_result(path, result):
     os.replace(f.name, path)
 
 
-def verify_startup(process, marker, prior_paths, resumed, offset, prior_world, settings, cwd, session_id):
+def verify_startup(process, marker, prior_paths, resumed, offset, prior_inventory, settings, cwd, session_id):
     deadline = time.monotonic() + STARTUP_TIMEOUT
     while time.monotonic() < deadline:
         paths = {Path(path): 0 for path in role.rollouts() - prior_paths}
@@ -174,7 +185,7 @@ def verify_startup(process, marker, prior_paths, resumed, offset, prior_world, s
         matches = []
         for path, position in paths.items():
             try:
-                evidence = startup_evidence(path, marker, position, prior_world if path == resumed else None)
+                evidence = startup_evidence(path, marker, position, prior_inventory if path == resumed else None)
             except (OSError, ValueError):
                 continue
             if evidence:
@@ -190,6 +201,17 @@ def verify_startup(process, marker, prior_paths, resumed, offset, prior_world, s
     raise StartupRejected("проверяемая запись запуска Codex не появилась")
 
 
+def stop_startup(child, terminal):
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, terminal)
+
+
 def launch(settings, cwd, journal, session_id=None, resumed=None):
     run = f"{time.time_ns()}-{uuid.uuid4().hex}"
     marker = f"foliome-orchestrator:{run}"
@@ -197,17 +219,15 @@ def launch(settings, cwd, journal, session_id=None, resumed=None):
     brief = cwd / "p1-orchestrator-brief.md"
     prompt = (
         f"{marker}\n"
-        f"Это проверка запуска оркестратора O. Прежде чем читать материалы проекта или выполнять задачу, "
-        f"проверь файл {result_path}. Начинай работу только когда в нём verified=true. "
-        f"Если файл пока отсутствует, повтори чтение через секунду. При отказе остановись. "
-        f"После подтверждения сообщи ID сессии из файла и выполни бриф {brief}."
+        f"Это проверочный ход для проверки конфигурации сессии. Используй только текстовый ответ {STARTUP_ACK}. "
+        "Инструменты не вызывай и работу по задачам не начинай."
     )
     prior_paths = role.rollouts()
     try:
         offset = resumed.stat().st_size if resumed else 0
-        prior_world = world_state_before(resumed, offset) if resumed else None
-    except (OSError, ValueError):
-        print("Codex O: журнал продолжения недоступен.", file=sys.stderr)
+        prior_inventory = inventory_before(resumed, offset) if resumed else None
+    except (OSError, ValueError, StartupRejected):
+        print("Codex O: журнал продолжения недоступен или повреждён.", file=sys.stderr)
         return None
     terminal = termios.tcgetattr(sys.stdin)
     result = {"ts": role.now(), "session_id": session_id, "verified": False}
@@ -215,19 +235,12 @@ def launch(settings, cwd, journal, session_id=None, resumed=None):
     child = subprocess.Popen(command(settings, cwd, journal.parent, prompt, session_id),
                              env={**os.environ, **role.OPENSPEC_ENV})
     try:
-        rollout, actual_id = verify_startup(child, marker, prior_paths, resumed, offset, prior_world,
+        rollout, actual_id = verify_startup(child, marker, prior_paths, resumed, offset, prior_inventory,
                                             settings, cwd, session_id)
-        save_result(result_path, {**result, **settings, "session_id": actual_id,
-                                  "rollout": str(rollout), "verified": True, "connectors": False})
+        result.update(settings, session_id=actual_id, rollout=str(rollout), verified=True, connectors=False)
+        save_result(result_path, result)
     except (StartupRejected, OSError, KeyboardInterrupt) as exc:
-        if child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, terminal)
+        stop_startup(child, terminal)
         if isinstance(exc, KeyboardInterrupt):
             return 130
         if isinstance(exc, OSError):
@@ -235,6 +248,23 @@ def launch(settings, cwd, journal, session_id=None, resumed=None):
         save_result(result_path, {**result, "reason": str(exc)})
         print(f"Codex O: {exc}", file=sys.stderr)
         return None
+
+    message = f"Запуск O подтверждён. Сообщи ID {actual_id} и выполни бриф {brief}."
+    if child.poll() is not None:
+        save_result(result_path, {**result, "verified": False, "reason": "сессия закончилась до передачи брифа"})
+        return 3
+    try:
+        sent = subprocess.run(["codex", "queue", "--disable", "apps", "-C", str(cwd),
+                               "--thread", actual_id, "--message", message],
+                              capture_output=True, text=True, timeout=15)
+        delivered = sent.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        delivered = False
+    if not delivered:
+        save_result(result_path, {**result, "verified": False, "reason": "передача брифа не подтверждена"})
+        print("Codex O: передача брифа не подтверждена. Автоматический повтор остановлен.", file=sys.stderr)
+        stop_startup(child, terminal)
+        return 3
     return child.wait()
 
 

@@ -25,7 +25,7 @@ class OrchestratorTests(unittest.TestCase):
             {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
             {"type": "response_item", "payload": {"type": "additional_tools", "role": "developer", "tools": []}},
             {"type": "world_state", "payload": {
-                "full": full, "state": {"apps_instructions": apps, "top_level_tools": tools or {"functions": {}}}
+                "full": full, "state": {"apps_instructions": apps, "top_level_tools": tools if tools is not None else {"functions": "a" * 40, "functions.exec": "b" * 40}}
             }},
             {"type": "turn_context", "payload": {
                 "turn_id": turn_id, "cwd": str(self.cwd), **self.settings,
@@ -33,7 +33,8 @@ class OrchestratorTests(unittest.TestCase):
             }},
             {"type": "response_item", "payload": {"type": "message", "role": "user",
                                                    "content": [{"type": "input_text", "text": marker + "\nbrief"}]}},
-            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": []}},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id,
+                                               "last_agent_message": orchestrator.STARTUP_ACK}},
         ]
 
     def write(self, rows, mode="w"):
@@ -45,8 +46,8 @@ class OrchestratorTests(unittest.TestCase):
         return {"type": "session_meta", "payload": {"source": source, "id": self.session_id, "cwd": str(self.cwd)}}
 
     def evaluate(self, marker, offset=0, resume_id=None):
-        world = orchestrator.world_state_before(self.trace, offset) if offset else None
-        evidence = orchestrator.startup_evidence(self.trace, marker, offset, world)
+        inventory = orchestrator.inventory_before(self.trace, offset) if offset else None
+        evidence = orchestrator.startup_evidence(self.trace, marker, offset, inventory)
         self.assertIsNotNone(evidence)
         return orchestrator.verify_evidence(*evidence, self.settings, self.cwd, resume_id)
 
@@ -73,7 +74,7 @@ class OrchestratorTests(unittest.TestCase):
                 with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
                     self.evaluate("marker")
 
-    def test_additional_tools_after_the_marker_are_checked_before_first_output(self):
+    def test_additional_tools_after_the_marker_are_checked_before_probe_finishes(self):
         turn = self.turn("current", "marker")
         self.write([self.metadata(), *turn[:-1]])
         self.assertIsNone(orchestrator.startup_evidence(self.trace, "marker"))
@@ -83,6 +84,22 @@ class OrchestratorTests(unittest.TestCase):
             turn[-1],
         ], mode="a")
         with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
+            self.evaluate("marker")
+
+    def test_malformed_or_partial_top_level_inventory_rejects_start(self):
+        for tools in ({"functions": "a" * 40},
+                      {"functions": "a" * 40, "functions.exec": {"invalid": True}},
+                      {"functions": "a" * 40, "functions.exec": "bad"}):
+            with self.subTest(tools=tools):
+                self.write([self.metadata(), *self.turn("current", "marker", tools=tools)])
+                with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
+                    self.evaluate("marker")
+
+    def test_startup_probe_rejects_calls_before_completion(self):
+        turn = self.turn("current", "marker")
+        turn.insert(-1, {"type": "response_item", "payload": {"type": "function_call", "name": "functions.exec"}})
+        self.write([self.metadata(), *turn])
+        with self.assertRaisesRegex(orchestrator.StartupRejected, "без вызова инструментов"):
             self.evaluate("marker")
 
     def test_clean_exit_before_evidence_is_a_rejected_launch(self):
@@ -106,7 +123,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertIsNone(orchestrator.startup_evidence(self.trace, "start", size))
         for turn, message in (
             (self.turn("resumed", "resume", apps=True), "коннекторов"),
-            (self.turn("resumed", "resume", tools={"mcp__codex_apps__example": {}}), "коннекторов"),
+            (self.turn("resumed", "resume", tools={"functions": "a" * 40, "functions.exec": "b" * 40, "mcp__codex_apps__example": "c" * 40}), "коннекторов"),
             (self.turn("resumed", "resume", model="other-model"), "effort"),
         ):
             with self.subTest(message=message):
@@ -119,7 +136,7 @@ class OrchestratorTests(unittest.TestCase):
     def test_resume_merges_the_current_inventory_delta(self):
         self.write([self.metadata(), *self.turn("previous", "start")])
         offset = self.trace.stat().st_size
-        for tools in ({"collaboration.spawn_agent": {}}, {"mcp__codex_apps__example": {}}):
+        for tools in ({"collaboration.spawn_agent": "a" * 40}, {"mcp__codex_apps__example": "c" * 40}):
             with self.subTest(tools=tools):
                 resumed = self.turn("resumed", "resume", full=False, tools=tools)
                 resumed[2]["payload"]["state"].pop("apps_instructions")
@@ -129,6 +146,17 @@ class OrchestratorTests(unittest.TestCase):
                         self.evaluate("resume", offset, self.session_id)
                 else:
                     self.assertEqual(self.evaluate("resume", offset, self.session_id), self.session_id)
+
+    def test_resume_reuses_inventory_when_current_turn_reports_no_changes(self):
+        self.write([self.metadata(), *self.turn("previous", "start")])
+        offset = self.trace.stat().st_size
+        resumed = self.turn("resumed", "resume")
+        del resumed[1:3]
+        self.write(resumed, mode="a")
+        self.assertEqual(self.evaluate("resume", offset, self.session_id), self.session_id)
+        evidence = orchestrator.startup_evidence(self.trace, "resume", offset)
+        with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
+            orchestrator.verify_evidence(*evidence, self.settings, self.cwd, self.session_id)
 
     def test_resume_accepts_only_verified_project_session(self):
         self.trace.touch()
