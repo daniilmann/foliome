@@ -48,9 +48,9 @@ test('technical log defaults to error and flushes the bounded session ring on er
   await withLog(async ({ log, directory }: any) => {
     log.beginSession('synthetic-session');
     for (let index = 0; index < 2001; index++) {
-      log.write({ level: 'info', code: 'browser-event' });
+      log.write({ level: 'debug', code: 'browser-event' });
     }
-    log.write({ level: 'debug', code: 'channel-denied' });
+    log.write({ level: 'warn', code: 'channel-denied' });
     log.write({ level: 'info', code: 'started' });
     await log.drain();
     assert.deepEqual(await readdir(directory), []);
@@ -69,7 +69,7 @@ test('technical log defaults to error and flushes the bounded session ring on er
       assert.deepEqual(Object.keys(row).sort(), ['at', 'code', 'level', 'sessionId']);
       assert.equal(row.at, '2026-01-02T03:04:05.000Z');
       assert.equal(row.sessionId, 'synthetic-session');
-      assert.ok(['info', 'debug', 'error'].includes(row.level));
+      assert.ok(['info', 'debug', 'warn', 'error'].includes(row.level));
       assert.ok(
         ['started', 'browser-event', 'channel-denied', 'protocol-unavailable'].includes(row.code),
       );
@@ -77,24 +77,26 @@ test('technical log defaults to error and flushes the bounded session ring on er
   });
 });
 
-test('trusted owner can enable fixed info and debug levels', async () => {
+test('trusted owner can enable the fixed warn, info and debug levels', async () => {
   await withLog(async ({ log, directory }: any) => {
     log.beginSession('synthetic-session');
+    log.setLevel('warn');
+    log.write({ level: 'warn', code: 'channel-denied' });
     log.setLevel('info');
     log.write({ level: 'info', code: 'started' });
     await log.drain();
     assert.deepEqual(
       (await records(directory)).rows.map((row: any) => row.code),
-      ['started'],
+      ['channel-denied', 'started'],
     );
     log.setLevel('debug');
     log.write({ level: 'debug', code: 'browser-event' });
     await log.drain();
     assert.deepEqual(
       (await records(directory)).rows.map((row: any) => row.code),
-      ['started', 'browser-event'],
+      ['channel-denied', 'started', 'browser-event'],
     );
-    for (const level of ['trace', 'warn', '', 'INFO']) {
+    for (const level of ['trace', '', 'INFO']) {
       assert.throws(() => log.setLevel(level));
     }
   });
@@ -120,20 +122,24 @@ test('technical log rejects open record shapes and never writes arbitrary data',
 test('log failure reports one compact code per session without stopping later writes', async () => {
   await withLog(async ({ log, directory, unavailable }: any) => {
     log.beginSession('synthetic-session');
-    log.setLevel('info');
+    log.setLevel('debug');
     await rm(directory, { recursive: true });
     await writeFile(directory, '');
-    log.write({ level: 'info', code: 'browser-event' });
-    log.write({ level: 'info', code: 'browser-event' });
+    log.write({ level: 'debug', code: 'browser-event' });
+    log.write({ level: 'debug', code: 'browser-event' });
     await log.drain();
     assert.deepEqual(unavailable, ['log-unavailable']);
     log.beginSession('synthetic-next-session');
-    log.write({ level: 'info', code: 'browser-event' });
+    log.write({ level: 'debug', code: 'browser-event' });
     await log.drain();
     assert.deepEqual(unavailable, ['log-unavailable', 'log-unavailable']);
     await rm(directory);
     await mkdir(directory, { mode: 0o700 });
-    log.write({ level: 'info', code: 'browser-event' });
+    log.write({ level: 'debug', code: 'browser-event' });
+    await log.drain();
+    assert.deepEqual(await readdir(directory), []);
+    log.beginSession('synthetic-recovered-session');
+    log.write({ level: 'debug', code: 'browser-event' });
     await log.drain();
     assert.ok((await records(directory)).rows.some((row: any) => row.code === 'browser-event'));
     assert.deepEqual(unavailable, ['log-unavailable', 'log-unavailable']);
