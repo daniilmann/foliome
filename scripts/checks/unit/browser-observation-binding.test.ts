@@ -18,7 +18,7 @@ const samples = [
     data: {
       url, title: 'First',
       nodes: [{ visible: true, role: 'textbox', text: '', field: 'sealed' }],
-      parents: [null], secrets: [], embeds: [],
+      parents: [null], identities: [11], classes: [null], semantics: ['textbox'], secrets: [], embeds: [],
       observation: { geometry: [{ rect: rect(10), runs: [], mask: true }], width: 200, height: 100, revision: 11, animationIds: ['first'], viewportStable: true, maskAnimationActive: false, unsupported: false },
     },
   },
@@ -27,7 +27,7 @@ const samples = [
     data: {
       url, title: 'Second',
       nodes: [{ visible: true, role: 'text', text: 'Second' }, { visible: true, role: 'textbox', text: '', field: 'sealed' }],
-      parents: [null, 0], secrets: [], embeds: [],
+      parents: [null, 0], identities: [21, 22], classes: [null, null], semantics: ['text', 'textbox'], secrets: [], embeds: [],
       observation: { geometry: [{ rect: rect(50), runs: [], mask: false }, { rect: rect(70), runs: [], mask: true }], width: 200, height: 100, revision: 22, animationIds: ['second'], viewportStable: false, maskAnimationActive: true, unsupported: false },
     },
   },

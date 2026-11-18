@@ -134,7 +134,14 @@ function create(database: DatabaseSync, clock: Clock) {
     if (!integer(value, 0)) throw new Error('invalid time');
     return value;
   }
+  const listRows = database.prepare(`SELECT v.at_ms AS atMs, v.source_id AS sourceId, v.access_id AS accessId,
+    v.actor, v.method, v.snapshot_number AS snapshotNumber, v.node_number AS nodeNumber,
+    v.decision, v.reason, o.status AS outcome FROM action_verdicts v
+    LEFT JOIN action_outcomes o ON o.verdict_id = v.id ORDER BY v.id`);
   return {
+    list() {
+      return listRows.all() as unknown as readonly { atMs: number; sourceId: string; accessId: string; actor: string; method: string; snapshotNumber: number; nodeNumber: number | null; decision: 'allowed' | 'blocked'; reason: string; outcome: string | null }[];
+    },
     appendVerdict(value: Verdict): number {
       if (!identifier(value.sessionId) || !identifier(value.sourceId) || !identifier(value.accessId) ||
         !integer(value.snapshotNumber, 1) || (value.nodeNumber !== null && !integer(value.nodeNumber, 1)) ||

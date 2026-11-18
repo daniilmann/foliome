@@ -1,5 +1,8 @@
 import type { PngGateFacts } from '../../domain/png-gate.ts';
 import type { PngPlan } from './png.ts';
+import type { prepareDomCollector } from './collect-dom.ts';
+
+type Binding = Awaited<ReturnType<Awaited<ReturnType<typeof prepareDomCollector>>['observeTargets']>>;
 
 const { isDeepStrictEqual } = require('node:util') as typeof import('node:util');
 const { filterTextSnapshot } = require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
@@ -9,7 +12,8 @@ const { protectPng } = require('./png.ts') as typeof import('./png.ts');
 type Session = Omit<PngGateFacts, 'stable' | 'maskApplied' | 'withinLimits'>;
 type Frame = Readonly<{
   facts: unknown;
-  plan: PngPlan;
+  plan: PngPlan | null;
+  binding?: Binding;
   revision: number;
   animationIds: readonly string[];
   viewportStable: boolean;
@@ -35,7 +39,7 @@ type Ports = Readonly<{
 }>;
 type Filtered = Extract<ReturnType<typeof filterTextSnapshot>, { ok: true }>['snapshot'];
 type Image = { code: 'login-step' | 'unstable' | 'limit' | 'error' } | { bytes: Buffer; snapshotNumber: number };
-type Result = { ok: true; snapshot: Filtered; image: Image } | { ok: false; code: 'internal' | 'protocol-unavailable' | 'session-revoked' };
+type Result = { ok: true; snapshot: Filtered; image: Image; binding?: Binding } | { ok: false; code: 'internal' | 'protocol-unavailable' | 'session-revoked' };
 
 export declare const captureCabinetSnapshot: typeof capture;
 declare const exports: { captureCabinetSnapshot: typeof capture };
@@ -56,7 +60,7 @@ async function bounded<T>(call: () => Promise<T>, ms: number): Promise<T> {
   }
 }
 
-function validPlan(plan: PngPlan): boolean {
+function validPlan(plan: PngPlan | null): plan is PngPlan {
   return !!plan && Array.isArray(plan.masks) && Array.isArray(plan.labels) &&
     plan.masks.every(r => r && [r.x, r.y, r.width, r.height].every(Number.isSafeInteger) && r.x >= 0 && r.y >= 0 && r.width > 0 && r.height > 0) &&
     plan.labels.every(l => l && [l.x, l.y, l.number].every(Number.isSafeInteger) && l.x >= 0 && l.y >= 0 && l.number > 0);
@@ -98,7 +102,7 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
       const entry: Deviation = { code, flags: code === 'retake' || code === 'unstable' ? flags : [], snapshotNumber: snapshot.snapshot, host: snapshot.page.host, path: snapshot.page.path,
         retakes, elapsedMs: Math.max(0, Math.floor(elapsed)) };
       // Protocol recording gets its own finite bound even when capture time has expired.
-      await bounded(() => ports.recordDeviation(entry), deadlineMs);
+      await bounded(() => { if (!currentSession()) throw new SessionRevoked(); return ports.recordDeviation(entry); }, deadlineMs);
       return true;
     } catch { return false; }
   };
@@ -112,7 +116,7 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
   try {
     while (true) {
       if (!currentSession()) return revoked();
-      const first = await bounded(() => ports.collect(), remaining());
+      const first = await bounded(() => { if (!currentSession()) throw new SessionRevoked(); return ports.collect(); }, remaining());
       const session = currentSession();
       if (!session) return revoked();
       const filtered = filterTextSnapshot(first.facts);
@@ -128,14 +132,14 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
         return ports.capturePng();
       }, remaining());
       if (!currentSession()) return revoked();
-      const second = await bounded(() => ports.collect(), remaining());
+      const second = await bounded(() => { if (!currentSession()) throw new SessionRevoked(); return ports.collect(); }, remaining());
       const latest = currentSession();
       if (!latest) return revoked();
       const checked = filterTextSnapshot(second.facts);
       if (!checked.ok) return { ok: false, code: 'internal' };
       if (!validFrame(second) || !validPlan(second.plan)) return await fail('error');
       const differences: SnapshotDeviationFlag[] = [];
-      if (!isDeepStrictEqual(baseline.facts, second.facts)) differences.push('flow');
+      if (!isDeepStrictEqual(baseline.facts, second.facts) || !isDeepStrictEqual(baseline.binding, second.binding)) differences.push('flow');
       if (!isDeepStrictEqual(baseline.plan, second.plan)) differences.push('rectangles');
       if (baseline.maskAnimationActive || second.maskAnimationActive ||
         !isDeepStrictEqual([...baseline.animationIds].sort(), [...second.animationIds].sort())) differences.push('animations');
@@ -148,9 +152,10 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
         if (!currentSession()) return revoked();
         if (!recorded) return { ok: false, code: 'protocol-unavailable' };
         if (remaining() <= 300) return await fail('unstable');
-        await bounded(() => ports.sleep(300), remaining());
+        await bounded(() => { if (!currentSession()) throw new SessionRevoked(); return ports.sleep(300); }, remaining());
         continue;
       }
+      if (!validPlan(baseline.plan)) return await fail('error');
       const protectedImage = protectPng(bytes, baseline.plan);
       if (remaining() <= 0) return await fail('unstable');
       if (!protectedImage.ok) return await fail(protectedImage.code);
@@ -158,7 +163,7 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
       if (!finalSession) return revoked();
       const gate = decidePngGate({ ...finalSession, stable: true, withinLimits: true, maskApplied: true });
       if (!gate.ok) return gate.code === 'login-step' ? { ok: true, snapshot, image: { code: 'login-step' } } : await fail(gate.code);
-      return { ok: true, snapshot, image: { bytes: protectedImage.bytes, snapshotNumber: snapshot.snapshot } };
+      return { ok: true, snapshot, image: { bytes: protectedImage.bytes, snapshotNumber: snapshot.snapshot }, ...(baseline.binding === undefined ? {} : { binding: baseline.binding }) };
     }
   } catch (error) {
     try {

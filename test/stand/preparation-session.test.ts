@@ -52,6 +52,9 @@ async function stand(run: (f: any) => Promise<void>) {
   let delayClose = false;
   let collector: Collector | undefined;
   let sourcePage: any;
+  let replaceOnObserve = false;
+  let snapshotObserveCalls = 0;
+  let successfulReads = 0;
   const secret = randomBytes(16).toString('hex');
   try {
     ownerBrowser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
@@ -59,7 +62,11 @@ async function stand(run: (f: any) => Promise<void>) {
     const ownerContext = await ownerBrowser.newContext({ serviceWorkers: 'block' });
     await sourceContext.route('**/*', async (route: any) => {
       if (route.request().method() === 'GET' && route.request().url() === `${origin}/overview`) {
-        await route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Synthetic overview</title><input type="password" aria-label="Synthetic password"><p>Synthetic visible text</p>' });
+        await route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic overview</title><input type="password" aria-label="Synthetic password"><p id="target">Synthetic visible text</p><button type="button" id="replace">Replace synthetic node</button><script>
+          document.getElementById('replace').addEventListener('click', () => {
+            const target = document.getElementById('target'); target.replaceWith(target.cloneNode(true));
+          });
+        </script>` });
       } else await route.abort();
     });
     await ownerContext.route('**/*', (route: any) => route.abort());
@@ -79,8 +86,19 @@ async function stand(run: (f: any) => Promise<void>) {
         await sourcePage?.close();
       },
       collectFrame: n => collector!.collectFrame(n),
-      observeTargets: n => collector!.observeTargets(n),
-      readObservedTarget: (n, node, proof, deep) => collector!.readObservedTarget(n, node, proof, deep),
+      async observeTargets(n) {
+        if (replaceOnObserve) {
+          replaceOnObserve = false;
+          snapshotObserveCalls++;
+          await sourcePage.getByRole('button', { name: 'Replace synthetic node' }).click();
+        }
+        return collector!.observeTargets(n);
+      },
+      async readObservedTarget(n, node, proof, deep) {
+        const result = await collector!.readObservedTarget(n, node, proof, deep);
+        if (result.ok) successfulReads++;
+        return result;
+      },
       loginObservations: () => collector!.loginObservations(),
       finishLoginObservation: () => collector!.finishLoginObservation(),
       capturePng: async () => Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })).data, 'base64'),
@@ -125,7 +143,7 @@ async function stand(run: (f: any) => Promise<void>) {
       await ownerPage.goto(`${owner}/`);
       await ownerPage.getByRole('button', { name: 'Вход завершён, продолжить' }).click();
     }
-    await run({ runtime, connect, login, db, ownerPage, sourcePage: () => sourcePage, secret, closing, delayClose: () => { delayClose = true; }, releaseClose: closeGate.resolve, executorRunning: () => executorRunning });
+    await run({ runtime, connect, login, db, ownerPage, sourcePage: () => sourcePage, collector: () => collector!, armReplacement: () => { replaceOnObserve = true; }, disarmReplacement: () => { replaceOnObserve = false; }, snapshotObserveCalls: () => snapshotObserveCalls, successfulReads: () => successfulReads, secret, closing, delayClose: () => { delayClose = true; }, releaseClose: closeGate.resolve, executorRunning: () => executorRunning });
     executorRunning = false;
   } finally {
     closeGate.resolve();
@@ -201,5 +219,34 @@ test('закрывает окно и отказывает старому и но
     await ownerPage.goto(`${owner}/`);
     assert.equal(errorCode(await old.call('current_task')), 'session-unavailable');
     assert.equal(errorCode(await fresh.call('current_task')), 'session-unavailable');
+  });
+});
+
+test('замена идентичного узла после защищённого снимка не привязывает старый номер к новому объекту', { timeout: 60_000 }, async () => {
+  await stand(async ({ runtime, connect, login, sourcePage, collector, armReplacement, disarmReplacement, snapshotObserveCalls, successfulReads }: any) => {
+    await runtime.open();
+    await login();
+    const client = await connect();
+    const before = await collector().observeTargets(1);
+    const target = before.candidates.find((item: any) => item.text === 'Synthetic visible text');
+    assert.ok(target);
+    armReplacement();
+    const response = await client.call('snapshot');
+    const snapshot = snapshotFrom(response);
+    assert.equal(snapshot.snapshot, 1);
+    assert.equal(snapshot.elements.find((item: any) => item.text === target.text)?.n, target.nodeNumber);
+    assert.equal(response.result.content.find((part: any) => part.type === 'image')?.mimeType, 'image/png');
+    disarmReplacement();
+    if (snapshotObserveCalls() === 0) await sourcePage().getByRole('button', { name: 'Replace synthetic node' }).click();
+    const after = await collector().observeTargets(1);
+    const replacement = after.candidates.find((item: any) => item.nodeNumber === target.nodeNumber);
+    assert.equal(replacement.text, target.text);
+    assert.equal(replacement.descriptor, target.descriptor);
+    assert.notEqual(replacement.identity, target.identity);
+    assert.deepEqual(await collector().readObservedTarget(1, target.nodeNumber, target), { ok: false, code: 'stale' });
+    assert.equal(successfulReads(), 0);
+    const read = await client.call('readText', { snapshotNumber: 1, nodeNumber: target.nodeNumber });
+    assert.deepEqual({ isError: read.result?.isError, code: read.result?.content?.[0]?.text, successfulReads: successfulReads(), snapshotObserveCalls: snapshotObserveCalls() },
+      { isError: true, code: 'stale', successfulReads: 0, snapshotObserveCalls: 0 });
   });
 });

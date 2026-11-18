@@ -4,7 +4,8 @@ const { decideActionVerdict } = require('../domain/action-verdict.ts') as typeof
 type Session = Readonly<{ sessionId: string; sourceId: string; accessId: string; sessionActive: boolean; loginStep: boolean; snapshotNumber: number }>;
 type Target = Omit<ActionCandidate, 'sameNode'> & Readonly<{ identity: string; descriptor: string; text: string }>;
 type Observation = Readonly<{ snapshotNumber: number; candidates: readonly Target[]; sessionId: string; sourceId: string; accessId: string }>;
-type SnapshotResult = { ok: true; snapshot: { snapshot: number }; image: unknown } | { ok: false; code: string };
+type Filtered = Extract<ReturnType<typeof import('../domain/snapshot-filter.ts').filterTextSnapshot>, { ok: true }>['snapshot'];
+type SnapshotResult = { ok: true; snapshot: Filtered; image: { bytes: Buffer; snapshotNumber: number } | { code: 'login-step' | 'unstable' | 'limit' | 'error' }; binding?: { snapshotNumber: number; candidates: Target[] } } | { ok: false; code: 'internal' | 'protocol-unavailable' | 'session-revoked' };
 type Ports = {
   getSession(): Session | undefined;
   collectTarget: ((snapshot: number) => Promise<Observation>) & { read(snapshot: number, node: number, proof: { identity: string; descriptor: string }, deep?: boolean): Promise<{ ok: true; text: string } | { ok: false; code: 'stale' | 'internal' }> };
@@ -30,18 +31,18 @@ function positive(value: unknown): value is number { return typeof value === 'nu
 function create(ports: Ports) {
   let inFlight = false;
   async function read(command: unknown, beforeSnapshot: Observation) {
-    if (inFlight) return { ok: false as const, code: 'session-unavailable' };
+    if (inFlight) return { ok: false as const, code: 'session-unavailable' as const };
     inFlight = true;
     try {
       const session = ports.getSession();
-      if (!session?.sessionActive) return { ok: false as const, code: 'session-unavailable' };
+      if (!session?.sessionActive) return { ok: false as const, code: 'session-unavailable' as const };
       const active = () => {
         const current = ports.getSession();
         return !!current?.sessionActive && current.sessionId === session.sessionId && current.sourceId === session.sourceId && current.accessId === session.accessId && current.loginStep === session.loginStep;
       };
       if (!positive(session.snapshotNumber) || !beforeSnapshot || beforeSnapshot.sessionId !== session.sessionId ||
           beforeSnapshot.sourceId !== session.sourceId || beforeSnapshot.accessId !== session.accessId ||
-          !positive(beforeSnapshot.snapshotNumber) || !Array.isArray(beforeSnapshot.candidates)) return { ok: false as const, code: 'session-unavailable' };
+          !positive(beforeSnapshot.snapshotNumber) || !Array.isArray(beforeSnapshot.candidates)) return { ok: false as const, code: 'session-unavailable' as const };
       const snapshotNumber = session.snapshotNumber;
       const requestedNode = own(command, 'nodeNumber');
       let verdict: ActionVerdict = beforeSnapshot.snapshotNumber !== snapshotNumber
@@ -51,14 +52,14 @@ function create(ports: Ports) {
         const { nodeNumber } = verdict;
         const previous = beforeSnapshot.candidates.filter(candidate => candidate.nodeNumber === nodeNumber);
         const observed = await ports.collectTarget(snapshotNumber);
-        if (!active()) return { ok: false as const, code: 'session-revoked' };
+        if (!active()) return { ok: false as const, code: 'session-revoked' as const };
         verdict = ports.getSession()?.snapshotNumber !== snapshotNumber
           ? { ok: false, code: 'stale' }
           : decideActionVerdict(command, { sessionActive: true, loginStep: session.loginStep, snapshotNumber: observed.snapshotNumber, candidates: observed.candidates.map(candidate => ({ ...candidate, sameNode: previous.length === 1 && previous[0].identity === candidate.identity && previous[0].descriptor === candidate.descriptor })) });
       }
       const unavailable = () => {
         if (active()) ports.onProtocolUnavailable(session.sessionId);
-        return { ok: false as const, code: 'protocol-unavailable' };
+        return { ok: false as const, code: 'protocol-unavailable' as const };
       };
       const protocolFailure = (value: unknown) => typeof value === 'object' && value !== null && own(value, 'code') === 'protocol-unavailable';
       const reason = verdict.ok ? 'allowed' : verdict.code === 'session-unavailable' ? 'internal' : verdict.code;
@@ -71,7 +72,7 @@ function create(ports: Ports) {
         if (!positive(value)) return unavailable();
         verdictId = value;
       } catch { return unavailable(); }
-      if (!active()) return { ok: false as const, code: 'session-revoked' };
+      if (!active()) return { ok: false as const, code: 'session-revoked' as const };
       let text: string | undefined;
       if (verdict.ok) {
         let status: 'ok' | 'stale' | 'internal' = 'internal';
@@ -84,16 +85,17 @@ function create(ports: Ports) {
             else if (!result.ok && result.code === 'stale') status = 'stale';
           }
         } catch { status = 'internal'; }
+        if (!active()) return { ok: false as const, code: 'session-revoked' as const };
         try {
           const pending = ports.protocol.appendOutcome({ verdictId, status });
           if (protocolFailure(pending)) return unavailable();
           const value = await pending;
           if (protocolFailure(value)) return unavailable();
         } catch { return unavailable(); }
-        if (!active()) return { ok: false as const, code: 'session-revoked' };
-        if (status !== 'ok' || text === undefined) return { ok: false as const, code: status };
+        if (!active()) return { ok: false as const, code: 'session-revoked' as const };
+        if (status !== 'ok' || text === undefined) return { ok: false as const, code: status === 'ok' ? 'internal' as const : status };
       }
-      if (!Number.isSafeInteger(snapshotNumber + 1)) return { ok: false as const, code: 'limit' };
+      if (!Number.isSafeInteger(snapshotNumber + 1)) return { ok: false as const, code: 'limit' as const };
       let snapshot: SnapshotResult;
       try {
         const pending = ports.captureSnapshot(snapshotNumber + 1);
@@ -101,14 +103,14 @@ function create(ports: Ports) {
         snapshot = await pending;
       } catch (error) {
         if (protocolFailure(error)) return unavailable();
-        return { ok: false as const, code: 'internal' };
+        return { ok: false as const, code: 'internal' as const };
       }
-      if (!active()) return { ok: false as const, code: 'session-revoked' };
+      if (!active()) return { ok: false as const, code: 'session-revoked' as const };
       if (!snapshot.ok) {
         if (snapshot.code === 'protocol-unavailable') return unavailable();
         return { ok: false as const, code: snapshot.code };
       }
-      if (snapshot.snapshot.snapshot !== snapshotNumber + 1) return { ok: false as const, code: 'internal' };
+      if (snapshot.snapshot.snapshot !== snapshotNumber + 1) return { ok: false as const, code: 'internal' as const };
       try {
         const persisted = ports.persistSnapshot(snapshot);
         if (protocolFailure(persisted)) return unavailable();
@@ -116,12 +118,12 @@ function create(ports: Ports) {
         if (protocolFailure(persistedResult)) return unavailable();
       } catch (error) {
         if (protocolFailure(error)) return unavailable();
-        return { ok: false as const, code: 'internal' };
+        return { ok: false as const, code: 'internal' as const };
       }
-      if (!active()) return { ok: false as const, code: 'session-revoked' };
+      if (!active()) return { ok: false as const, code: 'session-revoked' as const };
       if (!verdict.ok) return { ok: false as const, code: verdict.code, snapshot: snapshot.snapshot, image: snapshot.image };
       return { ok: true as const, data: { text, snapshot: snapshot.snapshot, image: snapshot.image } };
-    } catch { return { ok: false as const, code: 'internal' }; }
+    } catch { return { ok: false as const, code: 'internal' as const }; }
     finally { inFlight = false; }
   }
   return { read };

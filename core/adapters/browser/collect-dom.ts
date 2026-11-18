@@ -350,7 +350,9 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
       } catch { return { ok: false, code: 'internal' }; }
     },
     async collectFrame(snapshot: number) {
-      const { facts, observation: observed, rootNodeCount, rootContext } = await collect(snapshot);
+      const collected = await collect(snapshot);
+      const { facts, observation: observed, rootNodeCount, rootContext } = collected;
+      const binding = { snapshotNumber: snapshot, candidates: projectTargets(collected).candidates };
       if (closed) throw new Error('internal');
       const filtered = filterTextSnapshot(facts);
       if (!observed || !filtered.ok) throw new Error('internal');
@@ -389,7 +391,7 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
         plan = { masks, labels };
       } catch { plan = null; }
       if (closed) throw new Error('internal');
-      return { facts, plan, revision: observed.revision, animationIds: [`document:${rootContext}`, ...observed.animationIds], viewportStable: observed.viewportStable, maskAnimationActive: observed.maskAnimationActive };
+      return { facts, plan, binding, revision: observed.revision, animationIds: [`document:${rootContext}`, ...observed.animationIds], viewportStable: observed.viewportStable, maskAnimationActive: observed.maskAnimationActive };
     },
     async close(): Promise<void> {
       if (closed) return;
