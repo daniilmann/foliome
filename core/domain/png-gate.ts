@@ -57,6 +57,7 @@ function allowsLoginState(facts: PngGateFacts): boolean {
     return !manualInputSeen && !hasKnownSecret && !hasNonEmptyFields;
   }
   return (
+    loginStep === false &&
     ownFact(completion, "sessionId") === sessionId &&
     ownFact(completion, "source") === "trusted-adapter" &&
     ownFact(completion, "confirmed") === true

@@ -17,13 +17,15 @@ test('подавляет PNG при вводе и ошибочном сигна�
   }
   const entered = { manualInputSeen: true };
   const signal = { sessionId: 'current', source: 'trusted-adapter', confirmed: true };
-  assert.deepEqual(decide({ ...entered, completion: signal }), { ok: true });
+  denied({ ...entered, completion: signal }, 'login-step');
+  const completed = { manualInputSeen: true, loginStep: false };
+  assert.deepEqual(decide({ ...completed, completion: signal }), { ok: true });
   for (const completion of [
     { ...signal, sessionId: 'other' }, { ...signal, confirmed: false },
     { ...signal, source: 'page' }, { ...signal, source: 'agent' },
-  ]) denied({ ...entered, completion }, 'login-step');
-  denied({ ...entered, completion: signal, sessionActive: false }, 'login-step');
-  denied({ ...entered, completion: signal, maskApplied: false }, 'error');
+  ]) denied({ ...completed, completion }, 'login-step');
+  denied({ ...completed, completion: signal, sessionActive: false }, 'login-step');
+  denied({ ...completed, completion: signal, maskApplied: false }, 'error');
   denied({ stable: false }, 'unstable');
   denied({ withinLimits: false }, 'limit');
 });
