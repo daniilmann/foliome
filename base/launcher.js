@@ -12,6 +12,8 @@ const systemRoot = '/Library/Application Support/Foliome';
 const shaPattern = /^[a-f0-9]{40}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
 const maxFile = 128 * 1024 * 1024;
+// The signed runtime is verified during installation and is larger than a release source file.
+const maxRuntime = 512 * 1024 * 1024;
 const maxInventory = 1024 * 1024;
 
 function absolute(p) {
@@ -146,7 +148,7 @@ async function launchAcceptedRelease({ home, systemRoot: root, run }) {
   const node = path.join(base, 'node');
   const systemUid = root === systemRoot ? 0 : uid;
   for (const dir of [root, base]) await directory(dir, systemUid, root !== systemRoot);
-  const nodeFile = await openFile(node, systemUid, maxFile, root !== systemRoot);
+  const nodeFile = await openFile(node, systemUid, maxRuntime, root !== systemRoot);
   try {
     if ((nodeFile.s.mode & 0o111) === 0) throw Error('node');
   } finally {
@@ -216,7 +218,12 @@ if (require.main === module) {
       path.join(systemRoot, 'base/activation-state.js'),
       process.execPath,
     ]) {
-      const opened = await openFile(file, 0, maxFile, false);
+      const opened = await openFile(
+        file,
+        0,
+        file === process.execPath ? maxRuntime : maxFile,
+        false,
+      );
       await opened.h.close();
     }
     await launchAcceptedRelease({

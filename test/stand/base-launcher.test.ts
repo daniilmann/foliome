@@ -102,6 +102,18 @@
     }
   });
 
+  test('accepts an installed runtime larger than the source-file limit', async () => {
+    const { launchAcceptedRelease } = require('../../base/launcher.js');
+    const f = await fixture();
+    try {
+      await fs.truncate(f.node, 150 * 1024 * 1024);
+      await launchAcceptedRelease(f);
+      assert.equal(f.calls.length, 1);
+    } finally {
+      await fs.rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
   for (const failure of [
     'digest',
     'dependency',
