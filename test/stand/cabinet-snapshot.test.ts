@@ -69,7 +69,9 @@ function checkDeviation(entry: any, code: string, snapshotNumber: number) {
   assert.equal(entry.path, '/overview');
   assert.ok(Number.isSafeInteger(entry.retakes) && entry.retakes >= 0);
   assert.ok(Number.isSafeInteger(entry.elapsedMs) && entry.elapsedMs >= 0);
-  assert.deepEqual(Object.keys(entry).sort(), ['code', 'elapsedMs', 'host', 'path', 'retakes', 'snapshotNumber'].sort());
+  assert.ok(Array.isArray(entry.flags));
+  assert.deepEqual(entry.flags, ['flow', 'rectangles', 'animations', 'observer', 'visualViewport'].filter(flag => entry.flags.includes(flag)));
+  assert.deepEqual(Object.keys(entry).sort(), ['code', 'elapsedMs', 'flags', 'host', 'path', 'retakes', 'snapshotNumber'].sort());
   assert.doesNotMatch(JSON.stringify(entry), /Synthetic marker|data:image|Buffer/);
 }
 
@@ -289,45 +291,84 @@ test('подавляет PNG после первого ввода и после 
   });
 });
 
-test('переснимает нестабильный кадр и протоколирует отклонения без исходного изображения', { timeout: 60_000 }, async () => {
+test('переснимает нестабильный кадр и протоколирует отклонения без исходного изображения', { timeout: 60_000 }, async (t: any) => {
   const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const { createActionProtocol } = await import('../../core/adapters/store/action-protocol.ts');
   const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
-  await stand(async ({ capturePng, captures }: any) => {
+  const flagOrder = ['flow', 'rectangles', 'animations', 'observer', 'visualViewport'];
+  const expectedFlags = ['rectangles', 'observer'];
+  const changed = frame(8, 2, { ...rect, x: 21 });
+
+  await t.test('передаёт отличившиеся признаки массивом', async () => {
     const timer = clock();
-    const deviations: any[] = [];
-    const changed = frame(8, 2, { ...rect, x: 21 });
+    let entry: any;
     let calls = 0;
-    const ports = {
-      collect: async () => ++calls === 1 ? { ...frame(8), animationIds: ['synthetic-animation'] } : changed,
-      capturePng, now: timer.now, sleep: timer.sleep,
-      recordDeviation: async (entry: any) => { deviations.push(entry); },
-    };
-    const result = await captureCabinetSnapshot(ports, () => session, 1000);
+    const result = await captureCabinetSnapshot({
+      collect: async () => ++calls === 1 ? frame(8) : changed,
+      capturePng: async () => syntheticPng(), now: timer.now, sleep: timer.sleep,
+      recordDeviation: async (value: any) => { entry = value; },
+    }, () => session, 1000);
     assert.equal(result.ok, true);
-    assert.deepEqual(result.snapshot, filterTextSnapshot(changed.facts).snapshot);
-    assert.equal(result.image.snapshotNumber, 8);
-    assert.ok(Buffer.isBuffer(result.image.bytes));
-    assert.equal(captures(), 2);
-    assert.deepEqual(timer.sleeps, [300]);
-    assert.equal(deviations.length, 1);
-    checkDeviation(deviations[0], 'retake', 8);
-    assert.equal(deviations[0].retakes, 1);
+    assert.ok(Array.isArray(entry.flags));
+    assert.deepEqual(entry.flags, expectedFlags);
+  });
 
-    const timeoutClock = clock();
-    const timeoutDeviations: any[] = [];
-    let revision = 0;
-    const before = captures();
-    const unstable = await captureCabinetSnapshot({ ...ports, collect: async () => frame(9, ++revision, { ...rect, x: 20 + revision % 2 }), now: timeoutClock.now, sleep: timeoutClock.sleep, recordDeviation: async (entry: any) => { timeoutDeviations.push(entry); } }, () => session, 600);
-    assert.equal(unstable.ok, true);
-    assert.deepEqual(unstable.snapshot, filterTextSnapshot(facts(9)).snapshot);
-    assert.deepEqual(unstable.image, { code: 'unstable' });
-    assert.ok(captures() - before >= 2);
-    assert.ok(timeoutClock.sleeps.length >= 1 && timeoutClock.sleeps.every((ms: number) => ms === 300));
-    assert.ok(timeoutDeviations.some((entry) => entry.code === 'retake'));
-    assert.equal(timeoutDeviations.at(-1).code, 'unstable');
-    for (const entry of timeoutDeviations) checkDeviation(entry, entry.code, 9);
+  await t.test('записывает отклонения и отклоняет недоступный протокол', async () => {
+    const db = new DatabaseSync(':memory:');
+    try {
+      const protocol = createActionProtocol(db, () => 1) as any;
+      assert.equal(typeof protocol.appendSnapshotDeviation, 'function');
+      const recordDeviation = async (entry: any) => {
+        assert.ok(Array.isArray(entry.flags));
+        protocol.appendSnapshotDeviation({ sessionId: session.sessionId, sourceId: 'synthetic-source', accessId: 'synthetic-access', ...entry });
+      };
+      const rows = () => db.prepare('SELECT code, snapshot_number, host, path, flags, retakes, elapsed_ms FROM action_snapshot_deviations ORDER BY id').all().map((row: any) => {
+        const flags = row.flags.startsWith('[') ? JSON.parse(row.flags) : row.flags.split(',').filter(Boolean);
+        assert.ok(Array.isArray(flags));
+        assert.deepEqual(flags, flagOrder.filter(flag => flags.includes(flag)));
+        return { ...row, flags };
+      });
+      await stand(async ({ capturePng, captures }: any) => {
+        const timer = clock();
+        let calls = 0;
+        const ports = {
+          collect: async () => ++calls === 1 ? frame(8) : changed,
+          capturePng, now: timer.now, sleep: timer.sleep, recordDeviation,
+        };
+        const result = await captureCabinetSnapshot(ports, () => session, 1000);
+        assert.equal(result.ok, true);
+        assert.deepEqual(result.snapshot, filterTextSnapshot(changed.facts).snapshot);
+        assert.equal(result.image.snapshotNumber, 8);
+        assert.ok(Buffer.isBuffer(result.image.bytes));
+        assert.equal(captures(), 2);
+        assert.deepEqual(timer.sleeps, [300]);
+        assert.deepEqual(rows(), [{ code: 'retake', snapshot_number: 8, host: 'cabinet.invalid', path: '/overview', flags: expectedFlags, retakes: 1, elapsed_ms: 0 }]);
 
-    const denied = await captureCabinetSnapshot({ ...ports, collect: async () => frame(10, ++revision), recordDeviation: async () => { throw new Error('synthetic protocol failure'); } }, () => session, 1000);
-    assert.deepEqual(denied, { ok: false, code: 'protocol-unavailable' });
+        const timeoutClock = clock();
+        let revision = 0;
+        const before = captures();
+        const unstable = await captureCabinetSnapshot({ ...ports, collect: async () => frame(9, ++revision, { ...rect, x: 20 + revision % 2 }), now: timeoutClock.now, sleep: timeoutClock.sleep }, () => session, 600);
+        assert.equal(unstable.ok, true);
+        assert.deepEqual(unstable.snapshot, filterTextSnapshot(facts(9)).snapshot);
+        assert.deepEqual(unstable.image, { code: 'unstable' });
+        assert.ok(captures() - before >= 2);
+        assert.deepEqual(timeoutClock.sleeps, [300]);
+        const stored = rows();
+        assert.deepEqual(stored.slice(1), [
+          { code: 'retake', snapshot_number: 9, host: 'cabinet.invalid', path: '/overview', flags: expectedFlags, retakes: 1, elapsed_ms: 0 },
+          { code: 'retake', snapshot_number: 9, host: 'cabinet.invalid', path: '/overview', flags: expectedFlags, retakes: 2, elapsed_ms: 300 },
+          { code: 'unstable', snapshot_number: 9, host: 'cabinet.invalid', path: '/overview', flags: expectedFlags, retakes: 2, elapsed_ms: 300 },
+        ]);
+        const rawRows = db.prepare('SELECT * FROM action_snapshot_deviations ORDER BY id').all();
+        assert.doesNotMatch(JSON.stringify(rawRows), /Synthetic marker|data:image|Buffer/);
+        assert.ok(rawRows.every((row: any) => !Object.keys(row).some(key => /text|png|image/i.test(key))));
+
+        db.exec('PRAGMA query_only = ON');
+        assert.equal(db.prepare('PRAGMA query_only').get().query_only, 1);
+        const denied = await captureCabinetSnapshot({ ...ports, collect: async () => frame(10, ++revision) }, () => session, 1000);
+        assert.deepEqual(denied, { ok: false, code: 'protocol-unavailable' });
+        assert.deepEqual(rows(), stored);
+      });
+    } finally { db.close(); }
   });
 });
