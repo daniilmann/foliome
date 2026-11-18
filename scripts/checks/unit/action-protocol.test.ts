@@ -79,3 +79,110 @@ test('дозаписывает вердикт перед вызовом и ит�
     database.close();
   }
 });
+
+const allowedVerdict = {
+  sessionId: 'session-1', sourceId: 'source-1', accessId: 'access-1',
+  snapshotNumber: 2, nodeNumber: 3, method: 'readText', actionClass: 'read',
+  decision: 'allowed', reason: 'allowed',
+} as const;
+
+for (const [method, actionClass] of [
+  ['other', 'read'], ['readText', 'unknown'], ['other', 'unknown'],
+] as const) {
+  test(`отклоняет allowed с ${method}/${actionClass} через API`, async () => {
+    const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+    const database = new DatabaseSync(':memory:');
+    try {
+      const protocol = createActionProtocol(database, () => 1);
+      assert.throws(() => protocol.appendVerdict({ ...allowedVerdict, method, actionClass }));
+      assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts').get().n, 0);
+    } finally {
+      database.close();
+    }
+  });
+
+  test(`отклоняет allowed с ${method}/${actionClass} напрямую в SQL`, async () => {
+    const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+    const database = new DatabaseSync(':memory:');
+    try {
+      createActionProtocol(database, () => 1);
+      const insert = database.prepare(`INSERT INTO action_verdicts
+        (at_ms, session_id, source_id, access_id, snapshot_number, node_number, method, action_class, actor, decision, reason)
+        VALUES (1, 'session-1', 'source-1', 'access-1', 2, 3, ?, ?, 'agent', 'allowed', 'allowed')`);
+      assert.throws(() => insert.run(method, actionClass));
+      assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts').get().n, 0);
+    } finally {
+      database.close();
+    }
+  });
+}
+
+test('отклоняет запись вердикта во внешней транзакции и работает после отката', async () => {
+  const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+  const database = new DatabaseSync(':memory:');
+  try {
+    const protocol = createActionProtocol(database, () => 1);
+    database.exec('BEGIN');
+    let error: unknown;
+    try {
+      protocol.appendVerdict(allowedVerdict);
+    } catch (caught) {
+      error = caught;
+    }
+    database.exec('ROLLBACK');
+    assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts').get().n, 0);
+    const id = protocol.appendVerdict(allowedVerdict);
+    assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts WHERE id = ?').get(id).n, 1);
+    assert.ok(error instanceof Error, 'запись во внешней транзакции должна завершиться ошибкой');
+  } finally {
+    database.close();
+  }
+});
+
+test('отклоняет запись итога во внешней транзакции и работает после отката', async () => {
+  const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+  const database = new DatabaseSync(':memory:');
+  try {
+    const protocol = createActionProtocol(database, () => 1);
+    const verdictId = protocol.appendVerdict(allowedVerdict);
+    database.exec('BEGIN');
+    let error: unknown;
+    try {
+      protocol.appendOutcome({ verdictId, status: 'ok' });
+    } catch (caught) {
+      error = caught;
+    }
+    database.exec('ROLLBACK');
+    assert.equal(database.prepare('SELECT count(*) AS n FROM action_outcomes').get().n, 0);
+    protocol.appendOutcome({ verdictId, status: 'ok' });
+    assert.deepEqual({ ...database.prepare('SELECT verdict_id, status FROM action_outcomes').get() },
+      { verdict_id: verdictId, status: 'ok' });
+    assert.ok(error instanceof Error, 'запись во внешней транзакции должна завершиться ошибкой');
+  } finally {
+    database.close();
+  }
+});
+
+for (const table of ['action_verdicts', 'action_outcomes'] as const) {
+  test(`запрещает INSERT OR REPLACE существующей строки ${table}`, async () => {
+    const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+    const database = new DatabaseSync(':memory:');
+    try {
+      const protocol = createActionProtocol(database, () => 1);
+      const verdictId = protocol.appendVerdict(allowedVerdict);
+      protocol.appendOutcome({ verdictId, status: 'ok' });
+      const before = database.prepare(`SELECT * FROM ${table}`).all();
+      if (table === 'action_verdicts') {
+        assert.throws(() => database.prepare(`INSERT OR REPLACE INTO action_verdicts
+          (id, at_ms, session_id, source_id, access_id, snapshot_number, node_number, method, action_class, actor, decision, reason)
+          VALUES (?, 2, 'session-2', 'source-1', 'access-1', 2, 3, 'readText', 'read', 'agent', 'allowed', 'allowed')`).run(verdictId));
+      } else {
+        assert.throws(() => database.prepare(`INSERT OR REPLACE INTO action_outcomes
+          (verdict_id, at_ms, status) VALUES (?, 2, 'stale')`).run(verdictId));
+      }
+      assert.deepEqual(database.prepare(`SELECT * FROM ${table}`).all(), before);
+    } finally {
+      database.close();
+    }
+  });
+}

@@ -55,7 +55,8 @@ function create(database: DatabaseSync, clock: Clock) {
           'not-found', 'ambiguous', 'hidden', 'disabled', 'covered', 'stale', 'foreign-frame', 'foreign-host',
           'bad-url', 'form-repeat', 'popup-blocked', 'download-refused', 'secret-field', 'unclassified',
           'blocked-payment', 'blocked-change', 'limit', 'internal')),
-        CHECK ((decision = 'allowed' AND reason = 'allowed' AND node_number IS NOT NULL)
+        CHECK ((decision = 'allowed' AND reason = 'allowed' AND node_number IS NOT NULL
+          AND method = 'readText' AND action_class = 'read')
           OR (decision = 'blocked' AND reason <> 'allowed'))
       ) STRICT;
       CREATE TABLE IF NOT EXISTS action_outcomes (
@@ -81,7 +82,9 @@ function create(database: DatabaseSync, clock: Clock) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?)`);
   const insertOutcome = database.prepare('INSERT INTO action_outcomes (verdict_id, at_ms, status) VALUES (?, ?, ?)');
   function time(): number {
+    if (database.isTransaction) throw new Error('active transaction');
     const value = clock();
+    if (database.isTransaction) throw new Error('active transaction');
     if (!integer(value, 0)) throw new Error('invalid time');
     return value;
   }
@@ -91,7 +94,8 @@ function create(database: DatabaseSync, clock: Clock) {
         !integer(value.snapshotNumber, 1) || (value.nodeNumber !== null && !integer(value.nodeNumber, 1)) ||
         !['readText', 'other'].includes(value.method) || !['read', 'unknown'].includes(value.actionClass) ||
         !reasons.has(value.reason) ||
-        !((value.decision === 'allowed' && value.reason === 'allowed' && value.nodeNumber !== null) ||
+        !((value.decision === 'allowed' && value.reason === 'allowed' && value.nodeNumber !== null &&
+          value.method === 'readText' && value.actionClass === 'read') ||
           (value.decision === 'blocked' && value.reason !== 'allowed'))) throw new Error('invalid verdict');
       const result = insertVerdict.run(time(), value.sessionId, value.sourceId, value.accessId,
         value.snapshotNumber, value.nodeNumber, value.method, value.actionClass, value.decision, value.reason);
