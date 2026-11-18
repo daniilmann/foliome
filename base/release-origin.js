@@ -18,6 +18,8 @@ const requiredJobs = [
   'migration',
 ];
 const jsonLimit = 8 * 1024 * 1024;
+// The canonical npm package document includes publication times for every version.
+const registryLimit = 32 * 1024 * 1024;
 const archiveLimit = 256 * 1024 * 1024;
 const timeout = 30000;
 
@@ -37,7 +39,10 @@ async function fetchBounded(url, limit) {
       method: 'GET',
       redirect: 'manual',
       signal: controller.signal,
-      headers: { accept: 'application/vnd.github+json', 'user-agent': 'release-reader' },
+      headers: {
+        accept: new URL(url).hostname === 'api.github.com' ? 'application/vnd.github+json' : '*/*',
+        'user-agent': 'release-reader',
+      },
     });
     const length = response.headers.get('content-length');
     if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) throw Error();
@@ -75,8 +80,8 @@ async function request(transport, url, limit) {
   return response;
 }
 
-async function json(transport, url) {
-  const response = await request(transport, url, jsonLimit);
+async function json(transport, url, limit = jsonLimit) {
+  const response = await request(transport, url, limit);
   if (response.status !== 200) throw Error();
   return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(response.body));
 }
@@ -185,6 +190,8 @@ async function readReleaseOrigin(input) {
         typeof job.name !== 'string' ||
         names.has(job.name) ||
         job.run_id !== run.id ||
+        job.head_sha !== sha ||
+        job.head_branch !== tag ||
         job.run_attempt !== run.run_attempt ||
         job.status !== 'completed' ||
         job.conclusion !== 'success'
@@ -193,7 +200,7 @@ async function readReleaseOrigin(input) {
       names.add(job.name);
     }
     if (!requiredJobs.every((name) => names.has(name))) throw Error();
-    const npm = await json(transport, 'https://registry.npmjs.org/playwright-core');
+    const npm = await json(transport, 'https://registry.npmjs.org/playwright-core', registryLimit);
     const packageVersion = npm?.versions?.[playwrightVersion];
     const publishedAt = npm?.time?.[playwrightVersion];
     const published = Date.parse(publishedAt);

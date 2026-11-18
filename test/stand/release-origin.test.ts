@@ -1,9 +1,9 @@
 const assert: typeof import('node:assert/strict') = require('node:assert/strict');
 const { test }: typeof import('node:test') = require('node:test');
 
-/* Proposed installed adapter: base/release-origin.js exports async readReleaseOrigin({
+/* Installed adapter: base/release-origin.js exports async readReleaseOrigin({
  * policy: {repository, workflowId}, version, sha, now, transport, verifyBase
- * }). transport(url) returns {status, headers, body: Buffer}, never follows redirects.
+ * }). transport(url, limit) returns {status, headers, body: Buffer}, never follows redirects.
  * verifyBase({sha, manifest, codexBytes}) is the installed closed verifier, returning
  * boolean; it is not supplied by the release. Success is {ok:true, sha, version};
  * refusal is {ok:false}. This only observes a candidate; it does not accept or install.
@@ -19,11 +19,11 @@ const tag = `v${version}`;
 const api = `https://api.github.com/repos/${repository}`;
 const refUrl = `${api}/git/ref/tags/${tag}`;
 const manifestUrl = `${api}/contents/release/manifest.json?ref=${sha}`;
-const runsUrl = `${api}/actions/workflows/${workflowId}/runs?event=push&head_sha=${sha}`;
-const jobsUrl = `${api}/actions/runs/42/jobs`;
+const runsUrl = `${api}/actions/workflows/${workflowId}/runs?event=push&head_sha=${sha}&per_page=100&page=1`;
+const jobsUrl = `${api}/actions/runs/42/attempts/1/jobs?per_page=100&page=1`;
 const npmUrl = 'https://registry.npmjs.org/playwright-core';
 const codexUrl =
-  'https://github.com/example-publisher/example-tool/releases/download/v1.0.0/tool.tar.gz';
+  'https://github.com/openai/codex/releases/download/rust-v1.0.0/codex-aarch64-apple-darwin.tar.gz';
 const assetUrl = 'https://release-assets.githubusercontent.com/example/tool.tar.gz';
 const jobNames = [
   'typescript',
@@ -63,6 +63,7 @@ function fixture() {
   const run = {
     id: 42,
     workflow_id: workflowId,
+    run_attempt: 1,
     event: 'push',
     status: 'completed',
     conclusion: 'success',
@@ -73,8 +74,16 @@ function fixture() {
     pull_requests: [],
   };
   const jobs = {
-    total_count: jobNames.length,
-    jobs: jobNames.map((name) => ({ name, status: 'completed', conclusion: 'success' })),
+    total_count: jobNames.length + 1,
+    jobs: [...jobNames, 'publish'].map((name) => ({
+      name,
+      status: 'completed',
+      conclusion: 'success',
+      run_id: 42,
+      run_attempt: 1,
+      head_sha: sha,
+      head_branch: tag,
+    })),
   };
   const npm = {
     name: 'playwright-core',
@@ -227,7 +236,14 @@ test('отклоняет чужой тег, SHA, проект и прогон б
 
 test('требует каждую отдельную успешную проверку включая подписи и advisory', async () => {
   for (const name of jobNames)
-    for (const defect of ['missing', 'failed', 'unfinished']) {
+    for (const defect of [
+      'missing',
+      'failed',
+      'unfinished',
+      'wrong-attempt',
+      'wrong-tag',
+      'wrong-sha',
+    ]) {
       const f = fixture();
       const job = f.jobs.jobs.find((item) => item.name === name)!;
       if (defect === 'missing') {
@@ -236,6 +252,9 @@ test('требует каждую отдельную успешную прове
       }
       if (defect === 'failed') job.conclusion = 'failure';
       if (defect === 'unfinished') job.status = 'in_progress';
+      if (defect === 'wrong-attempt') job.run_attempt++;
+      if (defect === 'wrong-tag') job.head_branch = 'main';
+      if (defect === 'wrong-sha') job.head_sha = 'f'.repeat(40);
       f.setJobs();
       assert.equal((await port().readReleaseOrigin(f.input)).ok, false, `${name}: ${defect}`);
     }
@@ -257,6 +276,12 @@ test('сверяет возраст версии пакета по незави�
   f.npm.versions['1.64.1'].version = '1.64.2';
   f.setNpm();
   assert.equal((await port().readReleaseOrigin(f.input)).ok, false);
+});
+
+test('читает публикацию из полного ограниченного документа реестра', async () => {
+  const f = fixture();
+  f.responses.set(npmUrl, json({ ...f.npm, history: ' '.repeat(18 * 1024 * 1024) }));
+  assert.deepEqual(await port().readReleaseOrigin(f.input), { ok: true, sha, version });
 });
 
 test('ограничивает перенаправление Codex и отклоняет испорченный JSON или отказ проверяющего', async () => {
