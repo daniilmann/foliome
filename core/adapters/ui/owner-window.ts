@@ -127,7 +127,11 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
   }
 
   page.on('close', close);
-  page.on('load', () => { if (posting) { posting = false; refresh(); } });
+  page.on('load', () => {
+    if (!posting) return;
+    posting = false;
+    if (dirty) refresh();
+  });
   await context.routeWebSocket('**/*', (socket) => {
     try { void Promise.resolve(socket.close()).catch(() => {}); } catch { /* Already closed. */ }
   });
@@ -146,10 +150,12 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
         const requestHeaders = await request.allHeaders();
         if (closed || requestHeaders.origin !== origin || !/^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?\s*$/i.test(requestHeaders['content-type'] ?? '') || (request.postDataBuffer()?.length ?? 0) !== 0) throw new Error('refused');
         opening = true;
+        posting = true;
         status = '';
         try { await onOpen(); } catch { status = 'session-unavailable'; }
         finally { opening = false; }
         if (closed) throw new Error('refused');
+        dirty = false;
         await route.fulfill({ status: 200, headers, body: render() });
         return;
       }
@@ -162,7 +168,8 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
         pending = null;
         const result = confirmation.handle({ method: 'POST', path: endpoint, frame, origin, body });
         if (result === null || closed) throw new Error('refused');
-        await route.fulfill({ status: 200, headers, body: '<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Вход</title></head><body>Подтверждено</body></html>' });
+        dirty = false;
+        await route.fulfill({ status: 200, headers, body: render() });
         return;
       }
     } catch {
