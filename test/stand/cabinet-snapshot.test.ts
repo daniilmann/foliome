@@ -601,3 +601,150 @@ test('переснимает нестабильный кадр и протоко
     } finally { db.close(); }
   });
 });
+
+test('защищает подписи input и сохраняет обычные элементы на настоящем PNG', { timeout: 60_000 }, async (t: any) => {
+  const { randomBytes } = require('node:crypto');
+  const secret = `synthetic${randomBytes(12).toString('hex')}`;
+  for (const kind of ['ordinary', 'secret']) await t.test(kind, async () => {
+    await measuredPage(`
+      <input id="password" type="password" style="left:10px;top:10px;width:180px;height:25px">
+      <label style="left:10px;top:55px"><input type="checkbox" checked> Checkbox marker</label>
+      <label style="left:10px;top:85px"><input type="radio" checked> Radio marker</label>
+      <input id="button" type="button" value="Button marker" style="left:10px;top:120px;width:140px;height:30px">
+      <input id="submit" type="submit" value="${kind === 'secret' ? secret : 'Submit marker'}" style="left:10px;top:160px;width:220px;height:30px">
+      <input id="reset" type="reset" value="Reset marker" style="left:10px;top:200px;width:140px;height:30px">
+      <div id="ordinary" style="left:300px;top:30px;color:white">Readable marker</div>`, async ({ page, capture, decode }: any) => {
+      await page.locator('#password').fill(secret);
+      const target = await page.locator('#submit').boundingBox();
+      assert.ok(target && Number.isInteger(target.x) && Number.isInteger(target.y));
+      const before = await decode(await capture.raw());
+      const result = await capture.result();
+      assert.equal(result.ok, true);
+      const output = JSON.stringify(result.snapshot);
+      assert.ok(output.includes('Readable marker'));
+      assert.equal(output.includes(secret), false);
+      if (kind === 'ordinary') for (const marker of ['Checkbox marker', 'Radio marker', 'Button marker', 'Submit marker', 'Reset marker']) assert.ok(output.includes(marker), marker);
+      assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+      const after = await decode(result.image.bytes);
+      if (kind === 'secret') {
+        assertRectBlack(after, target);
+      } else {
+        for (const selector of ['label', '#button', '#submit', '#reset']) {
+          const elements = page.locator(selector);
+          for (let i = 0; i < await elements.count(); i++) {
+            const box = await elements.nth(i).boundingBox();
+            assert.ok(box);
+            assertVisibleUnchanged(before, after, box);
+          }
+        }
+      }
+    });
+  });
+});
+
+test('CSS анимация блокирует только маску и её предка', { timeout: 60_000 }, async (t: any) => {
+  for (const position of ['none', 'distant', 'mask', 'ancestor']) await t.test(position, async () => {
+    const animation = 'animation: pulse 2s linear infinite alternate;';
+    await measuredPage(`
+      <style>@keyframes pulse { from { opacity:1 } to { opacity:.6 } }</style>
+      <div style="left:10px;top:10px;${position === 'ancestor' ? animation : ''}">
+        <input id="mask" type="password" value="synthetic-value" style="position:relative;width:180px;height:30px;${position === 'mask' ? animation : ''}">
+      </div>
+      <div id="ordinary" style="left:300px;top:30px;color:white;${position === 'distant' ? animation : ''}">Readable marker</div>`, async ({ page, capture, decode }: any) => {
+      const box = await page.locator('#mask').boundingBox();
+      assert.ok(box);
+      const result = await capture.result();
+      assert.equal(result.ok, true);
+      assert.ok(JSON.stringify(result.snapshot).includes('Readable marker'));
+      if (position === 'distant' || position === 'none') {
+        assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+        assertRectBlack(await decode(result.image.bytes), box);
+      } else {
+        assert.deepEqual(result.image, { code: 'unstable' });
+      }
+    });
+  });
+});
+
+test('закрытый shadow host и разрешённый фрейм не раскрывают неизвестное содержимое', { timeout: 60_000 }, async (t: any) => {
+  for (const kind of ['closed shadow', 'source frame']) await t.test(kind, async () => {
+    const content = kind === 'closed shadow'
+      ? '<div id="target" style="left:20px;top:20px;width:120px;height:60px;background:rgb(240,30,50)"></div><script>document.querySelector("#target").attachShadow({mode:"closed"}).append(document.createTextNode("Hidden marker"))</script>'
+      : '<iframe id="target" src="/frame" style="left:20px;top:20px;width:120px;height:60px;border:0"></iframe>';
+    await measuredPage(`${content}<div id="ordinary" style="left:300px;top:30px;color:white">Readable marker</div>`, async ({ page, capture, decode }: any) => {
+      const box = kind === 'closed shadow' ? await page.locator('#target').boundingBox() : await page.frameLocator('#target').locator('#frame-field').boundingBox();
+      const ordinary = await page.locator('#ordinary').boundingBox();
+      assert.ok(box && ordinary);
+      assert.deepEqual(box, { x: 20, y: 20, width: 120, height: 60 });
+      const before = await decode(await capture.raw());
+      assert.deepEqual(pixelAt(before, 25, 25), [240, 30, 50, 255]);
+      const result = await capture.result();
+      assert.equal(result.ok, true);
+      assert.ok(JSON.stringify(result.snapshot).includes('Readable marker'));
+      assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+      const after = await decode(result.image.bytes);
+      assertRectBlack(after, box);
+      assertVisibleUnchanged(before, after, ordinary);
+    });
+  });
+});
+
+async function measuredPage(body: string, run: (fixture: any) => Promise<void>) {
+  const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
+  const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
+  try {
+    const context = await browser.newContext({ viewport: { width: 480, height: 260 }, deviceScaleFactor: 1, serviceWorkers: 'block' });
+    try {
+      await context.route('**/*', async (route: any) => {
+        const request = route.request();
+        if (request.method() !== 'GET') return route.abort();
+        if (request.url() === `${origin}/overview`) return route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic overview</title><style>html,body{margin:0;background:rgb(30,180,70)} body>div,body>input,body>label,body>iframe{position:absolute} label input{position:static}</style>${body}` });
+        if (request.url() === `${origin}/frame`) return route.fulfill({ contentType: 'text/html', body: '<!doctype html><style>html,body{margin:0;background:rgb(30,180,70)} input{display:block;box-sizing:border-box;width:120px;height:60px;background:rgb(240,30,50);border:0}</style><input id="frame-field" type="password" value="synthetic-value">' });
+        return route.abort();
+      });
+      const page = await context.newPage();
+      const cdp = await context.newCDPSession(page);
+      const collector = await prepareDomCollector(cdp, { sourceHost: 'cabinet.invalid', approvedHosts: [] });
+      try {
+        await page.goto(`${origin}/overview`, { waitUntil: 'load' });
+        const raw = async () => Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })).data, 'base64');
+        const timer = clock();
+        const result = () => captureCabinetSnapshot({ collect: () => collector.collectFrame(51), capturePng: raw, now: timer.now, sleep: timer.sleep, recordDeviation: async () => {} }, () => session, 600);
+        const decoder = await context.newPage();
+        const decode = (bytes: Buffer) => decoder.evaluate(async (encoded: string) => {
+          const image = new Image(); image.src = `data:image/png;base64,${encoded}`; await image.decode();
+          const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
+          const ctx = canvas.getContext('2d')!; ctx.drawImage(image, 0, 0);
+          return { width: image.width, data: Array.from(ctx.getImageData(0, 0, image.width, image.height).data) };
+        }, bytes.toString('base64'));
+        await run({ page, capture: { raw, result }, decode });
+      } finally { await collector.close(); }
+    } finally { await context.close(); }
+  } finally { await browser.close(); }
+}
+
+function pixelAt(image: any, x: number, y: number) {
+  return image.data.slice((y * image.width + x) * 4, (y * image.width + x) * 4 + 4);
+}
+
+function assertRectBlack(image: any, box: any) {
+  for (let y = Math.ceil(box.y); y < Math.floor(box.y + box.height); y++) {
+    for (let x = Math.ceil(box.x); x < Math.floor(box.x + box.width); x++) {
+      assert.deepEqual(pixelAt(image, x, y), [0, 0, 0, 255], `pixel ${x},${y}`);
+    }
+  }
+}
+
+function assertVisibleUnchanged(before: any, after: any, box: any) {
+  let visible = 0;
+  for (let y = Math.ceil(box.y); y < Math.floor(box.y + box.height); y++) {
+    for (let x = Math.ceil(box.x); x < Math.floor(box.x + box.width); x++) {
+      const pixel = pixelAt(before, x, y);
+      if (pixel[0] !== 30 || pixel[1] !== 180 || pixel[2] !== 70) visible++;
+      assert.deepEqual(pixelAt(after, x, y), pixel, `visible pixel ${x},${y}`);
+    }
+  }
+  assert.ok(visible > 0, 'visible pixels must be rendered');
+}
