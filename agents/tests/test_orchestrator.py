@@ -1,0 +1,105 @@
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import orchestrator
+
+
+class OrchestratorTests(unittest.TestCase):
+    session_id = "5fdec920-f489-4db7-8841-38a32064f422"
+    other_id = "24314146-394c-4e51-88b5-d1a621b7de28"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.cwd = Path(temporary.name).resolve()
+        self.trace = self.cwd / "rollout.jsonl"
+        self.settings = {"model": "example-model", "effort": "medium"}
+
+    def turn(self, turn_id, marker, *, apps=False, tools=None, full=True, model=None):
+        return [
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+            {"type": "response_item", "payload": {"type": "additional_tools", "role": "developer", "tools": []}},
+            {"type": "world_state", "payload": {
+                "full": full, "state": {"apps_instructions": apps, "top_level_tools": tools or {"functions": {}}}
+            }},
+            {"type": "turn_context", "payload": {
+                "turn_id": turn_id, "cwd": str(self.cwd), **self.settings,
+                "model": model if model else self.settings["model"],
+            }},
+            {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                   "content": [{"type": "input_text", "text": marker + "\nbrief"}]}},
+        ]
+
+    def write(self, rows, mode="w"):
+        with self.trace.open(mode, encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def metadata(self, source="cli"):
+        return {"type": "session_meta", "payload": {"source": source, "id": self.session_id, "cwd": str(self.cwd)}}
+
+    def evaluate(self, marker, offset=0, resume_id=None):
+        evidence = orchestrator.startup_evidence(self.trace, marker, offset)
+        self.assertIsNotNone(evidence)
+        return orchestrator.verify_evidence(*evidence, self.settings, self.cwd, resume_id)
+
+    def test_startup_checks_the_marker_turn_not_an_earlier_turn(self):
+        self.write([self.metadata(), *self.turn("previous", "другой запуск", apps=True),
+                    *self.turn("current", "этот запуск")])
+        self.assertEqual(self.evaluate("этот запуск"), self.session_id)
+        self.assertIsNone(orchestrator.startup_evidence(self.trace, "несуществующий запуск"))
+
+    def test_missing_inventory_does_not_prove_apps_are_disabled(self):
+        self.write([self.metadata(), *self.turn("current", "marker", full=False)])
+        self.assertIsNone(orchestrator.startup_evidence(self.trace, "marker"))
+
+    def test_foreign_and_noninteractively_launched_sessions_are_rejected(self):
+        self.write([self.metadata("exec"), *self.turn("current", "marker")])
+        self.assertIsNone(orchestrator.startup_evidence(self.trace, "marker"))
+        self.write([self.metadata(), *self.turn("current", "marker")])
+        with self.assertRaisesRegex(orchestrator.StartupRejected, "другой сессии"):
+            self.evaluate("marker", resume_id=self.other_id)
+
+    def test_resume_requires_current_settings_and_current_tools(self):
+        self.write([self.metadata(), *self.turn("previous", "start")])
+        size = self.trace.stat().st_size
+        self.assertIsNone(orchestrator.startup_evidence(self.trace, "start", size))
+        for turn, message in (
+            (self.turn("resumed", "resume", apps=True), "коннекторов"),
+            (self.turn("resumed", "resume", tools={"mcp__codex_apps__example": {}}), "коннекторов"),
+            (self.turn("resumed", "resume", model="other-model"), "effort"),
+        ):
+            with self.subTest(message=message):
+                self.write([self.metadata(), *self.turn("previous", "start"), *turn])
+                with self.assertRaisesRegex(orchestrator.StartupRejected, message):
+                    self.evaluate("resume", size, self.session_id)
+        self.write([self.metadata(), *self.turn("previous", "start"), *self.turn("resumed", "resume")])
+        self.assertEqual(self.evaluate("resume", size, self.session_id), self.session_id)
+
+    def test_resume_accepts_only_verified_project_session(self):
+        self.trace.touch()
+        with patch.object(orchestrator.role, "rollouts", return_value={str(self.trace)}):
+            self.assertIsNone(orchestrator.resume_trace(self.cwd, self.session_id))
+            orchestrator.save_result(self.cwd / "0001.json", {
+                "verified": True, "session_id": self.session_id, "rollout": str(self.trace),
+            })
+            self.assertEqual(orchestrator.resume_trace(self.cwd, self.session_id), self.trace)
+            self.assertIsNone(orchestrator.resume_trace(self.cwd, self.other_id))
+            orchestrator.save_result(self.cwd / "0002.json", {"verified": False, "session_id": self.session_id})
+            self.assertIsNone(orchestrator.resume_trace(self.cwd, self.session_id))
+
+    def test_both_commands_use_the_roster_and_disable_apps(self):
+        for session_id in (None, self.session_id):
+            with self.subTest(session_id=session_id):
+                cmd = orchestrator.command(self.settings, self.cwd, self.cwd, "prompt", session_id)
+                self.assertEqual(cmd[cmd.index("--disable") + 1], "apps")
+                self.assertEqual(cmd[cmd.index("-m") + 1], self.settings["model"])
+                self.assertEqual(cmd[cmd.index("-c") + 1], 'model_reasoning_effort="medium"')
+                self.assertEqual(cmd[-2:] if session_id else cmd[-1:],
+                                 [self.session_id, "prompt"] if session_id else ["prompt"])
+                self.assertEqual("resume" in cmd, session_id is not None)

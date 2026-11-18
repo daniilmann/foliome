@@ -1,5 +1,9 @@
 {
   "_doc": "Реестр ролей ADR-022 и ADR-026. Запуск — agents/role.py run через codex exec. Модель — полный ID, effort — явно. Review: true — отдельная сессия только для чтения. Роли phase: design до П1 доступны в учётке заказчика, с П1 все роли — только в dev. Простой уровень — флаг --simple.",
+  "orchestrator": {
+    "model": "gpt-6.2-sol",
+    "effort": "high"
+  },
   "simple": {
     "codex": "gpt-6.1-terra"
   },
