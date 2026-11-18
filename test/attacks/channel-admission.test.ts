@@ -109,3 +109,107 @@ test('проверяет UID до чтения и останавливает с�
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('принимает только абсолютный путь Unix-сокета и синхронно отклоняет TCP и невалидные пути', async () => {
+  const { createAdmittedChannel } = await import('../../core/adapters/channel/admission.ts');
+  const server = createAdmittedChannel({
+    expectedUid: process.getuid!(), maxLineBytes: 128,
+    peerUid: async () => process.getuid!(), onRequest: () => undefined, onDenied: () => {},
+  });
+  for (const args of [[0], [{ port: 0, host: '127.0.0.1' }], ['']]) {
+    assert.throws(() => (server.listen as (...values: unknown[]) => unknown)(...args), TypeError);
+  }
+});
+
+test('относительный путь синхронно отклоняется до передачи в net.Server.listen', async () => {
+  const { createAdmittedChannel } = await import('../../core/adapters/channel/admission.ts');
+  const originalListen = net.Server.prototype.listen;
+  let delegated = false;
+  net.Server.prototype.listen = function () { delegated = true; return this; };
+  try {
+    const server = createAdmittedChannel({
+      expectedUid: process.getuid!(), maxLineBytes: 128,
+      peerUid: async () => process.getuid!(), onRequest: () => undefined, onDenied: () => {},
+    });
+    const rejected: string[] = [];
+    for (const path of ['relative-socket', '\0synthetic', '/synthetic\0socket']) {
+      try { server.listen(path); } catch (error) {
+        assert.ok(error instanceof TypeError);
+        rejected.push(path);
+      }
+    }
+    assert.deepEqual(rejected, ['relative-socket', '\0synthetic', '/synthetic\0socket']);
+    assert.equal(delegated, false);
+  } finally {
+    net.Server.prototype.listen = originalListen;
+  }
+});
+
+async function exchangeResponse(response: unknown, method = 'tools/call') {
+  const { createAdmittedChannel } = await import('../../core/adapters/channel/admission.ts');
+  const directory = await mkdtemp(join(tmpdir(), 'channel-output-'));
+  const path = join(directory, 'socket');
+  const denied = deferred<string>();
+  const denials: string[] = [];
+  const request = { jsonrpc: '2.0', id: 7, method, params: {} };
+  const server = createAdmittedChannel({
+    expectedUid: process.getuid!(), maxLineBytes: 128,
+    peerUid: async () => process.getuid!(),
+    onRequest: (received: unknown) => { assert.deepEqual(received, request); return response; },
+    onDenied: (code: string) => { denials.push(code); denied.resolve(code); },
+  });
+  let client: any;
+  const chunks: Buffer[] = [];
+  try {
+    server.listen(path);
+    await once(server, 'listening');
+    client = net.createConnection(path);
+    client.on('data', (chunk: Buffer) => chunks.push(chunk));
+    client.on('error', () => {});
+    const closed = new Promise<void>((resolve) => client.once('close', resolve));
+    await once(client, 'connect');
+    client.write(`${JSON.stringify(request)}\n`);
+    return await Promise.race([
+      new Promise<{ output: string; denials: string[] }>((resolve) => {
+        client.on('data', () => {
+          const output = Buffer.concat(chunks).toString('utf8');
+          if (output.includes('\n')) resolve({ output, denials });
+        });
+      }),
+      denied.promise.then(async () => { await closed; return { output: Buffer.concat(chunks).toString('utf8'), denials }; }),
+    ]);
+  } finally {
+    client?.destroy();
+    await new Promise<void>((resolve, reject) => server.close((error: Error | undefined) => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test('допускает ping для транспорта', { timeout: 15_000 }, async () => {
+  const response = { jsonrpc: '2.0', id: 7, result: {} };
+  const actual = await exchangeResponse(response, 'ping');
+  assert.deepEqual(actual.denials, []);
+  assert.deepEqual(JSON.parse(actual.output), response);
+});
+
+test('пропускает ответ с изображением и метаданными при независимом малом лимите входа', { timeout: 15_000 }, async () => {
+  const image = Buffer.alloc(Math.floor(1.3 * 1024 * 1024), 0x61).toString('base64');
+  const response = { jsonrpc: '2.0', id: 7, result: { content: [
+    { type: 'image', data: image, mimeType: 'image/png' },
+    { type: 'text', text: JSON.stringify({ width: 1024, height: 768 }) },
+  ] } };
+  assert.ok(Buffer.byteLength(JSON.stringify(response)) < 4 * 1024 * 1024);
+  const actual = await exchangeResponse(response);
+  assert.deepEqual(actual.denials, []);
+  assert.deepEqual(JSON.parse(actual.output), response);
+});
+
+test('ответ свыше 4 MiB отклоняется фиксированным кодом без частичного вывода', { timeout: 15_000 }, async () => {
+  const response = { jsonrpc: '2.0', id: 7, result: { content: [
+    { type: 'text', text: 'x'.repeat(4 * 1024 * 1024) },
+  ] } };
+  assert.ok(Buffer.byteLength(JSON.stringify(response)) > 4 * 1024 * 1024);
+  const actual = await exchangeResponse(response);
+  assert.equal(actual.output, '');
+  assert.deepEqual(actual.denials, ['handler']);
+});
