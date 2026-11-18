@@ -125,7 +125,7 @@ test('сохраняет историю ручного ввода между д�
           await context.route('**/*', async (route: any) => {
             const request = route.request();
             if (request.method() !== 'GET') return route.abort();
-            if (request.url() === `${origin}/login`) return route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic login</title><label for="entry">Synthetic ${kind}</label><input id="entry" type="${kind === 'password' ? 'password' : 'text'}" autocomplete="${kind === 'login' ? 'username' : kind === 'password' ? 'current-password' : 'one-time-code'}"><a href="/next">Continue</a>` });
+            if (request.url() === `${origin}/login`) return route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic login</title><label for="entry">Synthetic ${kind}</label><input id="entry" type="${kind === 'password' ? 'password' : 'text'}" autocomplete="${kind === 'login' ? 'username' : kind === 'password' ? 'current-password' : 'one-time-code'}"><button type="button">Virtual key</button><a href="/next">Continue</a>` });
             if (request.url() === `${origin}/next`) return route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic next</title><p>Echo: ${value}</p>` });
             return route.abort();
           });
@@ -135,7 +135,11 @@ test('сохраняет историю ручного ввода между д�
           let closed = false;
           try {
             await page.goto(`${origin}/login`, { waitUntil: 'load' });
-            if (check === 'observations') assert.deepEqual(await collector.loginObservations(), { manualInputSeen: false, hasKnownSecret: false });
+            if (check === 'observations') {
+              assert.deepEqual(await collector.loginObservations(), { manualInputSeen: false, hasKnownSecret: false });
+              await page.getByRole('button', { name: 'Virtual key' }).click();
+              assert.deepEqual(await collector.loginObservations(), { manualInputSeen: true, hasKnownSecret: false });
+            }
             await page.locator('#entry').click();
             await page.locator('#entry').pressSequentially(value);
             await page.getByRole('link', { name: 'Continue' }).click();
