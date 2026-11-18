@@ -32,33 +32,76 @@ test('запрещает принятие в сессии сохраняет а�
     const activeFile = path.join(dir, 'active');
     const oldSha = '1111111111111111111111111111111111111111';
     const sha = '2222222222222222222222222222222222222222';
-    const before = { 'system/policy.conf': 'old synthetic policy\n', 'base/launcher.js': 'old synthetic launcher\n' };
-    const next = { 'system/policy.conf': 'new synthetic policy\n', 'base/launcher.js': 'new synthetic launcher\n', 'system/new.conf': 'new synthetic file\n' };
+    const before = {
+      'system/policy.conf': 'old synthetic policy\n',
+      'base/launcher.js': 'old synthetic launcher\n',
+    };
+    const next = {
+      'system/policy.conf': 'new synthetic policy\n',
+      'base/launcher.js': 'new synthetic launcher\n',
+      'system/new.conf': 'new synthetic file\n',
+    };
     for (const [name, text] of Object.entries(before)) await put(rootDir, name, text);
     for (const [name, text] of Object.entries(next)) await put(releaseDir, name, text);
     await fs.writeFile(activeFile, oldSha);
-    const tree = Object.fromEntries(Object.entries(next).map(([name, text]) => [name, hashes(text)]));
+    const tree = Object.fromEntries(
+      Object.entries(next).map(([name, text]) => [name, hashes(text)]),
+    );
     let checked = false;
-    await assert.rejects(installRoot({ releaseDir, rootDir, sha, tree, allowedPaths: Object.keys(next), checkBoundary: async ({ rootDir: installed, stagingDir }: any) => {
-      checked = true;
-      assert.equal(await fs.readFile(path.join(installed, 'system/policy.conf'), 'utf8'), next['system/policy.conf']);
-      assert.equal(await fs.readFile(path.join(installed, 'system/new.conf'), 'utf8'), next['system/new.conf']);
-      assert.equal(await fs.readFile(path.join(stagingDir, 'system/policy.conf'), 'utf8'), next['system/policy.conf']);
-      await fs.writeFile(path.join(releaseDir, 'system/policy.conf'), 'changed after staging\n');
-      assert.equal(await fs.readFile(path.join(stagingDir, 'system/policy.conf'), 'utf8'), next['system/policy.conf']);
-      throw new Error('synthetic boundary failure');
-    } }), (error: Error) => {
-      assert.ok(error instanceof Error);
-      assert.equal(error.message, 'boundary-failed');
-      assert.doesNotMatch(error.message, /synthetic boundary failure/);
-      return true;
-    });
+    await assert.rejects(
+      installRoot({
+        releaseDir,
+        rootDir,
+        sha,
+        tree,
+        allowedPaths: Object.keys(next),
+        checkBoundary: async ({
+          rootDir: installed,
+          stagingDir,
+        }: {
+          rootDir: string;
+          stagingDir: string;
+        }) => {
+          checked = true;
+          assert.equal(
+            await fs.readFile(path.join(installed, 'system/policy.conf'), 'utf8'),
+            next['system/policy.conf'],
+          );
+          assert.equal(
+            await fs.readFile(path.join(installed, 'system/new.conf'), 'utf8'),
+            next['system/new.conf'],
+          );
+          assert.equal(
+            await fs.readFile(path.join(stagingDir, 'system/policy.conf'), 'utf8'),
+            next['system/policy.conf'],
+          );
+          await fs.writeFile(
+            path.join(releaseDir, 'system/policy.conf'),
+            'changed after staging\n',
+          );
+          assert.equal(
+            await fs.readFile(path.join(stagingDir, 'system/policy.conf'), 'utf8'),
+            next['system/policy.conf'],
+          );
+          throw new Error('synthetic boundary failure');
+        },
+      }),
+      (error: Error) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'boundary-failed');
+        assert.doesNotMatch(error.message, /synthetic boundary failure/);
+        return true;
+      },
+    );
     assert.equal(checked, true);
-    for (const [name, text] of Object.entries(before)) assert.equal(await fs.readFile(path.join(rootDir, name), 'utf8'), text);
+    for (const [name, text] of Object.entries(before))
+      assert.equal(await fs.readFile(path.join(rootDir, name), 'utf8'), text);
     await assert.rejects(fs.lstat(path.join(rootDir, 'system/new.conf')), { code: 'ENOENT' });
     assert.equal(await fs.readFile(activeFile, 'utf8'), oldSha);
     await failedUpdates();
-  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
 
 // Proposed local port in core/adapters/update/install.ts:
@@ -81,10 +124,15 @@ async function updateFixture() {
   const rootDir = path.join(dir, 'root');
   const releasesDir = path.join(dir, 'releases');
   const db = new DatabaseSync(dbPath);
-  db.exec("CREATE TABLE entries (id INTEGER PRIMARY KEY, label TEXT NOT NULL) STRICT; INSERT INTO entries VALUES (1, 'synthetic original'); PRAGMA user_version = 1;");
+  db.exec(
+    "CREATE TABLE entries (id INTEGER PRIMARY KEY, label TEXT NOT NULL) STRICT; INSERT INTO entries VALUES (1, 'synthetic original'); PRAGMA user_version = 1;",
+  );
   db.close();
   await fs.writeFile(stateFile, JSON.stringify({ current: currentSha, previous: previousSha }));
-  for (const [sha, label] of [[currentSha, 'current'], [nextSha, 'next']]) {
+  for (const [sha, label] of [
+    [currentSha, 'current'],
+    [nextSha, 'next'],
+  ]) {
     await put(path.join(releasesDir, sha), 'system/policy.conf', `${label} synthetic policy\n`);
     await put(path.join(releasesDir, sha), 'base/launcher.js', `${label} synthetic launcher\n`);
   }
@@ -92,21 +140,44 @@ async function updateFixture() {
   await put(rootDir, 'base/launcher.js', 'next synthetic launcher\n');
   return { dir, dbPath, stateFile, rootDir, releasesDir };
 }
-async function state(file: string) { return JSON.parse(await fs.readFile(file, 'utf8')); }
+async function state(file: string) {
+  return JSON.parse(await fs.readFile(file, 'utf8'));
+}
 function data(file: string) {
   const db = new DatabaseSync(file, { readOnly: true });
   try {
     return {
-      version: db.prepare('PRAGMA user_version').get().user_version,
-      rows: db.prepare('SELECT id, label FROM entries ORDER BY id').all().map((row: any) => ({ ...row })),
-      columns: db.prepare('PRAGMA table_info(entries)').all().map((row: any) => row.name),
+      version: db.prepare('PRAGMA user_version').get()!.user_version,
+      rows: db
+        .prepare('SELECT id, label FROM entries ORDER BY id')
+        .all()
+        .map((row: Record<string, import('node:sqlite').SQLOutputValue>) => ({ ...row })),
+      columns: db
+        .prepare('PRAGMA table_info(entries)')
+        .all()
+        .map((row: Record<string, import('node:sqlite').SQLOutputValue>) => row.name),
     };
-  } finally { db.close(); }
+  } finally {
+    db.close();
+  }
 }
-const original = { version: 1, rows: [{ id: 1, label: 'synthetic original' }], columns: ['id', 'label'] };
-const migrated = { version: 2, rows: [{ id: 1, label: 'synthetic original' }, { id: 2, label: 'synthetic migrated' }], columns: ['id', 'label', 'note'] };
-function migration(db: any) {
-  db.exec("ALTER TABLE entries ADD COLUMN note TEXT; INSERT INTO entries (id, label) VALUES (2, 'synthetic migrated'); PRAGMA user_version = 2;");
+const original = {
+  version: 1,
+  rows: [{ id: 1, label: 'synthetic original' }],
+  columns: ['id', 'label'],
+};
+const migrated = {
+  version: 2,
+  rows: [
+    { id: 1, label: 'synthetic original' },
+    { id: 2, label: 'synthetic migrated' },
+  ],
+  columns: ['id', 'label', 'note'],
+};
+function migration(db: import('node:sqlite').DatabaseSync) {
+  db.exec(
+    "ALTER TABLE entries ADD COLUMN note TEXT; INSERT INTO entries (id, label) VALUES (2, 'synthetic migrated'); PRAGMA user_version = 2;",
+  );
 }
 
 test('активирует проверенный SHA после принятия и возвращает допустимый предыдущий SHA', async () => {
@@ -115,17 +186,26 @@ test('активирует проверенный SHA после приняти�
   try {
     let checks = 0;
     let migrations = 0;
-    const selfCheck = (db: any, sha: string) => {
+    const selfCheck = (db: import('node:sqlite').DatabaseSync, sha: string) => {
       checks++;
       assert.equal(sha, nextSha);
       assert.deepEqual(data(f.dbPath), original);
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 2);
       db.exec("UPDATE entries SET label = 'copy only' WHERE id = 1");
       assert.deepEqual(data(f.dbPath), original);
     };
-    await acceptUpdate({ ...f, sha: nextSha, allowed: true, sessionActive: false,
-      migrate: (db: any) => { migrations++; migration(db); }, selfCheck,
-      compatible: (_db: any, sha: string) => sha === nextSha });
+    await acceptUpdate({
+      ...f,
+      sha: nextSha,
+      allowed: true,
+      sessionActive: false,
+      migrate: (db: import('node:sqlite').DatabaseSync) => {
+        migrations++;
+        migration(db);
+      },
+      selfCheck,
+      compatible: (_db: import('node:sqlite').DatabaseSync, sha: string) => sha === nextSha,
+    });
     assert.equal(checks, 1);
     assert.equal(migrations, 2);
     assert.deepEqual(await state(f.stateFile), { current: nextSha, previous: currentSha });
@@ -133,37 +213,67 @@ test('активирует проверенный SHA после приняти�
 
     let restoreChecks = 0;
     let compatibilityChecks = 0;
-    const restore = { ...f, selfCheck: (db: any, sha: string) => {
-      restoreChecks++;
-      assert.equal(sha, currentSha);
-      assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
-      db.exec("UPDATE entries SET label = 'restore copy only' WHERE id = 1");
-    }, compatible: (_db: any, sha: string) => { compatibilityChecks++; assert.equal(sha, currentSha); return false; } };
+    const restore = {
+      ...f,
+      selfCheck: (db: import('node:sqlite').DatabaseSync, sha: string) => {
+        restoreChecks++;
+        assert.equal(sha, currentSha);
+        assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 2);
+        db.exec("UPDATE entries SET label = 'restore copy only' WHERE id = 1");
+      },
+      compatible: (_db: import('node:sqlite').DatabaseSync, sha: string) => {
+        compatibilityChecks++;
+        assert.equal(sha, currentSha);
+        return false;
+      },
+    };
     await assert.rejects(restorePrevious(restore));
     assert.equal(compatibilityChecks, 1);
     assert.deepEqual(await state(f.stateFile), { current: nextSha, previous: currentSha });
     assert.deepEqual(data(f.dbPath), migrated);
-    assert.equal(await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'), 'next synthetic policy\n');
+    assert.equal(
+      await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'),
+      'next synthetic policy\n',
+    );
     let boundaryChecks = 0;
     const previousPolicy = 'current synthetic policy\n';
     const previousRoot = {
       tree: { 'system/policy.conf': hashes(previousPolicy) },
       allowedPaths: ['system/policy.conf'],
-      checkBoundary: async ({ rootDir: installed }: any) => {
+      checkBoundary: async ({ rootDir: installed }: { rootDir: string }) => {
         boundaryChecks++;
-        assert.equal(await fs.readFile(path.join(installed, 'system/policy.conf'), 'utf8'), previousPolicy);
-        assert.equal(await fs.readFile(path.join(installed, 'base/launcher.js'), 'utf8'), 'next synthetic launcher\n');
+        assert.equal(
+          await fs.readFile(path.join(installed, 'system/policy.conf'), 'utf8'),
+          previousPolicy,
+        );
+        assert.equal(
+          await fs.readFile(path.join(installed, 'base/launcher.js'), 'utf8'),
+          'next synthetic launcher\n',
+        );
       },
     };
-    const verifiedRestore = { ...restore, previousRoot, compatible: (_db: any, sha: string) => { compatibilityChecks++; return sha === currentSha; } };
+    const verifiedRestore = {
+      ...restore,
+      previousRoot,
+      compatible: (_db: import('node:sqlite').DatabaseSync, sha: string) => {
+        compatibilityChecks++;
+        return sha === currentSha;
+      },
+    };
     const previousPolicyFile = path.join(f.releasesDir, currentSha, 'system/policy.conf');
     await fs.writeFile(previousPolicyFile, 'tampered synthetic policy\n');
     await assert.rejects(restorePrevious(verifiedRestore));
     assert.equal(boundaryChecks, 0);
     assert.deepEqual(await state(f.stateFile), { current: nextSha, previous: currentSha });
     assert.deepEqual(data(f.dbPath), migrated);
-    assert.equal(await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'), 'next synthetic policy\n');
-    assert.equal(await fs.readFile(path.join(f.rootDir, 'base/launcher.js'), 'utf8'), 'next synthetic launcher\n');
+    assert.equal(
+      await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'),
+      'next synthetic policy\n',
+    );
+    assert.equal(
+      await fs.readFile(path.join(f.rootDir, 'base/launcher.js'), 'utf8'),
+      'next synthetic launcher\n',
+    );
     await fs.writeFile(previousPolicyFile, previousPolicy);
     await restorePrevious(verifiedRestore);
     assert.ok(restoreChecks >= 1);
@@ -171,9 +281,17 @@ test('активирует проверенный SHA после приняти�
     assert.equal(boundaryChecks, 1);
     assert.deepEqual(await state(f.stateFile), { current: currentSha, previous: null });
     assert.deepEqual(data(f.dbPath), migrated);
-    assert.equal(await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'), 'current synthetic policy\n');
-    assert.equal(await fs.readFile(path.join(f.rootDir, 'base/launcher.js'), 'utf8'), 'next synthetic launcher\n');
-  } finally { await fs.rm(f.dir, { recursive: true, force: true }); }
+    assert.equal(
+      await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'),
+      'current synthetic policy\n',
+    );
+    assert.equal(
+      await fs.readFile(path.join(f.rootDir, 'base/launcher.js'), 'utf8'),
+      'next synthetic launcher\n',
+    );
+  } finally {
+    await fs.rm(f.dir, { recursive: true, force: true });
+  }
 });
 
 async function failedUpdates() {
@@ -183,21 +301,28 @@ async function failedUpdates() {
     try {
       let checks = 0;
       let migrations = 0;
-      await assert.rejects(acceptUpdate({ ...f, sha: nextSha,
-        allowed: failure !== 'not-allowed', sessionActive: failure === 'session',
-        migrate: (db: any) => {
-          migrations++;
-          migration(db);
-          if (failure === 'migration' && migrations === 2) throw new Error('synthetic migration failure');
-        },
-        selfCheck: (db: any) => {
-          checks++;
-          assert.deepEqual(data(f.dbPath), original);
-          assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
-          if (failure === 'check') throw new Error('synthetic check failure');
-        },
-        compatible: () => true,
-      }), failure);
+      await assert.rejects(
+        acceptUpdate({
+          ...f,
+          sha: nextSha,
+          allowed: failure !== 'not-allowed',
+          sessionActive: failure === 'session',
+          migrate: (db: import('node:sqlite').DatabaseSync) => {
+            migrations++;
+            migration(db);
+            if (failure === 'migration' && migrations === 2)
+              throw new Error('synthetic migration failure');
+          },
+          selfCheck: (db: import('node:sqlite').DatabaseSync) => {
+            checks++;
+            assert.deepEqual(data(f.dbPath), original);
+            assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 2);
+            if (failure === 'check') throw new Error('synthetic check failure');
+          },
+          compatible: () => true,
+        }),
+        failure,
+      );
       if (failure === 'not-allowed' || failure === 'session') {
         assert.equal(checks, 0, failure);
         assert.equal(migrations, 0, failure);
@@ -208,8 +333,14 @@ async function failedUpdates() {
         assert.equal(checks, 1);
         assert.equal(migrations, 2);
       }
-      assert.deepEqual(await state(f.stateFile), { current: currentSha, previous: previousSha }, failure);
+      assert.deepEqual(
+        await state(f.stateFile),
+        { current: currentSha, previous: previousSha },
+        failure,
+      );
       assert.deepEqual(data(f.dbPath), original, failure);
-    } finally { await fs.rm(f.dir, { recursive: true, force: true }); }
+    } finally {
+      await fs.rm(f.dir, { recursive: true, force: true });
+    }
   }
 }
