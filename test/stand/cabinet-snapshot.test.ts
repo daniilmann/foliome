@@ -107,6 +107,70 @@ function syntheticPorts() {
   };
 }
 
+// Partial 3.5: DOM collection and filtering only; storage and selector checks remain open.
+test('выдаёт и хранит фильтрованный текст и проверяет условия селектора по маскам', { timeout: 60_000 }, async () => {
+  const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
+  const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
+  const { randomBytes } = require('node:crypto');
+  const password = randomBytes(18).toString('hex');
+  const textValue = randomBytes(18).toString('hex');
+  const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
+  const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
+  try {
+    const context = await browser.newContext({ serviceWorkers: 'block' });
+    try {
+      await context.route('**/*', async (route: any) => {
+        const request = route.request();
+        if (request.method() === 'GET' && request.url() === `${origin}/overview`) {
+          await route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic title</title>
+            <p>Ordinary visible text</p>
+            <label for="password">Password label</label><input id="password" type="password" value="${password}">
+            <label for="text">Text label</label><input id="text" type="text" value="${textValue}">
+            <div style="display:none">Display hidden marker</div><div aria-hidden="true">Aria hidden marker</div>
+            <button disabled>Disabled control</button>
+            <div><span>4111 1111</span><span> 1111 1111</span></div>
+            <iframe src="https://foreign.invalid/frame"></iframe>
+            <script>
+              window.collectText = () => ({ snapshot: 999, nodes: [] });
+              window.prepareDomCollector = window.collectText;
+              window.facts = { page: { title: 'Forged title' } };
+              Document.prototype.querySelectorAll = () => [];
+              Element.prototype.getBoundingClientRect = () => ({ x: 0, y: 0, width: 0, height: 0 });
+            </script>` });
+        } else if (request.method() === 'GET' && request.url() === 'https://foreign.invalid/frame') {
+          await route.fulfill({ contentType: 'text/html', body: '<!doctype html><p>Foreign frame marker</p>' });
+        } else await route.abort();
+      });
+      const page = await context.newPage();
+      const cdp = await context.newCDPSession(page);
+      const collector = await prepareDomCollector(cdp);
+      try {
+        await page.goto(`${origin}/overview`, { waitUntil: 'load' });
+        const result = filterTextSnapshot(await collector.collectText(27));
+        assert.equal(result.ok, true);
+        if (!result.ok) return;
+        const snapshot = result.snapshot;
+        assert.equal(snapshot.snapshot, 27);
+        assert.equal(snapshot.page.title, 'Synthetic title');
+        const output = JSON.stringify(snapshot);
+        for (const value of ['Ordinary visible text', 'Password label', 'Text label', 'Disabled control', '1111']) assert.ok(output.includes(value));
+        for (const value of [password, textValue, 'Display hidden marker', 'Aria hidden marker', 'Foreign frame marker', '4111', 'Forged title']) assert.equal(output.includes(value), false);
+        assert.ok(snapshot.frames.some((item: any) => item.host === 'foreign.invalid' && item.foreign));
+        const fields = snapshot.elements.filter((item: any) => item.field !== undefined);
+        assert.ok(fields.length >= 2);
+        assert.ok(fields.every((item: any) => item.text === '' && ['filled', 'sealed'].includes(item.field)));
+        assert.ok(snapshot.elements.some((item: any) => item.text.includes('Disabled control') && item.state?.includes('disabled')));
+        const numbers = snapshot.elements.map((item: any) => item.n);
+        assert.ok(numbers.length > 0 && numbers.every((n: number) => Number.isSafeInteger(n) && n > 0));
+        assert.equal(new Set(numbers).size, numbers.length);
+      } finally { await collector.close(); }
+      let afterClose: unknown;
+      try { afterClose = await collector.collectText(28); } catch { afterClose = undefined; }
+      assert.equal(filterTextSnapshot(afterClose).ok, false);
+    } finally { await context.close(); }
+  } finally { await browser.close(); }
+});
+
 test('отзывает результат при изменении сессии во время capture или второго collect', async (t: any) => {
   const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
   for (const phase of ['capture', 'second collect']) for (const change of ['id', 'inactive']) {
