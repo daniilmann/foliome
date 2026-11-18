@@ -21,7 +21,7 @@ test('после проверки подписи запускает Chrome по 
       calls.push('verify');
       assert.equal(path, '/usr/bin/codesign');
       assert.ok(argv.includes('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'));
-      assert.ok(argv.includes('-R') || argv.includes('--test-requirement'));
+      assert.ok(argv.some((arg) => arg.startsWith('-R=') || arg.startsWith('--test-requirement=')));
       assert.ok(Array.isArray(argv));
       assert.ok(argv.includes('--verify'));
       assert.ok(!argv.includes('--strict') && !argv.includes('--deep'));
