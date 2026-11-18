@@ -71,6 +71,15 @@ test('отзывает право ожидающего вызова включа
   {
     const f = fixture();
     await f.session.open();
+    f.verdict.resolve();
+    f.outcome.resolve();
+    await assert.rejects(f.session.readForVerdict(undefined as unknown as string));
+    assert.deepEqual(f.calls, ['open']);
+  }
+
+  {
+    const f = fixture();
+    await f.session.open();
     f.session.bindSnapshot('old snapshot');
     await f.session.close();
     await f.session.open();
@@ -84,11 +93,15 @@ test('отзывает право ожидающего вызова включа
     f.session.bindSnapshot('snapshot');
     const pending = f.session.readForVerdict('snapshot');
     await f.verdictStarted.promise;
+    await assert.rejects(f.session.readForVerdict('snapshot'));
     assert.deepEqual(f.calls, ['open', 'verdict']);
     f.verdict.resolve();
     await f.outcomeStarted.promise;
     assert.deepEqual(f.calls, ['open', 'verdict', 'read', 'outcome']);
     f.outcome.resolve();
     assert.equal(await pending, 'synthetic result');
+    f.session.bindSnapshot('fresh snapshot');
+    assert.equal(await f.session.readForVerdict('fresh snapshot'), 'synthetic result');
+    assert.deepEqual(f.calls, ['open', 'verdict', 'read', 'outcome', 'verdict', 'read', 'outcome']);
   }
 });
