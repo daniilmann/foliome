@@ -13,7 +13,7 @@ const expression = `(() => {
   const nodes = [], parents = [], secrets = [], embeds = [];
   const forbidden = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT']);
   const fieldRoles = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton', 'slider']);
-  const safeAttrs = ['title', 'alt', 'aria-label', 'placeholder', 'name', 'type'];
+  const safeAttrs = ['id', 'name', 'class', 'data-testid', 'type', 'autocomplete', 'placeholder', 'aria-label'];
   const visit = (element, parent, ancestorsVisible) => {
     if (nodes.length >= 10000) throw new Error();
     const tag = element.tagName;
