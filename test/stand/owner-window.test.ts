@@ -28,8 +28,7 @@ test('показывает протокол в окне ядра с CSP и от�
         await route.abort();
       }
     });
-    const sourcePage = await sourceContext.newPage();
-    await sourcePage.goto(`${source}/`);
+    const sourceAnchor = await sourceContext.newPage();
     const page = await ownerContext.newPage();
     const controller = await attachOwnerWindow({
       context: ownerContext, page,
@@ -55,13 +54,72 @@ test('показывает протокол в окне ядра с CSP и от�
       assert.ok(result === null || result.status() >= 400, `доступ разрешён: ${url}`);
     }
 
+    async function deniedPost(target: any, sessionId: string, nonce: string, submit: () => Promise<unknown>) {
+      const outcome = new Promise<void>((resolve, reject) => {
+        const matches = (request: any) => {
+          if (request.url() !== `${owner}${endpoint}` || request.method() !== 'POST' || request.frame() !== target.mainFrame()) return false;
+          const body = new URLSearchParams(request.postData() ?? '');
+          return body.get('sessionId') === sessionId && body.get('nonce') === nonce;
+        };
+        const cleanup = () => {
+          clearTimeout(timer);
+          target.off('response', onResponse);
+          target.off('requestfailed', onFailed);
+        };
+        const onResponse = (response: any) => {
+          if (!matches(response.request())) return;
+          cleanup();
+          if (response.status() >= 400 && response.status() < 500) resolve();
+          else reject(new Error(`Неожиданный статус POST: ${response.status()}`));
+        };
+        const onFailed = (request: any) => {
+          if (!matches(request)) return;
+          cleanup();
+          resolve();
+        };
+        const timer = setTimeout(() => { cleanup(); reject(new Error('Нет исхода POST')); }, 5_000);
+        target.on('response', onResponse);
+        target.on('requestfailed', onFailed);
+      });
+      await Promise.all([outcome, submit().catch(() => {})]);
+    }
+
+    async function sourcePost() {
+      const sourcePage = await sourceContext.newPage();
+      try {
+        await sourcePage.goto(`${source}/`);
+        await deniedPost(sourcePage, 'session-one', 'nonce-one', () => sourcePage.locator('button').click());
+      } finally {
+        await sourcePage.close();
+      }
+    }
+
+    async function syntheticPost(sessionId: string, nonce: string) {
+      const navigation = page.waitForEvent('framenavigated', { predicate: (frame: any) => frame === page.mainFrame(), timeout: 5_000 });
+      await deniedPost(page, sessionId, nonce, () => page.evaluate(({ endpoint, sessionId, nonce }: { endpoint: string; sessionId: string; nonce: string }) => {
+        const form = document.createElement('form');
+        form.method = 'post';
+        form.action = endpoint;
+        for (const [name, value] of Object.entries({ sessionId, nonce })) {
+          const input = document.createElement('input');
+          input.name = name;
+          input.value = value;
+          form.append(input);
+        }
+        document.body.append(form);
+        form.submit();
+      }, { endpoint, sessionId, nonce }));
+      await navigation;
+    }
+
     const otherPage = await ownerContext.newPage();
     await deniedNavigation(otherPage, `${owner}/`);
     await deniedNavigation(page, `${owner}/unknown`);
     await deniedNavigation(page, `${owner}${endpoint}`);
+    const sourcePage = await sourceContext.newPage();
     await deniedNavigation(sourcePage, `${owner}/`);
-    await sourcePage.goto(`${source}/`);
-    await sourcePage.locator('button').click().catch(() => {});
+    await sourcePage.close();
+    await sourcePost();
     assert.deepEqual(completions, []);
 
     controller.begin({ sessionId: 'session-one', nonce: 'nonce-one' });
@@ -72,22 +130,20 @@ test('показывает протокол в окне ядра с CSP и от�
     assert.equal(await form.locator('[name="nonce"]').inputValue(), 'nonce-one');
     await form.locator('button, input[type="submit"]').first().click();
     assert.deepEqual(completions, ['session-one']);
-    await page.goBack();
-    const replay = page.locator(`form[method="post" i]`);
-    assert.equal(await replay.count(), 1);
-    await replay.locator('button, input[type="submit"]').first().click().catch(() => {});
+    await page.goto(`${owner}/`);
+    await syntheticPost('session-one', 'nonce-one');
     assert.deepEqual(completions, ['session-one']);
 
     controller.begin({ sessionId: 'session-two', nonce: 'nonce-two' });
     await page.goto(`${owner}/`);
     controller.close();
-    await page.locator('form[method="post" i]').locator('button, input[type="submit"]').first().click().catch(() => {});
+    await deniedPost(page, 'session-two', 'nonce-two', () => page.locator('form[method="post" i]').locator('button, input[type="submit"]').first().click());
     assert.deepEqual(completions, ['session-one']);
     await page.close();
     await deniedNavigation(otherPage, `${owner}${endpoint}`);
-    await sourcePage.goto(`${source}/`);
-    await sourcePage.locator('button').click().catch(() => {});
+    await sourcePost();
     assert.deepEqual(completions, ['session-one']);
+    await sourceAnchor.close();
     // Requests rejected by the test guard never reach the network or the source.
     assert.ok(escapedRequests.every((url) => url.startsWith(owner)));
   } finally {
