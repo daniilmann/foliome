@@ -236,6 +236,109 @@ test('собирает видимый DOM в изолированном мире
   } finally { await browser.close(); }
 });
 
+test('строит план закраски по защищённым наблюдениям браузера', { timeout: 60_000 }, async (t: any) => {
+  const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const { randomBytes } = require('node:crypto');
+  const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
+  const password = randomBytes(12).toString('hex');
+  for (const uncertain of [false, true]) await t.test(uncertain ? 'не выдаёт PNG при неопределённом содержимом у края' : 'закрашивает защищённые области на настоящем PNG', async () => {
+    const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
+    try {
+      const context = await browser.newContext({ viewport: { width: 640, height: 360 }, deviceScaleFactor: 1, serviceWorkers: 'block' });
+      try {
+        await context.route('**/*', async (route: any) => {
+          const request = route.request();
+          if (request.method() === 'GET' && request.url() === `${origin}/overview`) {
+            await route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic overview</title>
+              <style>
+                html,body { margin:0; background:rgb(30,180,70); }
+                .mark { position:absolute; color:rgb(240,30,50); font:20px monospace; white-space:pre; }
+                #field { position:absolute; left:20px; top:20px; width:210px; height:30px; box-sizing:border-box; background:rgb(240,30,50); }
+                #hidden { left:20px; top:70px; } #card { left:20px; top:110px; }
+                #echo { left:20px; top:150px; }
+                iframe { position:absolute; left:20px; top:200px; width:160px; height:70px; border:0; }
+                #ordinary { position:absolute; left:350px; top:40px; color:white; }
+                ${uncertain ? '#edge { position:absolute; right:0; top:300px; width:0; } #edge::after { content:open-quote; position:absolute; right:0; color:red; font:30px serif; }' : ''}
+              </style>
+              <input id="field" type="password" aria-label="Synthetic password">
+              <div id="hidden" class="mark" aria-hidden="true">5555 5555 5555 4444</div>
+              <div id="card" class="mark"><span>4111 </span><span>1111 </span><span>1111 </span><span>1111</span></div>
+              <div id="echo" class="mark">${password}</div>
+              <iframe src="https://foreign.invalid/frame"></iframe><div id="ordinary">Ordinary visible text</div>
+              ${uncertain ? '<div id="edge"></div>' : ''}` });
+          } else if (request.method() === 'GET' && request.url() === 'https://foreign.invalid/frame') {
+            await route.fulfill({ contentType: 'text/html', body: '<!doctype html><style>html,body{margin:0;background:rgb(240,30,50)}</style>Foreign synthetic content' });
+          } else await route.abort();
+        });
+        const page = await context.newPage();
+        const cdp = await context.newCDPSession(page);
+        const collector = await prepareDomCollector(cdp, { sourceHost: 'cabinet.invalid', approvedHosts: [] });
+        try {
+          await page.goto(`${origin}/overview`, { waitUntil: 'load' });
+          await page.locator('#field').fill(password);
+          const observed = await collector.collectFrame(31);
+          assert.equal(observed.facts.snapshot, 31);
+          if (uncertain) assert.equal(observed.plan, null);
+          else assert.ok(observed.plan);
+          const timer = clock();
+          const ports = {
+            collect: () => collector.collectFrame(31),
+            capturePng: async () => Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })).data, 'base64'),
+            now: timer.now, sleep: timer.sleep, recordDeviation: async () => {},
+          };
+          const result = await captureCabinetSnapshot(ports, () => session, 5000);
+          assert.equal(result.ok, true);
+          assert.equal(result.snapshot.snapshot, 31);
+          const output = JSON.stringify(result.snapshot);
+          assert.ok(output.includes('Ordinary visible text'));
+          assert.ok(!output.includes(password) && !output.includes('4111') && !output.includes('5555') && !output.includes('Foreign synthetic content'));
+          assert.ok(output.includes('1111'));
+          if (uncertain) {
+            assert.ok(['error', 'unstable'].includes(result.image.code));
+            assert.equal(result.image.bytes, undefined);
+            return;
+          }
+          assert.equal(result.image.snapshotNumber, 31);
+          assert.ok(Buffer.isBuffer(result.image.bytes));
+          const original = await ports.capturePng();
+          const decoder = await context.newPage();
+          await decoder.goto('about:blank');
+          const pixels = async (bytes: Buffer) => decoder.evaluate(async (encoded: string) => {
+            const image = new Image(); image.src = `data:image/png;base64,${encoded}`; await image.decode();
+            const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
+            const ctx = canvas.getContext('2d')!; ctx.drawImage(image, 0, 0);
+            return Array.from(ctx.getImageData(0, 0, image.width, image.height).data);
+          }, bytes.toString('base64')) as Promise<number[]>;
+          const before = await pixels(original), after = await pixels(result.image.bytes);
+          const pixel = (data: number[], x: number, y: number) => data.slice((y * 640 + x) * 4, (y * 640 + x) * 4 + 4);
+          // Check actual rendered red glyphs, not a rectangle supplied to the collector.
+          for (const [name, x0, x1, y0, y1] of [
+            ['aria-hidden card prefix', 20, 200, 78, 95],
+            ['split card prefix', 20, 200, 118, 135],
+            ['password echo', 20, 308, 158, 175],
+          ] as const) {
+            let rendered = 0;
+            for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+              const p = pixel(before, x, y);
+              if (p[0] > 150 && p[0] > p[1] * 2 && p[0] > p[2] * 2) {
+                rendered++;
+                assert.deepEqual(pixel(after, x, y), [0, 0, 0, 255], `${name} at ${x},${y}`);
+              }
+            }
+            assert.ok(rendered > 0, `${name} must actually be drawn`);
+          }
+          for (const [x, y] of [[25, 45], [100, 240]]) {
+            assert.deepEqual(pixel(before, x, y), [240, 30, 50, 255]);
+            assert.deepEqual(pixel(after, x, y), [0, 0, 0, 255]);
+          }
+          assert.deepEqual(pixel(after, 600, 20), [30, 180, 70, 255]);
+        } finally { await collector.close(); }
+      } finally { await context.close(); }
+    } finally { await browser.close(); }
+  });
+});
+
 test('отзывает результат при изменении сессии во время capture или второго collect', async (t: any) => {
   const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
   for (const phase of ['capture', 'second collect']) for (const change of ['id', 'inactive']) {
