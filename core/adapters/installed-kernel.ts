@@ -51,15 +51,22 @@ async function createInstalled(options: Options) {
   let runtime: ReturnType<typeof createPreparationRuntime> | undefined;
   let window: Awaited<ReturnType<typeof attachOwnerWindow>> | undefined;
   let running = false, closed = false, generation = 0;
+  let worker: { stop(): void | Promise<void> } | undefined;
   let socketOwned = false;
   let closePromise: Promise<void> | undefined;
   const sockets = new Set<Socket>();
+  function stopWorker() {
+    const old = worker;
+    worker = undefined;
+    if (old) { try { void Promise.resolve(old.stop()).catch(() => {}); } catch { /* Already stopped. */ } }
+  }
   const server = createAdmittedChannel({ expectedUid: options.executorUid, maxLineBytes: 1024 * 1024,
     ...(options.peerUid ? { peerUid: options.peerUid } : {}), onDenied: () => {},
     createHandler: () => runtime!.createHandler() });
   server.on('connection', (socket: Socket) => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
   async function closeSource() {
     generation++; running = false;
+    stopWorker();
     window?.cancel();
     const oldCollector = collector, oldContext = sourceContext, oldBrowser = sourceBrowser;
     collector = undefined; sourceContext = undefined; sourceBrowser = undefined; sourcePage = undefined; cdp = undefined;
@@ -70,6 +77,7 @@ async function createInstalled(options: Options) {
   async function close() {
     if (closePromise) return closePromise;
     closed = true; generation++; running = false;
+    stopWorker();
     closePromise = (async () => {
       window?.close();
       try { await runtime?.shutdown(); } catch { /* Continue releasing resources. */ }
@@ -95,7 +103,7 @@ async function createInstalled(options: Options) {
           sourceContext = await sourceBrowser.newContext(); check();
           sourcePage = await sourceContext.newPage(); check();
           const page = sourcePage;
-          page.on('close', () => { running = false; generation++; void runtime?.closeSource().catch(() => {}); });
+          page.on('close', () => { running = false; generation++; stopWorker(); void runtime?.closeSource().catch(() => {}); });
           await sourceContext.route('**/*', async route => {
             try {
               const request = route.request() as ReturnType<typeof route.request> & { isNavigationRequest(): boolean };
@@ -124,7 +132,15 @@ async function createInstalled(options: Options) {
     ownerContext = await ownerBrowser.newContext();
     owner = await ownerContext.newPage();
     owner.on('close', () => { void close(); });
-    window = await attach({ context: ownerContext, page: owner, rows: runtime.rows, onLoginComplete(sessionId) {
+    async function openSource(refresh = true) {
+      if (closed) throw new Error('session-unavailable');
+      const token = generation;
+      const sessionId = await runtime!.open();
+      if (closed || token !== generation) throw new Error('session-unavailable');
+      window!.begin({ sessionId, nonce: randomUUID() });
+      if (refresh) window!.refresh();
+    }
+    window = await attach({ context: ownerContext, page: owner, rows: runtime.rows, onOpen: () => openSource(false), onLoginComplete(sessionId) {
       if (closed || !runtime!.confirmLogin(sessionId)) return false;
       const token = generation;
       void (async () => {
@@ -136,15 +152,32 @@ async function createInstalled(options: Options) {
           pfCanary: async () => observation?.canary ?? '',
           run: async (...args) => { if (closed || token !== generation) throw new Error('revoked'); return options.runProcess(...args); },
         }, { sshConfigPath: options.paths.sshConfig });
-        if (closed || token !== generation) return;
-        if (result.ok) running = true;
-        else window?.setStatus(result.code);
+        if (result.ok && 'worker' in result) {
+          const started = result.worker;
+          if (closed || token !== generation) {
+            try { await started.stop(); } catch { /* Withdrawn worker. */ }
+            void started.finished.catch(() => {});
+            return;
+          }
+          worker = started;
+          running = true;
+          void started.finished.then(() => {
+            if (worker !== started) return;
+            worker = undefined; running = false;
+            void runtime?.closeSource().catch(() => {});
+          }, () => {
+            if (worker !== started) return;
+            worker = undefined; running = false;
+            window?.setStatus('executor-launch');
+            void runtime?.closeSource().catch(() => {});
+          });
+        } else if (!closed && token === generation) window?.setStatus(result.ok ? 'executor-launch' : result.code);
       })();
       return true;
     } });
     await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(options.paths.socket, () => { socketOwned = true; server.off('error', reject); resolve(); }); });
     return {
-      async openSource() { if (closed) throw new Error('session-unavailable'); const sessionId = await runtime!.open(); window!.begin({ sessionId, nonce: randomUUID() }); window!.refresh(); },
+      openSource,
       ownerPage() { if (!owner) throw new Error('session-unavailable'); return owner; },
       sourcePage() { if (!sourcePage) throw new Error('session-unavailable'); return sourcePage; },
       close,

@@ -1,12 +1,13 @@
 const path = require('node:path') as typeof import('node:path');
 
+type Worker = { started: true; finished: Promise<number | null>; stop(): void | Promise<void> };
 type Ports = {
   permissions(): Promise<boolean>;
   adminGroup(): Promise<boolean>;
   pfCanary(): Promise<string>;
-  run(command: string, args: string[], options: { stdio: 'ignore'; env: Record<string, never> }): Promise<number | null>;
+  run(command: string, args: string[], options: { stdio: 'ignore'; env: Record<string, never> }): Promise<number | null | Worker>;
 };
-type Result = { ok: true; exitCode: number | null } | { ok: false; code: 'boundary-config' | 'boundary-permissions' | 'boundary-admin' | 'boundary-pf' | 'executor-launch' };
+type Result = { ok: true; exitCode: number | null } | { ok: true; worker: Worker } | { ok: false; code: 'boundary-config' | 'boundary-permissions' | 'boundary-admin' | 'boundary-pf' | 'executor-launch' };
 export declare const startExecutor: typeof start;
 declare const exports: { startExecutor: typeof start };
 
@@ -21,6 +22,10 @@ async function start(ports: Ports, config: { sshConfigPath: string }): Promise<R
   catch { return { ok: false, code: 'boundary-pf' }; }
   try {
     const exitCode = await ports.run('/usr/bin/ssh', ['-F', configPath, 'executor-core'], { stdio: 'ignore', env: {} });
+    if (typeof exitCode === 'object' && exitCode !== null) {
+      if (exitCode.started !== true || typeof exitCode.stop !== 'function' || !(exitCode.finished instanceof Promise)) return { ok: false, code: 'executor-launch' };
+      return { ok: true, worker: exitCode };
+    }
     if (exitCode !== null && (!Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255)) return { ok: false, code: 'executor-launch' };
     return { ok: true, exitCode };
   } catch { return { ok: false, code: 'executor-launch' }; }

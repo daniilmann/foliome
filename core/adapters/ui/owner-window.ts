@@ -19,12 +19,13 @@ type Context = {
   route(url: string, handler: (route: Route) => Promise<void>): Promise<void>;
   routeWebSocket(url: string, handler: (socket: { close(): void | Promise<void> }) => void): Promise<void>;
 };
-type Page = { mainFrame(): object; on(event: 'close', listener: () => void): unknown; goto(url: string): Promise<unknown> };
+type Page = { mainFrame(): object; on(event: 'close' | 'load', listener: () => void): unknown; goto(url: string): Promise<unknown> };
 type Options = Readonly<{
   context: Context;
   page: Page;
   rows: (() => readonly Row[]) & { subscribe?: (listener: () => void) => () => void };
   onLoginComplete: (sessionId: string) => boolean;
+  onOpen?: () => Promise<void>;
 }>;
 
 export declare const attachOwnerWindow: typeof attach;
@@ -32,6 +33,7 @@ declare const exports: { attachOwnerWindow: typeof attach };
 
 const origin = 'https://foliome-owner.invalid';
 const endpoint = '/preparation/login-complete';
+const openEndpoint = '/preparation/open';
 const headers = {
   'content-type': 'text/html; charset=utf-8',
   'content-security-policy': "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
@@ -65,7 +67,7 @@ function parseBody(buffer: Buffer | null): Pending | null {
   return sessionId && nonce ? { sessionId, nonce } : null;
 }
 
-async function attach({ context, page, rows, onLoginComplete }: Options) {
+async function attach({ context, page, rows, onLoginComplete, onOpen }: Options) {
   const frame = page.mainFrame();
   const confirmation = createOwnerLoginConfirmation({ ownerFrame: frame, origin, endpoint, complete: onLoginComplete });
   const usedNonces = new Set<string>();
@@ -75,11 +77,20 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
   let dirty = false;
   let unsubscribe: (() => void) | undefined;
   let status = '';
+  let engaged = false;
+  let opening = false;
+  let posting = false;
+
+  function render(): string {
+    const table = renderProtocol(rows());
+    const form = pending === null ? (onOpen && !engaged && !opening ? `<form method="post" action="${openEndpoint}"><button type="submit">Открыть подготовку</button></form>` : '') : `<form method="post" action="${endpoint}"><input type="hidden" name="sessionId" value="${escapeAttribute(pending.sessionId)}"><input type="hidden" name="nonce" value="${escapeAttribute(pending.nonce)}"><button type="submit">Вход завершён, продолжить</button></form>`;
+    return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}<p>${escapeAttribute(status)}</p></body></html>`;
+  }
 
   function refresh(): void {
     if (closed) return;
     dirty = true;
-    if (updating) return;
+    if (updating || posting) return;
     updating = true;
     void (async () => {
       while (dirty && !closed) {
@@ -106,6 +117,8 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
       if (typeof sessionId !== 'string' || !sessionId || typeof nonce !== 'string' || !nonce || usedNonces.has(nonce)) return;
       usedNonces.add(nonce);
       pending = { sessionId, nonce };
+      engaged = true;
+      status = '';
       confirmation.begin(pending);
     } catch {
       pending = null;
@@ -114,6 +127,7 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
   }
 
   page.on('close', close);
+  page.on('load', () => { if (posting) { posting = false; refresh(); } });
   await context.routeWebSocket('**/*', (socket) => {
     try { void Promise.resolve(socket.close()).catch(() => {}); } catch { /* Already closed. */ }
   });
@@ -123,10 +137,20 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
       const url = request.url();
       if (closed || request.frame() !== frame) throw new Error('refused');
       if (request.method() === 'GET' && url === `${origin}/`) {
-        const table = renderProtocol(rows());
+        const body = render();
         if (closed) throw new Error('refused');
-        const form = pending === null ? '' : `<form method="post" action="${endpoint}"><input type="hidden" name="sessionId" value="${escapeAttribute(pending.sessionId)}"><input type="hidden" name="nonce" value="${escapeAttribute(pending.nonce)}"><button type="submit">Вход завершён, продолжить</button></form>`;
-        await route.fulfill({ status: 200, headers, body: `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}<p>${escapeAttribute(status)}</p></body></html>` });
+        await route.fulfill({ status: 200, headers, body });
+        return;
+      }
+      if (request.method() === 'POST' && url === `${origin}${openEndpoint}` && onOpen && !engaged && !opening) {
+        const requestHeaders = await request.allHeaders();
+        if (closed || requestHeaders.origin !== origin || !/^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?\s*$/i.test(requestHeaders['content-type'] ?? '') || (request.postDataBuffer()?.length ?? 0) !== 0) throw new Error('refused');
+        opening = true;
+        status = '';
+        try { await onOpen(); } catch { status = 'session-unavailable'; }
+        finally { opening = false; }
+        if (closed) throw new Error('refused');
+        await route.fulfill({ status: 200, headers, body: render() });
         return;
       }
       if (request.method() === 'POST' && url === `${origin}${endpoint}`) {
@@ -134,6 +158,7 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
         if (closed || requestHeaders.origin !== origin || !/^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?\s*$/i.test(requestHeaders['content-type'] ?? '')) throw new Error('refused');
         const body = parseBody(request.postDataBuffer());
         if (body === null || pending === null || body.sessionId !== pending.sessionId || body.nonce !== pending.nonce) throw new Error('refused');
+        posting = true;
         pending = null;
         const result = confirmation.handle({ method: 'POST', path: endpoint, frame, origin, body });
         if (result === null || closed) throw new Error('refused');
@@ -141,12 +166,13 @@ async function attach({ context, page, rows, onLoginComplete }: Options) {
         return;
       }
     } catch {
+      posting = false;
       // Any failure refuses the request without passing it to another handler.
     }
     try { await route.abort(); } catch { /* The request may already be gone. */ }
   });
   unsubscribe = rows.subscribe?.(refresh);
-  return { begin, close, refresh, cancel() { pending = null; confirmation.close(); refresh(); }, setStatus(value: string) { status = value; refresh(); } };
+  return { begin, close, refresh, cancel() { pending = null; engaged = false; confirmation.close(); refresh(); }, setStatus(value: string) { status = value; refresh(); } };
 }
 
 exports.attachOwnerWindow = attach;
