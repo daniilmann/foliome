@@ -22,7 +22,7 @@ test('дозаписывает вердикт перед вызовом и ит�
       reason: 'allowed',
       rawText: 'synthetic-raw-text-marker',
       url: 'synthetic-raw-url-marker',
-    };
+    } as const;
     let verdictId: number;
     const events: string[] = [];
     const session = createPreparationSession({
@@ -33,13 +33,18 @@ test('дозаписывает вердикт перед вызовом и ит�
         events.push('verdict');
       },
       read: async () => {
-        assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts WHERE id = ?').get(verdictId).n, 1);
+        assert.equal(
+          database.prepare('SELECT count(*) AS n FROM action_verdicts WHERE id = ?').get(verdictId)
+            .n,
+          1,
+        );
         assert.equal(database.prepare('SELECT count(*) AS n FROM action_outcomes').get().n, 0);
         events.push('read');
         return 'ok';
       },
-      saveOutcome: async (status: string) => {
-        protocol.appendOutcome({ verdictId, status, rawText: 'synthetic-outcome-marker' });
+      saveOutcome: async (status: 'ok' | 'stale' | 'limit' | 'internal') => {
+        const outcome = { verdictId, status, rawText: 'synthetic-outcome-marker' };
+        protocol.appendOutcome(outcome);
         events.push('outcome');
       },
     });
@@ -49,31 +54,80 @@ test('дозаписывает вердикт перед вызовом и ит�
     assert.deepEqual(events, ['verdict', 'read', 'outcome']);
 
     const row = database.prepare('SELECT * FROM action_verdicts WHERE id = ?').get(verdictId!);
-    assert.deepEqual({ ...row }, {
-      id: verdictId!, at_ms: 1700000000000, session_id: 'session-1', source_id: 'source-1',
-      access_id: 'access-1', snapshot_number: 2, node_number: 3, method: 'readText',
-      action_class: 'read', actor: 'agent', decision: 'allowed', reason: 'allowed',
-    });
-    const outcome = database.prepare('SELECT * FROM action_outcomes WHERE verdict_id = ?').get(verdictId!);
-    assert.deepEqual({ ...outcome }, { verdict_id: verdictId!, at_ms: 1700000000001, status: 'ok' });
+    assert.deepEqual(
+      { ...row },
+      {
+        id: verdictId!,
+        at_ms: 1700000000000,
+        session_id: 'session-1',
+        source_id: 'source-1',
+        access_id: 'access-1',
+        snapshot_number: 2,
+        node_number: 3,
+        method: 'readText',
+        action_class: 'read',
+        actor: 'agent',
+        decision: 'allowed',
+        reason: 'allowed',
+      },
+    );
+    const outcome = database
+      .prepare('SELECT * FROM action_outcomes WHERE verdict_id = ?')
+      .get(verdictId!);
+    assert.deepEqual(
+      { ...outcome },
+      { verdict_id: verdictId!, at_ms: 1700000000001, status: 'ok' },
+    );
     for (const table of ['action_verdicts', 'action_outcomes']) {
-      const schema = database.prepare('PRAGMA table_list').all().find((entry: { name: string }) => entry.name === table);
+      const schema = database
+        .prepare('PRAGMA table_list')
+        .all()
+        .find((entry: { name: string }) => entry.name === table);
       assert.equal(schema.strict, 1);
       const columns = database.prepare(`PRAGMA table_info(${table})`).all();
-      assert.ok(columns.every((column: { type: string }) => !['REAL', 'ANY'].includes(column.type)));
-      assert.ok(!JSON.stringify(database.prepare(`SELECT * FROM ${table}`).all()).includes('synthetic-raw-'));
+      assert.ok(
+        columns.every((column: { type: string }) => !['REAL', 'ANY'].includes(column.type)),
+      );
+      assert.ok(
+        !JSON.stringify(database.prepare(`SELECT * FROM ${table}`).all()).includes(
+          'synthetic-raw-',
+        ),
+      );
       assert.throws(() => database.exec(`UPDATE ${table} SET at_ms = 1`));
       assert.throws(() => database.exec(`DELETE FROM ${table}`));
     }
     const foreignKeys = database.prepare('PRAGMA foreign_key_list(action_outcomes)').all();
-    assert.ok(foreignKeys.some((key: { table: string; from: string; to: string }) =>
-      key.table === 'action_verdicts' && key.from === 'verdict_id' && key.to === 'id'));
+    assert.ok(
+      foreignKeys.some(
+        (key: { table: string; from: string; to: string }) =>
+          key.table === 'action_verdicts' && key.from === 'verdict_id' && key.to === 'id',
+      ),
+    );
     assert.throws(() => protocol.appendOutcome({ verdictId: 999999, status: 'internal' }));
     assert.throws(() => protocol.appendOutcome({ verdictId: verdictId!, status: 'stale' }));
 
-    const blockedId = protocol.appendVerdict({ ...verdict, method: 'other', actionClass: 'unknown', decision: 'blocked', reason: 'unsupported' });
-    const blocked = database.prepare('SELECT method, action_class, actor, decision, reason FROM action_verdicts WHERE id = ?').get(blockedId);
-    assert.deepEqual({ ...blocked }, { method: 'other', action_class: 'unknown', actor: 'agent', decision: 'blocked', reason: 'unsupported' });
+    const blockedId = protocol.appendVerdict({
+      ...verdict,
+      method: 'other',
+      actionClass: 'unknown',
+      decision: 'blocked',
+      reason: 'unsupported',
+    });
+    const blocked = database
+      .prepare(
+        'SELECT method, action_class, actor, decision, reason FROM action_verdicts WHERE id = ?',
+      )
+      .get(blockedId);
+    assert.deepEqual(
+      { ...blocked },
+      {
+        method: 'other',
+        action_class: 'unknown',
+        actor: 'agent',
+        decision: 'blocked',
+        reason: 'unsupported',
+      },
+    );
     await session.close();
   } finally {
     database.close();
@@ -81,16 +135,25 @@ test('дозаписывает вердикт перед вызовом и ит�
 });
 
 const allowedVerdict = {
-  sessionId: 'session-1', sourceId: 'source-1', accessId: 'access-1',
-  snapshotNumber: 2, nodeNumber: 3, method: 'readText', actionClass: 'read',
-  decision: 'allowed', reason: 'allowed',
+  sessionId: 'session-1',
+  sourceId: 'source-1',
+  accessId: 'access-1',
+  snapshotNumber: 2,
+  nodeNumber: 3,
+  method: 'readText',
+  actionClass: 'read',
+  decision: 'allowed',
+  reason: 'allowed',
 } as const;
 
 for (const [method, actionClass] of [
-  ['other', 'read'], ['readText', 'unknown'], ['other', 'unknown'],
+  ['other', 'read'],
+  ['readText', 'unknown'],
+  ['other', 'unknown'],
 ] as const) {
   test(`отклоняет allowed с ${method}/${actionClass} через API`, async () => {
-    const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+    const { createActionProtocol } =
+      await import('../../../core/adapters/store/action-protocol.ts');
     const database = new DatabaseSync(':memory:');
     try {
       const protocol = createActionProtocol(database, () => 1);
@@ -102,7 +165,8 @@ for (const [method, actionClass] of [
   });
 
   test(`отклоняет allowed с ${method}/${actionClass} напрямую в SQL`, async () => {
-    const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+    const { createActionProtocol } =
+      await import('../../../core/adapters/store/action-protocol.ts');
     const database = new DatabaseSync(':memory:');
     try {
       createActionProtocol(database, () => 1);
@@ -132,7 +196,10 @@ test('отклоняет запись вердикта во внешней тр�
     database.exec('ROLLBACK');
     assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts').get().n, 0);
     const id = protocol.appendVerdict(allowedVerdict);
-    assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts WHERE id = ?').get(id).n, 1);
+    assert.equal(
+      database.prepare('SELECT count(*) AS n FROM action_verdicts WHERE id = ?').get(id).n,
+      1,
+    );
     assert.ok(error instanceof Error, 'запись во внешней транзакции должна завершиться ошибкой');
   } finally {
     database.close();
@@ -155,8 +222,10 @@ test('отклоняет запись итога во внешней транз�
     database.exec('ROLLBACK');
     assert.equal(database.prepare('SELECT count(*) AS n FROM action_outcomes').get().n, 0);
     protocol.appendOutcome({ verdictId, status: 'ok' });
-    assert.deepEqual({ ...database.prepare('SELECT verdict_id, status FROM action_outcomes').get() },
-      { verdict_id: verdictId, status: 'ok' });
+    assert.deepEqual(
+      { ...database.prepare('SELECT verdict_id, status FROM action_outcomes').get() },
+      { verdict_id: verdictId, status: 'ok' },
+    );
     assert.ok(error instanceof Error, 'запись во внешней транзакции должна завершиться ошибкой');
   } finally {
     database.close();
@@ -165,7 +234,8 @@ test('отклоняет запись итога во внешней транз�
 
 for (const table of ['action_verdicts', 'action_outcomes'] as const) {
   test(`запрещает INSERT OR REPLACE существующей строки ${table}`, async () => {
-    const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+    const { createActionProtocol } =
+      await import('../../../core/adapters/store/action-protocol.ts');
     const database = new DatabaseSync(':memory:');
     try {
       const protocol = createActionProtocol(database, () => 1);
@@ -173,12 +243,24 @@ for (const table of ['action_verdicts', 'action_outcomes'] as const) {
       protocol.appendOutcome({ verdictId, status: 'ok' });
       const before = database.prepare(`SELECT * FROM ${table}`).all();
       if (table === 'action_verdicts') {
-        assert.throws(() => database.prepare(`INSERT OR REPLACE INTO action_verdicts
+        assert.throws(() =>
+          database
+            .prepare(
+              `INSERT OR REPLACE INTO action_verdicts
           (id, at_ms, session_id, source_id, access_id, snapshot_number, node_number, method, action_class, actor, decision, reason)
-          VALUES (?, 2, 'session-2', 'source-1', 'access-1', 2, 3, 'readText', 'read', 'agent', 'allowed', 'allowed')`).run(verdictId));
+          VALUES (?, 2, 'session-2', 'source-1', 'access-1', 2, 3, 'readText', 'read', 'agent', 'allowed', 'allowed')`,
+            )
+            .run(verdictId),
+        );
       } else {
-        assert.throws(() => database.prepare(`INSERT OR REPLACE INTO action_outcomes
-          (verdict_id, at_ms, status) VALUES (?, 2, 'stale')`).run(verdictId));
+        assert.throws(() =>
+          database
+            .prepare(
+              `INSERT OR REPLACE INTO action_outcomes
+          (verdict_id, at_ms, status) VALUES (?, 2, 'stale')`,
+            )
+            .run(verdictId),
+        );
       }
       assert.deepEqual(database.prepare(`SELECT * FROM ${table}`).all(), before);
     } finally {
@@ -188,22 +270,49 @@ for (const table of ['action_verdicts', 'action_outcomes'] as const) {
 }
 
 type BrowserEvent = {
-  sessionId: string; sourceId: string; accessId: string; stepNumber: number;
-  kind: 'main-frame-navigation' | 'non-get-request'; method: string; host: string; path: string;
+  sessionId: string;
+  sourceId: string;
+  accessId: string;
+  stepNumber: number;
+  kind: 'main-frame-navigation' | 'non-get-request';
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS' | 'other';
+  host: string;
+  path: string;
 };
 
 const browserEvents: BrowserEvent[] = [
-  { sessionId: 'session-1', sourceId: 'source-1', accessId: 'access-1', stepNumber: 1,
-    kind: 'main-frame-navigation', method: 'GET', host: 'example.test', path: '/fixture' },
-  { sessionId: 'session-1', sourceId: 'source-1', accessId: 'access-1', stepNumber: 2,
-    kind: 'non-get-request', method: 'POST', host: 'example.test', path: '/fixture' },
+  {
+    sessionId: 'session-1',
+    sourceId: 'source-1',
+    accessId: 'access-1',
+    stepNumber: 1,
+    kind: 'main-frame-navigation',
+    method: 'GET',
+    host: 'example.test',
+    path: '/fixture',
+  },
+  {
+    sessionId: 'session-1',
+    sourceId: 'source-1',
+    accessId: 'access-1',
+    stepNumber: 2,
+    kind: 'non-get-request',
+    method: 'POST',
+    host: 'example.test',
+    path: '/fixture',
+  },
 ];
 
 test('при отказе записи вердикта итога навигации главного фрейма или не-GET отзывает сессию в том числе без команды агента', async (t: import('node:test').TestContext) => {
   const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
   const { createPreparationSession } = await import('../../../core/use-cases/preparation.ts');
 
-  for (const failure of ['verdict', 'outcome', 'main-frame-navigation', 'non-get-request'] as const) {
+  for (const failure of [
+    'verdict',
+    'outcome',
+    'main-frame-navigation',
+    'non-get-request',
+  ] as const) {
     await t.test(failure, async () => {
       const database = new DatabaseSync(':memory:');
       try {
@@ -227,19 +336,32 @@ test('при отказе записи вердикта итога навига�
         };
         const ports = {
           openSource: async () => {},
-          closeSource: async () => { closes++; },
-          saveVerdict: async () => { write(() => { verdictId = protocol.appendVerdict(allowedVerdict); }); },
+          closeSource: async () => {
+            closes++;
+          },
+          saveVerdict: async () => {
+            write(() => {
+              verdictId = protocol.appendVerdict(allowedVerdict);
+            });
+          },
           read: async () => {
             reads++;
             if (failure === 'outcome') database.exec('PRAGMA query_only = ON');
             return 'fixture-result';
           },
-          saveOutcome: async () => { write(() => protocol.appendOutcome({ verdictId, status: 'ok' })); },
-          saveBrowserEvent: async (event: BrowserEvent) => { write(() => protocol.appendBrowserEvent(event)); },
-          protocolUnavailable: async () => { unavailable++; },
+          saveOutcome: async () => {
+            write(() => protocol.appendOutcome({ verdictId, status: 'ok' }));
+          },
+          saveBrowserEvent: async (event: BrowserEvent) => {
+            write(() => protocol.appendBrowserEvent(event));
+          },
+          protocolUnavailable: async () => {
+            unavailable++;
+          },
         };
         const session = createPreparationSession(ports) as unknown as {
-          open(sessionId?: string): Promise<void>; bindSnapshot(snapshot: string): void;
+          open(sessionId?: string): Promise<void>;
+          bindSnapshot(snapshot: string): void;
           readForVerdict(snapshot: string): Promise<string>;
           recordBrowserEvent(event: BrowserEvent): Promise<void>;
         };
@@ -249,16 +371,23 @@ test('при отказе записи вердикта итога навига�
         session.bindSnapshot('snapshot-1');
         if (failure !== 'outcome') database.exec('PRAGMA query_only = ON');
         if (failure === 'verdict' || failure === 'outcome') {
-          await assert.rejects(session.readForVerdict('snapshot-1'), { message: 'protocol-unavailable' });
+          await assert.rejects(session.readForVerdict('snapshot-1'), {
+            message: 'protocol-unavailable',
+          });
         } else {
-          await assert.rejects(session.recordBrowserEvent(event!), { message: 'protocol-unavailable' });
+          await assert.rejects(session.recordBrowserEvent(event!), {
+            message: 'protocol-unavailable',
+          });
         }
         assert.equal((writeError as { errcode?: number } | undefined)?.errcode, 8);
         assert.equal(closes, 1);
         assert.equal(reads, failure === 'outcome' ? 1 : 0);
         await assert.rejects(session.readForVerdict('snapshot-1'));
         assert.equal(reads, failure === 'outcome' ? 1 : 0);
-        assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts').get().n, failure === 'outcome' ? 1 : 0);
+        assert.equal(
+          database.prepare('SELECT count(*) AS n FROM action_verdicts').get().n,
+          failure === 'outcome' ? 1 : 0,
+        );
         assert.equal(database.prepare('SELECT count(*) AS n FROM action_outcomes').get().n, 0);
         assert.equal(unavailable, 1);
       } finally {
@@ -274,7 +403,9 @@ test('отклоняет старое событие браузера после
   let closes = 0;
   const session = createPreparationSession({
     openSource: async () => {},
-    closeSource: async () => { closes++; },
+    closeSource: async () => {
+      closes++;
+    },
     saveVerdict: async () => {},
     read: async () => 'fixture-result',
     saveOutcome: async () => {},
@@ -283,8 +414,10 @@ test('отклоняет старое событие браузера после
       if (event.sessionId === 'session-1') throw new Error('unexpected stale event');
     },
   }) as unknown as {
-    open(sessionId?: string): Promise<void>; close(): Promise<void>;
-    bindSnapshot(snapshot: string): void; readForVerdict(snapshot: string): Promise<string>;
+    open(sessionId?: string): Promise<void>;
+    close(): Promise<void>;
+    bindSnapshot(snapshot: string): void;
+    readForVerdict(snapshot: string): Promise<string>;
     recordBrowserEvent(event: BrowserEvent): Promise<void>;
   };
   await session.open('session-1');
@@ -305,9 +438,14 @@ test('отклоняет событие браузера без привязки
   const { createPreparationSession } = await import('../../../core/use-cases/preparation.ts');
   const stored: BrowserEvent[] = [];
   const session = createPreparationSession({
-    openSource: async () => {}, closeSource: async () => {}, saveVerdict: async () => {},
-    read: async () => 'fixture-result', saveOutcome: async () => {},
-    saveBrowserEvent: async (event: BrowserEvent) => { stored.push(event); },
+    openSource: async () => {},
+    closeSource: async () => {},
+    saveVerdict: async () => {},
+    read: async () => 'fixture-result',
+    saveOutcome: async () => {},
+    saveBrowserEvent: async (event: BrowserEvent) => {
+      stored.push(event);
+    },
   });
   await session.open();
   await assert.rejects(session.recordBrowserEvent(browserEvents[0]));
@@ -325,13 +463,29 @@ test('дозаписывает событие браузера в таблицу
       appendBrowserEvent(value: BrowserEvent): void;
     };
     protocol.appendBrowserEvent(browserEvents[0]);
-    const schema = database.prepare('PRAGMA table_list').all().find((entry: { name: string }) => entry.name === 'action_browser_events');
+    const schema = database
+      .prepare('PRAGMA table_list')
+      .all()
+      .find((entry: { name: string }) => entry.name === 'action_browser_events');
     assert.equal(schema.strict, 1);
-    const row = database.prepare('SELECT session_id, source_id, access_id, step_number, kind, method, host, path FROM action_browser_events').get();
-    assert.deepEqual({ ...row }, {
-      session_id: 'session-1', source_id: 'source-1', access_id: 'access-1', step_number: 1,
-      kind: 'main-frame-navigation', method: 'GET', host: 'example.test', path: '/fixture',
-    });
+    const row = database
+      .prepare(
+        'SELECT session_id, source_id, access_id, step_number, kind, method, host, path FROM action_browser_events',
+      )
+      .get();
+    assert.deepEqual(
+      { ...row },
+      {
+        session_id: 'session-1',
+        source_id: 'source-1',
+        access_id: 'access-1',
+        step_number: 1,
+        kind: 'main-frame-navigation',
+        method: 'GET',
+        host: 'example.test',
+        path: '/fixture',
+      },
+    );
     assert.throws(() => database.exec("UPDATE action_browser_events SET path = '/other'"));
     assert.throws(() => database.exec('DELETE FROM action_browser_events'));
   } finally {

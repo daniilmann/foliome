@@ -1,4 +1,4 @@
-const assert = require('node:assert/strict');
+const assert: typeof import('node:assert/strict') = require('node:assert/strict');
 const test = require('node:test');
 const { EventEmitter } = require('node:events');
 
@@ -6,7 +6,9 @@ class Deferred<T> {
   promise: Promise<T>;
   resolve!: (value: T) => void;
   constructor() {
-    this.promise = new Promise<T>(resolve => { this.resolve = resolve; });
+    this.promise = new Promise<T>((resolve) => {
+      this.resolve = resolve;
+    });
   }
 }
 
@@ -16,19 +18,55 @@ const samples = [
   {
     context: 101,
     data: {
-      url, title: 'First',
+      url,
+      title: 'First',
       nodes: [{ visible: true, role: 'textbox', text: '', field: 'sealed' }],
-      parents: [null], identities: [11], classes: [null], semantics: ['textbox'], secrets: [], embeds: [],
-      observation: { geometry: [{ rect: rect(10), runs: [], mask: true }], width: 200, height: 100, revision: 11, animationIds: ['first'], viewportStable: true, maskAnimationActive: false, unsupported: false },
+      parents: [null],
+      identities: [11],
+      classes: [null],
+      semantics: ['textbox'],
+      secrets: [],
+      embeds: [],
+      observation: {
+        geometry: [{ rect: rect(10), runs: [], mask: true }],
+        width: 200,
+        height: 100,
+        revision: 11,
+        animationIds: ['first'],
+        viewportStable: true,
+        maskAnimationActive: false,
+        unsupported: false,
+      },
     },
   },
   {
     context: 202,
     data: {
-      url, title: 'Second',
-      nodes: [{ visible: true, role: 'text', text: 'Second' }, { visible: true, role: 'textbox', text: '', field: 'sealed' }],
-      parents: [null, 0], identities: [21, 22], classes: [null, null], semantics: ['text', 'textbox'], secrets: [], embeds: [],
-      observation: { geometry: [{ rect: rect(50), runs: [], mask: false }, { rect: rect(70), runs: [], mask: true }], width: 200, height: 100, revision: 22, animationIds: ['second'], viewportStable: false, maskAnimationActive: true, unsupported: false },
+      url,
+      title: 'Second',
+      nodes: [
+        { visible: true, role: 'text', text: 'Second' },
+        { visible: true, role: 'textbox', text: '', field: 'sealed' },
+      ],
+      parents: [null, 0],
+      identities: [21, 22],
+      classes: [null, null],
+      semantics: ['text', 'textbox'],
+      secrets: [],
+      embeds: [],
+      observation: {
+        geometry: [
+          { rect: rect(50), runs: [], mask: false },
+          { rect: rect(70), runs: [], mask: true },
+        ],
+        width: 200,
+        height: 100,
+        revision: 22,
+        animationIds: ['second'],
+        viewportStable: false,
+        maskAnimationActive: true,
+        unsupported: false,
+      },
     },
   },
 ];
@@ -40,51 +78,76 @@ function port() {
   let documents = 0;
   const events = new EventEmitter();
   return {
-    entered, document,
-    on: events.on.bind(events), off: events.off.bind(events),
+    entered,
+    document,
+    on: events.on.bind(events),
+    off: events.off.bind(events),
     async send(method: string, params?: Record<string, unknown>): Promise<unknown> {
       switch (method) {
         case 'Page.enable':
         case 'Runtime.enable':
-        case 'Runtime.addBinding': return {};
-        case 'Page.addScriptToEvaluateOnNewDocument': return { identifier: 'script' };
-        case 'Page.removeScriptToEvaluateOnNewDocument': return {};
-        case 'Page.getFrameTree': return { frameTree: { frame: { id: 'root', url } } };
-        case 'Page.createIsolatedWorld': return { executionContextId: samples[worlds++].context };
+        case 'Runtime.addBinding':
+          return {};
+        case 'Page.addScriptToEvaluateOnNewDocument':
+          return { identifier: 'script' };
+        case 'Page.removeScriptToEvaluateOnNewDocument':
+          return {};
+        case 'Page.getFrameTree':
+          return { frameTree: { frame: { id: 'root', url } } };
+        case 'Page.createIsolatedWorld':
+          return { executionContextId: samples[worlds++].context };
         case 'Runtime.evaluate': {
-          const sample = samples.find(item => item.context === params?.contextId);
+          const sample = samples.find((item) => item.context === params?.contextId);
           assert.ok(sample);
           return { result: { value: sample.data } };
         }
         case 'DOM.getDocument':
-          if (documents++ === 0) { entered.resolve(); return document.promise; }
+          if (documents++ === 0) {
+            entered.resolve();
+            return document.promise;
+          }
           return { root: {} };
-        default: throw new Error(`unexpected CDP method: ${method}`);
+        default:
+          throw new Error(`unexpected CDP method: ${method}`);
       }
     },
     async detach() {},
   };
 }
 
-function checkFrame(frame: any, index: number) {
+function checkFrame(
+  frame: Awaited<
+    ReturnType<
+      Awaited<
+        ReturnType<
+          typeof import('../../../core/adapters/browser/collect-dom.ts').prepareDomCollector
+        >
+      >['collectFrame']
+    >
+  >,
+  index: number,
+) {
   const sample = samples[index];
-  assert.deepEqual({
-    title: frame.facts.page.title,
-    count: frame.facts.nodes.length,
-    masks: frame.plan?.masks,
-    revision: frame.revision,
-    animationIds: frame.animationIds,
-    viewportStable: frame.viewportStable,
-    maskAnimationActive: frame.maskAnimationActive,
-  }, {
-    title: sample.data.title,
-    count: sample.data.nodes.length,
-    masks: [{ x: index === 0 ? 6 : 66, y: 16, width: 18, height: 18 }],
-    revision: sample.data.observation.revision,
-    animationIds: [`document:${sample.context}`, ...sample.data.observation.animationIds],
-    viewportStable: sample.data.observation.viewportStable,
-    maskAnimationActive: sample.data.observation.maskAnimationActive,
-  });
+  assert.deepEqual(
+    {
+      title: frame.facts.page.title,
+      count: frame.facts.nodes.length,
+      masks: frame.plan?.masks,
+      revision: frame.revision,
+      animationIds: frame.animationIds,
+      viewportStable: frame.viewportStable,
+      maskAnimationActive: frame.maskAnimationActive,
+    },
+    {
+      title: sample.data.title,
+      count: sample.data.nodes.length,
+      masks: [{ x: index === 0 ? 6 : 66, y: 16, width: 18, height: 18 }],
+      revision: sample.data.observation.revision,
+      animationIds: [`document:${sample.context}`, ...sample.data.observation.animationIds],
+      viewportStable: sample.data.observation.viewportStable,
+      maskAnimationActive: sample.data.observation.maskAnimationActive,
+    },
+  );
 }
 
 for (const secondKind of ['frame', 'text'] as const) {
@@ -99,7 +162,10 @@ for (const secondKind of ['frame', 'text'] as const) {
         const second = await collector.collectFrame(2);
         checkFrame(second, 1);
       } else {
-        const second = await collector.collectText(2) as any;
+        const second = await collector.collectText(2);
+        assert.ok(second && typeof second === 'object' && 'page' in second && 'nodes' in second);
+        assert.ok(second.page && typeof second.page === 'object' && 'title' in second.page);
+        assert.ok(Array.isArray(second.nodes));
         assert.equal(second.page.title, samples[1].data.title);
         assert.equal(second.nodes.length, samples[1].data.nodes.length);
       }

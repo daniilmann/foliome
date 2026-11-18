@@ -2,7 +2,8 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 test('подтверждает возврат управления только из окна владельца и только один раз для активной сессии', async () => {
-  const { createOwnerLoginConfirmation } = await import('../../../core/adapters/ui/owner-login-confirmation.ts');
+  const { createOwnerLoginConfirmation } =
+    await import('../../../core/adapters/ui/owner-login-confirmation.ts');
   const { decidePngGate } = await import('../../../core/domain/png-gate.ts');
   const ownerFrame = {};
   const otherFrame = {};
@@ -10,18 +11,35 @@ test('подтверждает возврат управления только 
   const endpoint = '/owner/login/complete';
   const completed: string[] = [];
   const adapter = createOwnerLoginConfirmation({
-    ownerFrame, origin, endpoint, complete: (sessionId: string) => { completed.push(sessionId); return true; },
+    ownerFrame,
+    origin,
+    endpoint,
+    complete: (sessionId: string) => {
+      completed.push(sessionId);
+      return true;
+    },
   });
   const request = {
-    method: 'POST', path: endpoint, frame: ownerFrame, origin,
+    method: 'POST',
+    path: endpoint,
+    frame: ownerFrame,
+    origin,
     body: { sessionId: 'session-1', nonce: 'nonce-1' },
   };
-  const fact = { sessionId: 'session-1', source: 'trusted-adapter', confirmed: true };
-  const gate = (completion: typeof fact | null) => decidePngGate({
-    sessionId: 'session-1', sessionActive: true, loginStep: false,
-    manualInputSeen: true, hasKnownSecret: false, hasNonEmptyFields: false,
-    completion, stable: true, maskApplied: true, withinLimits: true,
-  });
+  const fact = { sessionId: 'session-1', source: 'trusted-adapter' as const, confirmed: true };
+  const gate = (completion: typeof fact | null) =>
+    decidePngGate({
+      sessionId: 'session-1',
+      sessionActive: true,
+      loginStep: false,
+      manualInputSeen: true,
+      hasKnownSecret: false,
+      hasNonEmptyFields: false,
+      completion,
+      stable: true,
+      maskApplied: true,
+      withinLimits: true,
+    });
 
   assert.equal(adapter.handle(request), null);
   adapter.begin({ sessionId: 'session-1', nonce: 'nonce-1' });
@@ -33,7 +51,8 @@ test('подтверждает возврат управления только 
     { ...request, body: { ...request.body, sessionId: 'old-session' } },
     { ...request, body: { ...request.body, nonce: 'old-nonce' } },
     { ...request, body: { ...request.body, extra: true } },
-  ]) assert.equal(adapter.handle(invalid), null);
+  ])
+    assert.equal(adapter.handle(invalid), null);
   assert.deepEqual(completed, []);
   assert.deepEqual(gate(null), { ok: false, code: 'login-step' });
   const confirmation = adapter.handle(request);
@@ -50,28 +69,44 @@ test('подтверждает возврат управления только 
   adapter.begin({ sessionId: 'session-2', nonce: 'nonce-3' });
   assert.equal(adapter.handle(second), null);
   assert.deepEqual(adapter.handle({ ...second, body: { ...second.body, nonce: 'nonce-3' } }), {
-    sessionId: 'session-2', source: 'trusted-adapter', confirmed: true,
+    sessionId: 'session-2',
+    source: 'trusted-adapter',
+    confirmed: true,
   });
   assert.deepEqual(completed, ['session-1', 'session-2']);
 });
 
 for (const [name, failure] of [
   ['false', () => false],
-  ['синхронное исключение', () => { throw new Error('completion failed'); }],
+  [
+    'синхронное исключение',
+    () => {
+      throw new Error('completion failed');
+    },
+  ],
   ['Promise', () => Promise.resolve(true) as unknown as boolean],
 ] as const) {
   test(`не выдаёт подтверждение при результате complete: ${name} и расходует nonce`, async () => {
-    const { createOwnerLoginConfirmation } = await import('../../../core/adapters/ui/owner-login-confirmation.ts');
+    const { createOwnerLoginConfirmation } =
+      await import('../../../core/adapters/ui/owner-login-confirmation.ts');
     const ownerFrame = {};
     const origin = 'https://owner.example';
     const endpoint = '/owner/login/complete';
     let attempts = 0;
     const adapter = createOwnerLoginConfirmation({
-      ownerFrame, origin, endpoint,
-      complete: () => { attempts++; return attempts === 1 ? failure() : true; },
+      ownerFrame,
+      origin,
+      endpoint,
+      complete: () => {
+        attempts++;
+        return attempts === 1 ? failure() : true;
+      },
     });
     const request = {
-      method: 'POST', path: endpoint, frame: ownerFrame, origin,
+      method: 'POST',
+      path: endpoint,
+      frame: ownerFrame,
+      origin,
       body: { sessionId: 'session-1', nonce: 'nonce-1' },
     };
 

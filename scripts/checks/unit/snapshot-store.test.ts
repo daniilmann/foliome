@@ -11,8 +11,22 @@ function filtered(snapshot: number, path = '/overview') {
     page: { url: `https://source.example${path}?token=synthetic-raw-marker`, title: 'Обзор' },
     frames: [{ index: 0, host: 'source.example', foreign: false, unavailable: false }],
     nodes: [
-      { n: 1, frame: 0, visible: true, role: 'text', text: 'Открытый текст synthetic-secret-marker' },
-      { n: 2, frame: 0, visible: true, role: 'textbox', field: 'filled', text: 'synthetic-field-marker', value: 'synthetic-field-value' },
+      {
+        n: 1,
+        frame: 0,
+        visible: true,
+        role: 'text',
+        text: 'Открытый текст synthetic-secret-marker',
+      },
+      {
+        n: 2,
+        frame: 0,
+        visible: true,
+        role: 'textbox',
+        field: 'filled',
+        text: 'synthetic-field-marker',
+        value: 'synthetic-field-value',
+      },
       { n: 3, frame: 0, visible: false, role: 'text', text: 'synthetic-hidden-marker' },
     ],
     secrets: [{ kind: 'password', value: 'synthetic-secret-marker' }],
@@ -22,7 +36,8 @@ function filtered(snapshot: number, path = '/overview') {
 }
 
 test('выдаёт и хранит фильтрованный текст и проверяет условия селектора по маскам', async () => {
-  const { createTextSnapshotStore } = await import('../../../core/adapters/store/text-snapshot-store.ts');
+  const { createTextSnapshotStore } =
+    await import('../../../core/adapters/store/text-snapshot-store.ts');
   const db = new DatabaseSync(':memory:');
   try {
     let now = 0;
@@ -34,27 +49,47 @@ test('выдаёт и хранит фильтрованный текст и пр
     await store.append({ sessionId: 'session-a', ...scopeA, result: first });
     await store.append({ sessionId: 'session-b', ...scopeB, result: filtered(2) });
 
-    const schema = db.prepare('PRAGMA table_list').all().find((row: { name: string }) => row.name === 'text_snapshots');
+    const schema = db
+      .prepare('PRAGMA table_list')
+      .all()
+      .find((row: { name: string }) => row.name === 'text_snapshots');
     assert.equal(schema.strict, 1);
     const columns = db.prepare('PRAGMA table_info(text_snapshots)').all();
-    assert.ok(columns.some((column: { name: string; type: string }) => column.name === 'snapshot_json' && column.type === 'TEXT'));
-    assert.ok(columns.every((column: { name: string; type: string }) =>
-      !/png|image|raw|html/i.test(column.name) && !['REAL', 'ANY'].includes(column.type)));
+    assert.ok(
+      columns.some(
+        (column: { name: string; type: string }) =>
+          column.name === 'snapshot_json' && column.type === 'TEXT',
+      ),
+    );
+    assert.ok(
+      columns.every(
+        (column: { name: string; type: string }) =>
+          !/png|image|raw|html/i.test(column.name) && !['REAL', 'ANY'].includes(column.type),
+      ),
+    );
     const rows = db.prepare('SELECT * FROM text_snapshots').all();
     assert.equal(rows.length, 2);
     for (const row of rows) {
       const json = row.snapshot_json as string;
       assert.match(json, /\[секрет\]/);
-      assert.doesNotMatch(JSON.stringify(row), /synthetic-(?:field|hidden|secret|raw)-marker|synthetic-field-value/);
+      assert.doesNotMatch(
+        JSON.stringify(row),
+        /synthetic-(?:field|hidden|secret|raw)-marker|synthetic-field-value/,
+      );
       assert.deepEqual(JSON.parse(json), row === rows[0] ? first.snapshot : filtered(2).snapshot);
     }
     assert.deepEqual(await store.latest({ ...scopeA, ...page }), first.snapshot);
     assert.deepEqual(await store.latest({ ...scopeB, ...page }), filtered(2).snapshot);
-    assert.equal(await store.latest({ sourceId: scopeA.sourceId, accessId: scopeB.accessId, ...page }), null);
+    assert.equal(
+      await store.latest({ sourceId: scopeA.sourceId, accessId: scopeB.accessId, ...page }),
+      null,
+    );
     assert.equal(await store.latest({ ...scopeA, host: 'other.example', path: page.path }), null);
     assert.equal(await store.latest({ ...scopeA, host: page.host, path: '/other' }), null);
 
-    await assert.rejects(async () => store.append({ sessionId: 'session-a', ...scopeA, result: first }));
+    await assert.rejects(async () =>
+      store.append({ sessionId: 'session-a', ...scopeA, result: first }),
+    );
     assert.equal(db.prepare('SELECT count(*) AS n FROM text_snapshots').get().n, 2);
     assert.deepEqual(await store.latest({ ...scopeA, ...page }), first.snapshot);
 
@@ -65,7 +100,9 @@ test('выдаёт и хранит фильтрованный текст и пр
     assert.equal(db.prepare('SELECT count(*) AS n FROM text_snapshots').get().n, 3);
     now += 1;
     await store.prune();
-    const remaining = db.prepare('SELECT snapshot_json FROM text_snapshots').all()
+    const remaining = db
+      .prepare('SELECT snapshot_json FROM text_snapshots')
+      .all()
       .map((row: { snapshot_json: string }) => JSON.parse(row.snapshot_json));
     assert.equal(remaining.length, 2);
     assert.ok(remaining.some((snapshot: { snapshot: number }) => snapshot.snapshot === 2));

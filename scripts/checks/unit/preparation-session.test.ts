@@ -6,7 +6,9 @@ test('отзывает право ожидающего вызова включа
 
   function deferred<T>() {
     let resolve!: (value: T) => void;
-    const promise = new Promise<T>((done) => { resolve = done; });
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
     return { promise, resolve };
   }
 
@@ -18,8 +20,14 @@ test('отзывает право ожидающего вызова включа
     const calls: string[] = [];
     let sourceOpen = false;
     const session = createPreparationSession({
-      openSource: async () => { sourceOpen = true; calls.push('open'); },
-      closeSource: async () => { sourceOpen = false; calls.push('close'); },
+      openSource: async () => {
+        sourceOpen = true;
+        calls.push('open');
+      },
+      closeSource: async () => {
+        sourceOpen = false;
+        calls.push('close');
+      },
       saveVerdict: async () => {
         calls.push('verdict');
         verdictStarted.resolve();
@@ -37,8 +45,15 @@ test('отзывает право ожидающего вызова включа
         await outcome.promise;
       },
     });
-    return { session, calls, verdict, outcome, verdictStarted, outcomeStarted,
-      isSourceOpen: () => sourceOpen };
+    return {
+      session,
+      calls,
+      verdict,
+      outcome,
+      verdictStarted,
+      outcomeStarted,
+      isSourceOpen: () => sourceOpen,
+    };
   }
 
   {
@@ -110,13 +125,24 @@ test('сохраняет итог начатого чтения после за�
   const { createPreparationSession } = await import('../../../core/use-cases/preparation.ts');
   let finishRead!: (value: string) => void;
   let signalReadStarted!: () => void;
-  const readResult = new Promise<string>((resolve) => { finishRead = resolve; });
-  const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+  const readResult = new Promise<string>((resolve) => {
+    finishRead = resolve;
+  });
+  const readStarted = new Promise<void>((resolve) => {
+    signalReadStarted = resolve;
+  });
   const outcomes: string[] = [];
   const session = createPreparationSession({
-    openSource: async () => {}, closeSource: async () => {}, saveVerdict: async () => {},
-    read: async () => { signalReadStarted(); return readResult; },
-    saveOutcome: async (value: string) => { outcomes.push(value); },
+    openSource: async () => {},
+    closeSource: async () => {},
+    saveVerdict: async () => {},
+    read: async () => {
+      signalReadStarted();
+      return readResult;
+    },
+    saveOutcome: async (value: string) => {
+      outcomes.push(value);
+    },
   });
   await session.open();
   session.bindSnapshot('old-snapshot');
