@@ -1,0 +1,148 @@
+name: Release checks
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  typescript:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+  eslint:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+  prettier:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm run format:check
+  unit:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm test
+  stand:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm run test:stand
+  protective:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm run test:attacks
+  signatures:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm audit signatures
+  advisory:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: npm audit
+  migration:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with:
+          node-version: '26.13.1'
+      - run: npm ci --ignore-scripts
+      - run: node --test --test-concurrency=1 test/stand/update.test.ts
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [typescript, eslint, prettier, unit, stand, protective, signatures, advisory, migration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Verify existing release tag and publish English notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$(jq -r .version release/manifest.json)" == "${TAG#v}" ]]
+          [[ "$(gh api "repos/$REPOSITORY/commits/$TAG" --jq .sha)" == "$COMMIT" ]]
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file release/notes.en.md

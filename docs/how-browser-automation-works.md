@@ -6,7 +6,7 @@ This design is intentional. Computer Use sends a screenshot to the API for every
 
 ## Three Layers
 
-![Browser Automation Layers](browser-automation.png)
+![Browser Automation Layers](https://github.com/daniilmann/foliome/blob/a9a6d99e4cba4ac054e4ccbd7d3be7904ff053de/docs/browser-automation.png)
 
 ### 1. Deterministic Layer (Playwright — zero LLM cost)
 
@@ -40,7 +40,7 @@ This uses the agent's own LLM capabilities (Claude Code's context window) — no
 
 ## Full Sync Flow
 
-![Architecture Flow](architecture-flow.png)
+![Architecture Flow](https://github.com/daniilmann/foliome/blob/a9a6d99e4cba4ac054e4ccbd7d3be7904ff053de/docs/architecture-flow.png)
 
 1. **Trigger**: User says `/sync` or runs `node readers/sync-all.js`
 2. **Phase 1**: API connectors run in parallel (REST APIs, no browser needed)
@@ -55,7 +55,7 @@ This uses the agent's own LLM capabilities (Claude Code's context window) — no
 
 ## How This Compares to Claude Computer Use
 
-![Comparison](computer-use-comparison.png)
+![Comparison](https://github.com/daniilmann/foliome/blob/a9a6d99e4cba4ac054e4ccbd7d3be7904ff053de/docs/computer-use-comparison.png)
 
 | | Foliome | Claude Computer Use |
 |---|---|---|
