@@ -115,6 +115,7 @@ test('собирает видимый DOM в изолированном мире
   const { randomBytes } = require('node:crypto');
   const password = randomBytes(18).toString('hex');
   const textValue = randomBytes(18).toString('hex');
+  const tokenId = 'account-abc123def456ghi789';
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
   try {
@@ -125,6 +126,7 @@ test('собирает видимый DOM в изолированном мире
         if (request.method() === 'GET' && request.url() === `${origin}/overview`) {
           await route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic title</title>
             <p>Ordinary visible text</p>
+            <p id="${tokenId}">Token marker</p><p>Known secret ${password}</p>
             <label for="password">Password label</label><input id="password" type="password" value="${password}">
             <label for="text">Text label</label><input id="text" type="text" value="${textValue}">
             <div style="display:none">Display hidden marker</div><div aria-hidden="true">Aria hidden marker</div>
@@ -167,6 +169,45 @@ test('собирает видимый DOM в изолированном мире
         const numbers = snapshot.elements.map((item: any) => item.n);
         assert.ok(numbers.length > 0 && numbers.every((n: number) => Number.isSafeInteger(n) && n > 0));
         assert.equal(new Set(numbers).size, numbers.length);
+        await t.test('выдаёт и хранит фильтрованный текст и проверяет условия селектора по маскам', async () => {
+          const { createTextSnapshotStore } = await import('../../core/adapters/store/text-snapshot-store.ts');
+          const db = new DatabaseSync(':memory:');
+          try {
+            const store = createTextSnapshotStore(db, () => 1234);
+            const scope = { sourceId: 'synthetic-source', accessId: 'synthetic-access' };
+            store.append({ sessionId: 'synthetic-session', ...scope, result });
+            const rows = db.prepare('SELECT * FROM text_snapshots').all();
+            assert.equal(rows.length, 1);
+            assert.equal(rows[0].at_ms, 1234);
+            assert.deepEqual(JSON.parse(rows[0].snapshot_json as string), snapshot);
+            const stored = store.latest({ ...scope, host: 'cabinet.invalid', path: '/overview' });
+            assert.deepEqual(stored, snapshot);
+            const serialized = JSON.stringify(rows);
+            for (const value of [password, textValue, tokenId, 'Display hidden marker', 'Aria hidden marker']) {
+              assert.equal(serialized.includes(value), false);
+            }
+            assert.ok(serialized.includes('[секрет]'));
+
+            const { selectFilteredNodes } = await import('../../core/domain/filtered-selector.ts');
+            const ordinary = snapshot.elements.find((item: any) => item.text === 'Ordinary visible text');
+            const token = snapshot.elements.find((item: any) => item.text === 'Token marker');
+            assert.ok(ordinary && token);
+            assert.equal(token.attrs?.id, 'account-{id}');
+            const select = (conditions: any[]) => selectFilteredNodes(stored, conditions);
+            assert.deepEqual(select([{ kind: 'text', operator: 'contains', value: 'Ordinary visible text' }]), [ordinary.n]);
+            assert.deepEqual(select([{ kind: 'text', operator: 'equals', value: 'Ordinary visible text' }]), [ordinary.n]);
+            for (const value of ['Display hidden marker', 'Aria hidden marker', password]) {
+              assert.deepEqual(select([{ kind: 'text', operator: 'contains', value }]), []);
+            }
+            for (const [operator, value] of [['equals', 'account-{id}'], ['contains', '{id}'], ['prefix', 'account-'], ['suffix', '{id}'], ['token', 'account-{id}'], ['language-prefix', 'account']]) {
+              assert.deepEqual(select([{ kind: 'attribute', name: 'id', operator, value }]), [token.n]);
+            }
+            assert.deepEqual(select([{ kind: 'attribute', name: 'id', operator: 'equals', value: tokenId }]), []);
+            assert.deepEqual(select([{ kind: 'attribute', name: 'unknown', operator: 'equals', value: 'account-{id}' }]), []);
+            assert.deepEqual(select([{ kind: 'text', operator: 'equals', value: 'Token marker' }, { kind: 'attribute', name: 'id', operator: 'equals', value: 'account-{id}' }]), [token.n]);
+            assert.deepEqual(select([{ kind: 'text', operator: 'equals', value: 'Ordinary visible text' }, { kind: 'attribute', name: 'id', operator: 'equals', value: 'account-{id}' }]), []);
+          } finally { db.close(); }
+        });
         await t.test('показывает видимого потомка display contents', () => {
           assert.ok(output.includes('Contents visible marker'));
         });
