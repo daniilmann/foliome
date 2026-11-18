@@ -1570,8 +1570,9 @@ test(
             );
             const after = await decode(result.image.bytes);
             const labels = await numberedLabelAreas(page);
-            for (const span of await page.locator('#target span').all()) {
-              const box = await span.boundingBox();
+            const numbered = page.locator('#target span, svg, svg use');
+            for (const element of await numbered.all()) {
+              const box = await element.boundingBox();
               if (box)
                 labels.push({
                   x: Math.max(0, Math.floor(box.x)),
