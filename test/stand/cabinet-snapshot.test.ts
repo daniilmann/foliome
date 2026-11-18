@@ -1249,6 +1249,130 @@ test(
 );
 
 test(
+  'разрешённый исходный фрейм маскирует секрет и сохраняет соседний цвет',
+  { timeout: 60_000 },
+  async () => {
+    await measuredPage(
+      '<iframe id="target" src="/source" style="left:20px;top:20px;width:220px;height:100px;border:0"></iframe>',
+      async ({ page, capture, decode }: any) => {
+        const secret = await page.frameLocator('#target').locator('#secret').boundingBox();
+        const swatch = await page.frameLocator('#target').locator('#swatch').boundingBox();
+        assert.deepEqual(secret, { x: 30, y: 30, width: 60, height: 40 });
+        assert.deepEqual(swatch, { x: 150, y: 30, width: 60, height: 40 });
+        const before = await decode(await capture.raw());
+        assert.deepEqual(pixelAt(before, 35, 65), [240, 30, 50, 255]);
+        assert.deepEqual(pixelAt(before, 170, 50), [20, 100, 220, 255]);
+        const result = await capture.result();
+        assert.equal(result.ok, true);
+        assert.equal(JSON.stringify(result.snapshot).includes('synthetic-secret'), false);
+        assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+        const after = await decode(result.image.bytes);
+        assert.deepEqual(pixelAt(after, 35, 65), [0, 0, 0, 255]);
+        assert.deepEqual(pixelAt(after, 170, 50), [20, 100, 220, 255]);
+      },
+    );
+  },
+);
+
+test(
+  'вложенный исходный фрейм учитывает рамку отступ и прокрутку',
+  { timeout: 60_000 },
+  async () => {
+    await measuredPage(
+      '<style>body{height:700px}</style><iframe id="outer" src="/outer" style="left:20px;top:420px;width:300px;height:150px;border:5px solid black;padding:7px"></iframe>',
+      async ({ page, capture, decode }: any) => {
+        await page.evaluate(() => scrollTo(0, 400));
+        assert.equal(await page.evaluate(() => scrollY), 400);
+        const secret = await page
+          .frameLocator('#outer')
+          .frameLocator('#inner')
+          .locator('#secret')
+          .boundingBox();
+        const swatch = await page
+          .frameLocator('#outer')
+          .frameLocator('#inner')
+          .locator('#swatch')
+          .boundingBox();
+        assert.deepEqual(secret, { x: 72, y: 72, width: 60, height: 40 });
+        assert.deepEqual(swatch, { x: 192, y: 72, width: 60, height: 40 });
+        const before = await decode(await capture.raw());
+        assert.deepEqual(pixelAt(before, 77, 107), [240, 30, 50, 255]);
+        assert.deepEqual(pixelAt(before, 212, 92), [20, 100, 220, 255]);
+        const result = await capture.result();
+        assert.equal(result.ok, true);
+        assert.equal(JSON.stringify(result.snapshot).includes('synthetic-secret'), false);
+        assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+        const after = await decode(result.image.bytes);
+        assert.deepEqual(pixelAt(after, 77, 107), [0, 0, 0, 255]);
+        assert.deepEqual(pixelAt(after, 212, 92), [20, 100, 220, 255]);
+      },
+    );
+  },
+);
+
+test(
+  'изменение исходного фрейма после сбора вызывает повтор или отказ от PNG',
+  { timeout: 60_000 },
+  async () => {
+    await measuredPage(
+      '<iframe id="target" src="/source" style="left:20px;top:20px;width:220px;height:100px;border:0"></iframe>',
+      async ({ page, capture }: any) => {
+        const deviations: string[] = [];
+        let changed = false;
+        const result = await capture.result(async () => {
+          if (!changed) {
+            changed = true;
+            await page
+              .frameLocator('#target')
+              .locator('#secret')
+              .evaluate((element: HTMLElement) => {
+                element.style.left = '80px';
+              });
+          }
+        }, deviations);
+        assert.equal(changed, true);
+        assert.equal(result.ok, true);
+        assert.equal(JSON.stringify(result.snapshot).includes('synthetic-secret'), false);
+        assert.ok(deviations.includes('retake') || !Buffer.isBuffer(result.image.bytes));
+      },
+    );
+  },
+);
+
+test(
+  'преобразованный исходный фрейм или его предок полностью маскируется',
+  { timeout: 60_000 },
+  async (t: import('node:test').TestContext) => {
+    for (const kind of ['frame', 'ancestor'])
+      await t.test(kind, async () => {
+        const iframe = `<iframe id="target" src="/source" style="position:${kind === 'frame' ? 'absolute' : 'relative'};left:0;top:0;width:220px;height:100px;border:0;${kind === 'frame' ? 'transform:translateX(20px)' : ''}"></iframe>`;
+        const body =
+          kind === 'frame'
+            ? iframe
+            : `<div style="left:20px;top:0;transform:translateX(20px)">${iframe}</div>`;
+        await measuredPage(
+          `${body}<div id="ordinary" style="left:320px;top:80px;width:60px;height:40px;background:rgb(20,100,220)"></div>`,
+          async ({ page, capture, decode }: any) => {
+            const box = await page.locator('#target').boundingBox();
+            assert.ok(box);
+            const before = await decode(await capture.raw());
+            assert.deepEqual(pixelAt(before, box.x + 15, box.y + 45), [240, 30, 50, 255]);
+            assert.deepEqual(pixelAt(before, box.x + 150, box.y + 30), [20, 100, 220, 255]);
+            assert.deepEqual(pixelAt(before, 350, 100), [20, 100, 220, 255]);
+            const result = await capture.result();
+            assert.equal(result.ok, true);
+            assert.equal(JSON.stringify(result.snapshot).includes('synthetic-secret'), false);
+            assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+            const after = await decode(result.image.bytes);
+            assertRectBlack(after, box, await numberedLabelAreas(page));
+            assert.deepEqual(pixelAt(after, 350, 100), [20, 100, 220, 255]);
+          },
+        );
+      });
+  },
+);
+
+test(
   'снимок соответствует наблюдаемой области при несовпадении размеров и прокрутке',
   { timeout: 60_000 },
   async (t: import('node:test').TestContext) => {
@@ -1355,6 +1479,16 @@ async function measuredPage(body: string, run: (fixture: any) => Promise<void>) 
             contentType: 'text/html',
             body: `<!doctype html><title>Synthetic overview</title><style>html,body{margin:0;background:rgb(30,180,70)} body>div,body>input,body>label,body>iframe{position:absolute} label input{position:static}</style>${body}`,
           });
+        if (request.url() === `${origin}/source`)
+          return route.fulfill({
+            contentType: 'text/html',
+            body: '<!doctype html><style>html,body{margin:0;background:rgb(30,180,70)} #secret,#swatch{position:absolute;top:10px;width:60px;height:40px;border:0;padding:0} #secret{left:10px;background:rgb(240,30,50)} #swatch{left:130px;background:rgb(20,100,220)}</style><input id="secret" type="password" value="synthetic-secret"><div id="swatch"></div>',
+          });
+        if (request.url() === `${origin}/outer`)
+          return route.fulfill({
+            contentType: 'text/html',
+            body: '<!doctype html><style>html,body{margin:0} iframe{position:absolute;left:20px;top:20px;width:220px;height:100px;border:4px solid black;padding:6px}</style><iframe id="inner" src="/source"></iframe>',
+          });
         if (request.url() === `${origin}/frame`)
           return route.fulfill({
             contentType: 'text/html',
@@ -1373,14 +1507,20 @@ async function measuredPage(body: string, run: (fixture: any) => Promise<void>) 
         const raw = async (viewport?: any) =>
           captureViewportPng(cdp, viewport ?? (await collector.collectFrame(51)).viewport);
         const timer = clock();
-        const result = () =>
+        const result = (afterCapture?: () => Promise<void>, deviations: string[] = []) =>
           captureCabinetSnapshot(
             {
               collect: () => collector.collectFrame(51),
-              capturePng: raw,
+              capturePng: async (viewport: any) => {
+                const bytes = await raw(viewport);
+                await afterCapture?.();
+                return bytes;
+              },
               now: timer.now,
               sleep: timer.sleep,
-              recordDeviation: async () => {},
+              recordDeviation: async (entry: { code: string }) => {
+                deviations.push(entry.code);
+              },
             },
             () => session,
             600,
