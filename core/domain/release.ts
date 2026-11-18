@@ -291,10 +291,10 @@ function readTree(value: unknown, policy: ReleasePolicy): ReadonlyMap<string, st
   const blobs = new Map<string, string>();
   for (const value of entries) {
     const entry = readRecord(value, ['path', 'blobSha', 'mode']);
-    // The policy input has no executable file allowlist.
     if (
       !entry ||
-      entry.mode !== '100644' ||
+      (entry.mode !== '100644' &&
+        !(entry.mode === '100755' && entry.path === 'scripts/telegram-agent.sh')) ||
       typeof entry.path !== 'string' ||
       !matches(entry.blobSha, gitShaPattern) ||
       !registerPath(entry.path, policy.allowedRootFiles, policy.allowedDirectories, seenPaths)
