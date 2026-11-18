@@ -35,6 +35,7 @@ async function runStand(run: (f: any) => Promise<void>) {
   const { createPreparationRuntime } = require('../../../core/main.ts');
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   const { prepareDomCollector } = require('../../../core/adapters/browser/collect-dom.ts');
+  const { captureViewportPng } = require('../../../core/adapters/browser/capture-snapshot.ts');
   const { attachOwnerWindow } = require('../../../core/adapters/ui/owner-window.ts');
   const { createAdmittedChannel } = require('../../../core/adapters/channel/admission.ts');
   const { createActionProtocol } = require('../../../core/adapters/store/action-protocol.ts');
@@ -101,7 +102,7 @@ async function runStand(run: (f: any) => Promise<void>) {
       },
       loginObservations: () => collector!.loginObservations(),
       finishLoginObservation: () => collector!.finishLoginObservation(),
-      capturePng: async () => Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })).data, 'base64'),
+      capturePng: (viewport: Awaited<ReturnType<Collector['collectFrame']>>['viewport']) => captureViewportPng(cdp, viewport),
     };
     const protocol = createActionProtocol(db, () => 1234);
     const store = createTextSnapshotStore(db, () => 1234);

@@ -20,6 +20,7 @@ const frame = (snapshot: number, revision = 1, mask = rect) => ({
 });
 
 async function stand(run: (fixture: any) => Promise<void>) {
+  const { captureViewportPng } = require('../../core/adapters/browser/capture-snapshot.ts');
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
   try {
@@ -36,8 +37,7 @@ async function stand(run: (fixture: any) => Promise<void>) {
       let captures = 0;
       const capturePng = async () => {
         captures++;
-        const result = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
-        return Buffer.from(result.data, 'base64');
+        return captureViewportPng(cdp, { x: 0, y: 0, width: 100, height: 80 });
       };
       const decoder = await context.newPage();
       await decoder.goto('about:blank');
@@ -112,7 +112,7 @@ function syntheticPorts() {
 test('сохраняет историю ручного ввода между документами и скрывает эхо без подтверждения входа', { timeout: 60_000 }, async (t: any) => {
   const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
   const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
-  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const { captureCabinetSnapshot, captureViewportPng } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
   const { randomBytes } = require('node:crypto');
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   for (const kind of ['login', 'password', 'code']) {
@@ -167,7 +167,7 @@ test('сохраняет историю ручного ввода между д�
               let captures = 0;
               const result = await captureCabinetSnapshot({
                 collect: () => collector.collectFrame(43),
-                capturePng: async () => { captures++; return Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png' })).data, 'base64'); },
+                capturePng: async (viewport: any) => { captures++; return captureViewportPng(cdp, viewport); },
                 now: timer.now, sleep: timer.sleep, recordDeviation: async () => {},
               }, () => ({ sessionId: 'synthetic-session', sessionActive: true, loginStep: true, manualInputSeen: true, hasKnownSecret: true, hasNonEmptyFields: false, completion: null }), 5000);
               assert.equal(result.ok, true);
@@ -321,7 +321,7 @@ test('собирает видимый DOM в изолированном мире
 
 test('строит план закраски по защищённым наблюдениям браузера', { timeout: 60_000 }, async (t: any) => {
   const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
-  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const { captureCabinetSnapshot, captureViewportPng } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
   const { randomBytes } = require('node:crypto');
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   const password = randomBytes(12).toString('hex');
@@ -367,7 +367,7 @@ test('строит план закраски по защищённым набл�
           const timer = clock();
           const ports = {
             collect: () => collector.collectFrame(31),
-            capturePng: async () => Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })).data, 'base64'),
+            capturePng: (viewport: typeof observed.viewport) => captureViewportPng(cdp, viewport),
             now: timer.now, sleep: timer.sleep, recordDeviation: async () => {},
           };
           const result = await captureCabinetSnapshot(ports, () => session, 5000);
@@ -384,7 +384,7 @@ test('строит план закраски по защищённым набл�
           }
           assert.equal(result.image.snapshotNumber, 31);
           assert.ok(Buffer.isBuffer(result.image.bytes));
-          const original = await ports.capturePng();
+          const original = await ports.capturePng((await collector.collectFrame(31)).viewport);
           const decoder = await context.newPage();
           await decoder.goto('about:blank');
           const pixels = async (bytes: Buffer) => decoder.evaluate(async (encoded: string) => {
