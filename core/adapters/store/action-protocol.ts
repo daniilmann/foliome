@@ -2,33 +2,88 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { BrowserEvent } from '../../use-cases/preparation.ts';
 import type { SnapshotDeviationFlag } from '../browser/capture-snapshot.ts';
 
-type Reason = 'allowed' | 'unsupported' | 'not-declared' | 'value-not-allowed' | 'not-found' |
-  'ambiguous' | 'hidden' | 'disabled' | 'covered' | 'stale' | 'foreign-frame' | 'foreign-host' |
-  'bad-url' | 'form-repeat' | 'popup-blocked' | 'download-refused' | 'secret-field' |
-  'unclassified' | 'blocked-payment' | 'blocked-change' | 'limit' | 'internal';
+type Reason =
+  | 'allowed'
+  | 'unsupported'
+  | 'not-declared'
+  | 'value-not-allowed'
+  | 'not-found'
+  | 'ambiguous'
+  | 'hidden'
+  | 'disabled'
+  | 'covered'
+  | 'stale'
+  | 'foreign-frame'
+  | 'foreign-host'
+  | 'bad-url'
+  | 'form-repeat'
+  | 'popup-blocked'
+  | 'download-refused'
+  | 'secret-field'
+  | 'unclassified'
+  | 'blocked-payment'
+  | 'blocked-change'
+  | 'limit'
+  | 'internal';
 type Verdict = Readonly<{
-  sessionId: string; sourceId: string; accessId: string;
-  snapshotNumber: number; nodeNumber: number | null;
-  method: 'readText' | 'other'; actionClass: 'read' | 'unknown';
-  decision: 'allowed' | 'blocked'; reason: Reason;
+  sessionId: string;
+  sourceId: string;
+  accessId: string;
+  snapshotNumber: number;
+  nodeNumber: number | null;
+  method: 'readText' | 'other';
+  actionClass: 'read' | 'unknown';
+  decision: 'allowed' | 'blocked';
+  reason: Reason;
 }>;
 type Outcome = Readonly<{ verdictId: number; status: 'ok' | 'stale' | 'internal' | 'limit' }>;
 type Clock = () => number;
 type SnapshotDeviation = Readonly<{
-  sessionId: string; sourceId: string; accessId: string; snapshotNumber: number;
-  host: string; path: string; code: 'retake' | 'unstable' | 'limit' | 'error';
-  flags: readonly SnapshotDeviationFlag[]; retakes: number; elapsedMs: number;
+  sessionId: string;
+  sourceId: string;
+  accessId: string;
+  snapshotNumber: number;
+  host: string;
+  path: string;
+  code: 'retake' | 'unstable' | 'limit' | 'error';
+  flags: readonly SnapshotDeviationFlag[];
+  retakes: number;
+  elapsedMs: number;
 }>;
-const flagOrder: readonly SnapshotDeviationFlag[] = ['flow', 'rectangles', 'animations', 'observer', 'visualViewport'];
+const flagOrder: readonly SnapshotDeviationFlag[] = [
+  'flow',
+  'rectangles',
+  'animations',
+  'observer',
+  'visualViewport',
+];
 
 export declare const createActionProtocol: typeof create;
 declare const exports: { createActionProtocol: typeof create };
 
 const reasons = new Set<Reason>([
-  'allowed', 'unsupported', 'not-declared', 'value-not-allowed', 'not-found', 'ambiguous',
-  'hidden', 'disabled', 'covered', 'stale', 'foreign-frame', 'foreign-host', 'bad-url',
-  'form-repeat', 'popup-blocked', 'download-refused', 'secret-field', 'unclassified',
-  'blocked-payment', 'blocked-change', 'limit', 'internal',
+  'allowed',
+  'unsupported',
+  'not-declared',
+  'value-not-allowed',
+  'not-found',
+  'ambiguous',
+  'hidden',
+  'disabled',
+  'covered',
+  'stale',
+  'foreign-frame',
+  'foreign-host',
+  'bad-url',
+  'form-repeat',
+  'popup-blocked',
+  'download-refused',
+  'secret-field',
+  'unclassified',
+  'blocked-payment',
+  'blocked-change',
+  'limit',
+  'internal',
 ]);
 
 function integer(value: unknown, minimum: number): value is number {
@@ -121,8 +176,10 @@ function create(database: DatabaseSync, clock: Clock) {
       CREATE TRIGGER IF NOT EXISTS action_snapshot_deviations_no_replace BEFORE INSERT ON action_snapshot_deviations WHEN EXISTS (SELECT 1 FROM action_snapshot_deviations WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
     `);
     const columns = database.prepare('PRAGMA table_info(action_browser_events)').all();
-    if (!columns.some(column => column.name === 'actor')) {
-      database.exec("ALTER TABLE action_browser_events ADD COLUMN actor TEXT NOT NULL DEFAULT 'browser' CHECK (actor = 'browser')");
+    if (!columns.some((column) => column.name === 'actor')) {
+      database.exec(
+        "ALTER TABLE action_browser_events ADD COLUMN actor TEXT NOT NULL DEFAULT 'browser' CHECK (actor = 'browser')",
+      );
     }
     database.exec('RELEASE action_protocol_schema');
   } catch (error) {
@@ -133,7 +190,9 @@ function create(database: DatabaseSync, clock: Clock) {
   const insertVerdict = database.prepare(`INSERT INTO action_verdicts
     (at_ms, session_id, source_id, access_id, snapshot_number, node_number, method, action_class, actor, decision, reason)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?)`);
-  const insertOutcome = database.prepare('INSERT INTO action_outcomes (verdict_id, at_ms, status) VALUES (?, ?, ?)');
+  const insertOutcome = database.prepare(
+    'INSERT INTO action_outcomes (verdict_id, at_ms, status) VALUES (?, ?, ?)',
+  );
   const insertBrowserEvent = database.prepare(`INSERT INTO action_browser_events
     (at_ms, session_id, source_id, access_id, step_number, kind, method, host, path)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -147,7 +206,8 @@ function create(database: DatabaseSync, clock: Clock) {
     if (!integer(value, 0)) throw new Error('invalid time');
     return value;
   }
-  const listRows = database.prepare(`SELECT v.at_ms AS atMs, v.source_id AS sourceId, v.access_id AS accessId,
+  const listRows =
+    database.prepare(`SELECT v.at_ms AS atMs, v.source_id AS sourceId, v.access_id AS accessId,
     v.actor, v.method, v.snapshot_number AS snapshotNumber, v.node_number AS nodeNumber,
     v.decision, v.reason, o.status AS outcome FROM action_verdicts v
     LEFT JOIN action_outcomes o ON o.verdict_id = v.id ORDER BY v.id`);
@@ -157,48 +217,131 @@ function create(database: DatabaseSync, clock: Clock) {
       database.prepare('INSERT INTO channel_denials (at_ms, code) VALUES (?, ?)').run(time(), code);
     },
     list() {
-      return listRows.all() as unknown as readonly { atMs: number; sourceId: string; accessId: string; actor: string; method: string; snapshotNumber: number; nodeNumber: number | null; decision: 'allowed' | 'blocked'; reason: string; outcome: string | null }[];
+      return listRows.all() as unknown as readonly {
+        atMs: number;
+        sourceId: string;
+        accessId: string;
+        actor: string;
+        method: string;
+        snapshotNumber: number;
+        nodeNumber: number | null;
+        decision: 'allowed' | 'blocked';
+        reason: string;
+        outcome: string | null;
+      }[];
     },
     appendVerdict(value: Verdict): number {
-      if (!identifier(value.sessionId) || !identifier(value.sourceId) || !identifier(value.accessId) ||
-        !integer(value.snapshotNumber, 1) || (value.nodeNumber !== null && !integer(value.nodeNumber, 1)) ||
-        !['readText', 'other'].includes(value.method) || !['read', 'unknown'].includes(value.actionClass) ||
+      if (
+        !identifier(value.sessionId) ||
+        !identifier(value.sourceId) ||
+        !identifier(value.accessId) ||
+        !integer(value.snapshotNumber, 1) ||
+        (value.nodeNumber !== null && !integer(value.nodeNumber, 1)) ||
+        !['readText', 'other'].includes(value.method) ||
+        !['read', 'unknown'].includes(value.actionClass) ||
         !reasons.has(value.reason) ||
-        !((value.decision === 'allowed' && value.reason === 'allowed' && value.nodeNumber !== null &&
-          value.method === 'readText' && value.actionClass === 'read') ||
-          (value.decision === 'blocked' && value.reason !== 'allowed'))) throw new Error('invalid verdict');
-      const result = insertVerdict.run(time(), value.sessionId, value.sourceId, value.accessId,
-        value.snapshotNumber, value.nodeNumber, value.method, value.actionClass, value.decision, value.reason);
+        !(
+          (value.decision === 'allowed' &&
+            value.reason === 'allowed' &&
+            value.nodeNumber !== null &&
+            value.method === 'readText' &&
+            value.actionClass === 'read') ||
+          (value.decision === 'blocked' && value.reason !== 'allowed')
+        )
+      )
+        throw new Error('invalid verdict');
+      const result = insertVerdict.run(
+        time(),
+        value.sessionId,
+        value.sourceId,
+        value.accessId,
+        value.snapshotNumber,
+        value.nodeNumber,
+        value.method,
+        value.actionClass,
+        value.decision,
+        value.reason,
+      );
       const id = Number(result.lastInsertRowid);
       if (!integer(id, 1)) throw new Error('invalid verdict id');
       return id;
     },
     appendOutcome(value: Outcome): void {
-      if (!integer(value.verdictId, 1) || !['ok', 'stale', 'internal', 'limit'].includes(value.status)) {
+      if (
+        !integer(value.verdictId, 1) ||
+        !['ok', 'stale', 'internal', 'limit'].includes(value.status)
+      ) {
         throw new Error('invalid outcome');
       }
       insertOutcome.run(value.verdictId, time(), value.status);
     },
     appendBrowserEvent(value: BrowserEvent): void {
-      if (!identifier(value.sessionId) || !identifier(value.sourceId) || !identifier(value.accessId) ||
-        !integer(value.stepNumber, 1) || !['main-frame-navigation', 'non-get-request'].includes(value.kind) ||
-        !['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'other'].includes(value.method) ||
-        typeof value.host !== 'string' || value.host.length < 1 || value.host.length > 253 ||
-        typeof value.path !== 'string' || value.path.length < 1 || value.path.length > 2048) {
+      if (
+        !identifier(value.sessionId) ||
+        !identifier(value.sourceId) ||
+        !identifier(value.accessId) ||
+        !integer(value.stepNumber, 1) ||
+        !['main-frame-navigation', 'non-get-request'].includes(value.kind) ||
+        !['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'other'].includes(
+          value.method,
+        ) ||
+        typeof value.host !== 'string' ||
+        value.host.length < 1 ||
+        value.host.length > 253 ||
+        typeof value.path !== 'string' ||
+        value.path.length < 1 ||
+        value.path.length > 2048
+      ) {
         throw new Error('invalid browser event');
       }
-      insertBrowserEvent.run(time(), value.sessionId, value.sourceId, value.accessId,
-        value.stepNumber, value.kind, value.method, value.host, value.path);
+      insertBrowserEvent.run(
+        time(),
+        value.sessionId,
+        value.sourceId,
+        value.accessId,
+        value.stepNumber,
+        value.kind,
+        value.method,
+        value.host,
+        value.path,
+      );
     },
     appendSnapshotDeviation(value: SnapshotDeviation): void {
-      if (!identifier(value.sessionId) || !identifier(value.sourceId) || !identifier(value.accessId) ||
-        !integer(value.snapshotNumber, 1) || typeof value.host !== 'string' || value.host.length < 1 || value.host.length > 253 ||
-        typeof value.path !== 'string' || value.path.length < 1 || value.path.length > 2048 ||
-        !['retake', 'unstable', 'limit', 'error'].includes(value.code) || !Array.isArray(value.flags) ||
-        value.flags.some((flag, index) => !flagOrder.includes(flag) || (index > 0 && flagOrder.indexOf(value.flags[index - 1]) >= flagOrder.indexOf(flag))) ||
-        !integer(value.retakes, 0) || !integer(value.elapsedMs, 0)) throw new Error('invalid snapshot deviation');
-      insertSnapshotDeviation.run(time(), value.sessionId, value.sourceId, value.accessId, value.snapshotNumber,
-        value.host, value.path, value.code, JSON.stringify(value.flags), value.retakes, value.elapsedMs);
+      if (
+        !identifier(value.sessionId) ||
+        !identifier(value.sourceId) ||
+        !identifier(value.accessId) ||
+        !integer(value.snapshotNumber, 1) ||
+        typeof value.host !== 'string' ||
+        value.host.length < 1 ||
+        value.host.length > 253 ||
+        typeof value.path !== 'string' ||
+        value.path.length < 1 ||
+        value.path.length > 2048 ||
+        !['retake', 'unstable', 'limit', 'error'].includes(value.code) ||
+        !Array.isArray(value.flags) ||
+        value.flags.some(
+          (flag, index) =>
+            !flagOrder.includes(flag) ||
+            (index > 0 && flagOrder.indexOf(value.flags[index - 1]) >= flagOrder.indexOf(flag)),
+        ) ||
+        !integer(value.retakes, 0) ||
+        !integer(value.elapsedMs, 0)
+      )
+        throw new Error('invalid snapshot deviation');
+      insertSnapshotDeviation.run(
+        time(),
+        value.sessionId,
+        value.sourceId,
+        value.accessId,
+        value.snapshotNumber,
+        value.host,
+        value.path,
+        value.code,
+        JSON.stringify(value.flags),
+        value.retakes,
+        value.elapsedMs,
+      );
     },
   };
 }

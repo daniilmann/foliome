@@ -1,29 +1,91 @@
-const { filterTextSnapshot, filterEventAddress } = require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
+const { filterTextSnapshot, filterEventAddress } =
+  require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
 const { createHmac, randomBytes } = require('node:crypto') as typeof import('node:crypto');
 
 type Cdp = {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
   detach(): Promise<void>;
-  on(event: 'Runtime.executionContextCreated', listener: (event: { context: { id: number; name: string; origin: string; auxData?: { frameId?: string } } }) => void): unknown;
-  on(event: 'Runtime.executionContextDestroyed', listener: (event: { executionContextId: number }) => void): unknown;
+  on(
+    event: 'Runtime.executionContextCreated',
+    listener: (event: {
+      context: { id: number; name: string; origin: string; auxData?: { frameId?: string } };
+    }) => void,
+  ): unknown;
+  on(
+    event: 'Runtime.executionContextDestroyed',
+    listener: (event: { executionContextId: number }) => void,
+  ): unknown;
   on(event: 'Runtime.executionContextsCleared', listener: () => void): unknown;
-  on(event: 'Runtime.bindingCalled', listener: (event: { name: string; payload: string; executionContextId: number }) => void): unknown;
-  on(event: 'Page.frameNavigated', listener: (event: { frame: { id: string; url: string } }) => void): unknown;
-  off(event: 'Runtime.executionContextCreated', listener: (event: { context: { id: number; name: string; origin: string; auxData?: { frameId?: string } } }) => void): unknown;
-  off(event: 'Runtime.executionContextDestroyed', listener: (event: { executionContextId: number }) => void): unknown;
+  on(
+    event: 'Runtime.bindingCalled',
+    listener: (event: { name: string; payload: string; executionContextId: number }) => void,
+  ): unknown;
+  on(
+    event: 'Page.frameNavigated',
+    listener: (event: { frame: { id: string; url: string } }) => void,
+  ): unknown;
+  off(
+    event: 'Runtime.executionContextCreated',
+    listener: (event: {
+      context: { id: number; name: string; origin: string; auxData?: { frameId?: string } };
+    }) => void,
+  ): unknown;
+  off(
+    event: 'Runtime.executionContextDestroyed',
+    listener: (event: { executionContextId: number }) => void,
+  ): unknown;
   off(event: 'Runtime.executionContextsCleared', listener: () => void): unknown;
-  off(event: 'Runtime.bindingCalled', listener: (event: { name: string; payload: string; executionContextId: number }) => void): unknown;
-  off(event: 'Page.frameNavigated', listener: (event: { frame: { id: string; url: string } }) => void): unknown;
+  off(
+    event: 'Runtime.bindingCalled',
+    listener: (event: { name: string; payload: string; executionContextId: number }) => void,
+  ): unknown;
+  off(
+    event: 'Page.frameNavigated',
+    listener: (event: { frame: { id: string; url: string } }) => void,
+  ): unknown;
 };
 type FrameTree = { frame: { id: string; url: string }; childFrames?: FrameTree[] };
 type FrameFact = { index: number; host: string; foreign: boolean; unavailable: boolean };
-type NodeFact = { n: number; frame: number; parent?: number; visible: boolean; role: string; text: string; state?: string; field?: 'empty' | 'filled' | 'sealed'; href?: string; attrs?: Record<string, string> };
+type NodeFact = {
+  n: number;
+  frame: number;
+  parent?: number;
+  visible: boolean;
+  role: string;
+  text: string;
+  state?: string;
+  field?: 'empty' | 'filled' | 'sealed';
+  href?: string;
+  attrs?: Record<string, string>;
+};
 type Secret = { value: string; kind: 'login' | 'password' | 'code' };
 type Rect = { x: number; y: number; width: number; height: number };
 type Geometry = { rect: Rect; runs: Rect[]; mask: boolean; button: boolean; ancestors: number[] };
 type Viewport = { x: number; y: number; width: number; height: number };
-type Observation = { viewport: Viewport; geometry: Geometry[]; width: number; height: number; revision: number; animationIds: string[]; animationTargets: (number | null)[]; viewportStable: boolean; maskAnimationActive: boolean; unsupported: boolean };
-type DocumentFacts = { url: string; title: string; nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[]; parents: (number | null)[]; identities: number[]; classes: ('blocked-payment' | 'blocked-change' | null)[]; semantics: string[]; secrets: Secret[]; embeds: { url: string; visible: boolean }[]; observation: Observation };
+type Observation = {
+  viewport: Viewport;
+  geometry: Geometry[];
+  width: number;
+  height: number;
+  revision: number;
+  animationIds: string[];
+  animationTargets: (number | null)[];
+  viewportStable: boolean;
+  maskAnimationActive: boolean;
+  unsupported: boolean;
+};
+type DocumentFacts = {
+  url: string;
+  title: string;
+  nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[];
+  parents: (number | null)[];
+  identities: number[];
+  classes: ('blocked-payment' | 'blocked-change' | null)[];
+  semantics: string[];
+  secrets: Secret[];
+  embeds: { url: string; visible: boolean }[];
+  observation: Observation;
+};
 
 // This expression is owned by the adapter and runs only in its isolated world.
 const expression = `(() => {
@@ -191,89 +253,198 @@ class NavigationError extends Error {}
 function bounded<T>(operation: () => Promise<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('internal')), deadline);
-    Promise.resolve().then(operation).then(value => { clearTimeout(timer); resolve(value); }, () => { clearTimeout(timer); reject(new Error('internal')); });
+    Promise.resolve()
+      .then(operation)
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          reject(new Error('internal'));
+        },
+      );
   });
 }
-function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function tree(value: unknown): FrameTree {
-  if (!record(value) || !record(value.frame) || typeof value.frame.id !== 'string' || typeof value.frame.url !== 'string' || (value.childFrames !== undefined && !Array.isArray(value.childFrames))) throw new Error('internal');
-  return { frame: { id: value.frame.id, url: value.frame.url }, childFrames: (value.childFrames ?? []).map(tree) };
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
-function host(url: string): string { try { return new URL(url).hostname.toLowerCase().replace(/\.$/, ''); } catch { return ''; } }
+function tree(value: unknown): FrameTree {
+  if (
+    !record(value) ||
+    !record(value.frame) ||
+    typeof value.frame.id !== 'string' ||
+    typeof value.frame.url !== 'string' ||
+    (value.childFrames !== undefined && !Array.isArray(value.childFrames))
+  )
+    throw new Error('internal');
+  return {
+    frame: { id: value.frame.id, url: value.frame.url },
+    childFrames: (value.childFrames ?? []).map(tree),
+  };
+}
+function host(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/\.$/, '');
+  } catch {
+    return '';
+  }
+}
 function configuredHost(value: unknown): string {
   if (typeof value !== 'string' || !value || /[\s/@?#\\:]/.test(value)) throw new Error('internal');
   const parsed = new URL('https://' + value);
-  if (parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.port || parsed.username || parsed.password) throw new Error('internal');
+  if (
+    parsed.pathname !== '/' ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.port ||
+    parsed.username ||
+    parsed.password
+  )
+    throw new Error('internal');
   const normalized = parsed.hostname.toLowerCase().replace(/\.$/, '');
   if (!normalized || normalized.endsWith('.')) throw new Error('internal');
   return normalized;
 }
-function trustedUrl(value: string, sourceHost: string, approvedHosts: ReadonlySet<string>): boolean {
+function trustedUrl(
+  value: string,
+  sourceHost: string,
+  approvedHosts: ReadonlySet<string>,
+): boolean {
   try {
     const parsed = new URL(value);
     const authority = value.match(/^https:\/\/([^/?#]*)/i)?.[1];
     const hostname = parsed.hostname.toLowerCase().replace(/\.$/, '');
-    return !!authority && !authority.includes('@') && parsed.protocol === 'https:' && !parsed.port && !parsed.username && !parsed.password &&
-      (hostname === sourceHost || hostname.endsWith('.' + sourceHost) || approvedHosts.has(hostname));
-  } catch { return false; }
+    return (
+      !!authority &&
+      !authority.includes('@') &&
+      parsed.protocol === 'https:' &&
+      !parsed.port &&
+      !parsed.username &&
+      !parsed.password &&
+      (hostname === sourceHost ||
+        hostname.endsWith('.' + sourceHost) ||
+        approvedHosts.has(hostname))
+    );
+  } catch {
+    return false;
+  }
 }
 
-async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: readonly string[] }) {
+async function prepare(
+  cdp: Cdp,
+  config: { sourceHost: string; approvedHosts?: readonly string[] },
+) {
   const descriptorKey = randomBytes(32);
   let closed = false;
   let scriptId: string | undefined;
   const contexts = new Map<number, { frameId: string; origin: string }>();
   const frameUrls = new Map<string, string>();
   const history = new Map<string, Secret>();
-  let historySize = 0, overflow = false, manualInputSeen = false, observationFinished = false;
+  let historySize = 0,
+    overflow = false,
+    manualInputSeen = false,
+    observationFinished = false;
   let sourceHost = '';
   let approvedHosts = new Set<string>();
   const remember = (secret: Secret) => {
     if (observationFinished || !secret.value) return;
     const key = secret.kind + '\0' + secret.value;
     if (history.has(key)) return;
-    if (history.size >= 4096 || historySize + secret.value.length > 1024 * 1024) { overflow = true; return; }
+    if (history.size >= 4096 || historySize + secret.value.length > 1024 * 1024) {
+      overflow = true;
+      return;
+    }
     history.set(key, secret);
     historySize += secret.value.length;
   };
-  const contextCreated = ({ context }: { context: { id: number; name: string; origin: string; auxData?: { frameId?: string } } }) => {
-    if (context.name === worldName && context.auxData?.frameId && trustedUrl(context.origin, sourceHost, approvedHosts)) contexts.set(context.id, { frameId: context.auxData.frameId, origin: context.origin });
+  const contextCreated = ({
+    context,
+  }: {
+    context: { id: number; name: string; origin: string; auxData?: { frameId?: string } };
+  }) => {
+    if (
+      context.name === worldName &&
+      context.auxData?.frameId &&
+      trustedUrl(context.origin, sourceHost, approvedHosts)
+    )
+      contexts.set(context.id, { frameId: context.auxData.frameId, origin: context.origin });
   };
-  const contextDestroyed = ({ executionContextId }: { executionContextId: number }) => { contexts.delete(executionContextId); };
-  const contextsCleared = () => { contexts.clear(); };
-  const frameNavigated = ({ frame }: { frame: { id: string; url: string } }) => { frameUrls.set(frame.id, frame.url); };
+  const contextDestroyed = ({ executionContextId }: { executionContextId: number }) => {
+    contexts.delete(executionContextId);
+  };
+  const contextsCleared = () => {
+    contexts.clear();
+  };
+  const frameNavigated = ({ frame }: { frame: { id: string; url: string } }) => {
+    frameUrls.set(frame.id, frame.url);
+  };
   const bindingCalled = (event: { name: string; payload: string; executionContextId: number }) => {
     if (closed || event.name !== bindingName) return;
     const context = contexts.get(event.executionContextId);
     const url = context && frameUrls.get(context.frameId);
-    if (!context || !url || !trustedUrl(url, sourceHost, approvedHosts) || new URL(url).origin !== context.origin) return;
+    if (
+      !context ||
+      !url ||
+      !trustedUrl(url, sourceHost, approvedHosts) ||
+      new URL(url).origin !== context.origin
+    )
+      return;
     try {
       const data: unknown = JSON.parse(event.payload);
-      if (!record(data) || typeof data.manual !== 'boolean' || typeof data.value !== 'string' || !['login', 'password', 'code'].includes(String(data.kind))) { overflow = true; return; }
+      if (
+        !record(data) ||
+        typeof data.manual !== 'boolean' ||
+        typeof data.value !== 'string' ||
+        !['login', 'password', 'code'].includes(String(data.kind))
+      ) {
+        overflow = true;
+        return;
+      }
       manualInputSeen ||= data.manual;
       remember({ value: data.value, kind: data.kind as Secret['kind'] });
-    } catch { overflow = true; }
+    } catch {
+      overflow = true;
+    }
   };
   const removeListeners = () => {
     if (typeof cdp.off !== 'function') return;
-    cdp.off('Runtime.executionContextCreated', contextCreated); cdp.off('Runtime.executionContextDestroyed', contextDestroyed);
-    cdp.off('Runtime.executionContextsCleared', contextsCleared); cdp.off('Runtime.bindingCalled', bindingCalled); cdp.off('Page.frameNavigated', frameNavigated);
+    cdp.off('Runtime.executionContextCreated', contextCreated);
+    cdp.off('Runtime.executionContextDestroyed', contextDestroyed);
+    cdp.off('Runtime.executionContextsCleared', contextsCleared);
+    cdp.off('Runtime.bindingCalled', bindingCalled);
+    cdp.off('Page.frameNavigated', frameNavigated);
   };
   try {
     if (!config || !Array.isArray(config.approvedHosts ?? [])) throw new Error();
     sourceHost = configuredHost(config.sourceHost);
     approvedHosts = new Set((config.approvedHosts ?? []).map(configuredHost));
-    cdp.on('Runtime.executionContextCreated', contextCreated); cdp.on('Runtime.executionContextDestroyed', contextDestroyed);
-    cdp.on('Runtime.executionContextsCleared', contextsCleared); cdp.on('Runtime.bindingCalled', bindingCalled); cdp.on('Page.frameNavigated', frameNavigated);
+    cdp.on('Runtime.executionContextCreated', contextCreated);
+    cdp.on('Runtime.executionContextDestroyed', contextDestroyed);
+    cdp.on('Runtime.executionContextsCleared', contextsCleared);
+    cdp.on('Runtime.bindingCalled', bindingCalled);
+    cdp.on('Page.frameNavigated', frameNavigated);
     await bounded(() => cdp.send('Page.enable'));
     const initial = await bounded(() => cdp.send('Page.getFrameTree'));
     if (!record(initial)) throw new Error();
-    const rememberFrames = (frame: FrameTree) => { frameUrls.set(frame.frame.id, frame.frame.url); for (const child of frame.childFrames ?? []) rememberFrames(child); };
+    const rememberFrames = (frame: FrameTree) => {
+      frameUrls.set(frame.frame.id, frame.frame.url);
+      for (const child of frame.childFrames ?? []) rememberFrames(child);
+    };
     rememberFrames(tree(initial.frameTree));
     await bounded(() => cdp.send('Runtime.enable'));
-    await bounded(() => cdp.send('Runtime.addBinding', { name: bindingName, executionContextName: worldName }));
+    await bounded(() =>
+      cdp.send('Runtime.addBinding', { name: bindingName, executionContextName: worldName }),
+    );
     const script = observationScript(sourceHost, approvedHosts);
-    const registered = await bounded(() => cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: script, worldName, runImmediately: true }));
+    const registered = await bounded(() =>
+      cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+        source: script,
+        worldName,
+        runImmediately: true,
+      }),
+    );
     if (!record(registered) || typeof registered.identifier !== 'string') throw new Error();
     scriptId = registered.identifier;
     async function collect(snapshot: number) {
@@ -289,211 +460,476 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           if (!record(response)) throw new Error();
           const root = tree(response.frameTree);
           const rootHost = host(root.frame.url);
-          if (!rootHost || !trustedUrl(root.frame.url, sourceHost, approvedHosts)) throw new Error();
-          const frames: FrameFact[] = [], nodes: NodeFact[] = [], secrets: Secret[] = [];
+          if (!rootHost || !trustedUrl(root.frame.url, sourceHost, approvedHosts))
+            throw new Error();
+          const frames: FrameFact[] = [],
+            nodes: NodeFact[] = [],
+            secrets: Secret[] = [];
           let page: { url: string; title: string } | undefined;
           let observation: Observation | undefined;
           let rootNodeCount = 0;
           let rootContext = 0;
-          let rootIdentities: number[] = [], rootClasses: DocumentFacts['classes'] = [];
+          let rootIdentities: number[] = [],
+            rootClasses: DocumentFacts['classes'] = [];
           let rootSemantics: string[] = [];
           const embeds: { url: string; visible: boolean }[] = [];
-          const visit = async (frame: FrameTree, foreignAncestor: boolean, parentAccessible: boolean): Promise<void> => {
+          const visit = async (
+            frame: FrameTree,
+            foreignAncestor: boolean,
+            parentAccessible: boolean,
+          ): Promise<void> => {
             if (frames.length >= 256) throw new Error();
             const frameHost = host(frame.frame.url);
-            const foreign = foreignAncestor || !trustedUrl(frame.frame.url, sourceHost, approvedHosts);
+            const foreign =
+              foreignAncestor || !trustedUrl(frame.frame.url, sourceHost, approvedHosts);
             const index = frames.length;
             const fact: FrameFact = { index, host: frameHost, foreign, unavailable: false };
             frames.push(fact);
             if (!foreign && parentAccessible) {
-              const base = nodes.length, secretBase = secrets.length, embedBase = embeds.length;
+              const base = nodes.length,
+                secretBase = secrets.length,
+                embedBase = embeds.length;
               try {
-                const world = await send('Page.createIsolatedWorld', { frameId: frame.frame.id, worldName });
-                if (!record(world) || !Number.isSafeInteger(world.executionContextId)) throw new Error();
-                const evaluation = await send('Runtime.evaluate', { expression, contextId: world.executionContextId, returnByValue: true });
-                if (!record(evaluation) || evaluation.exceptionDetails || !record(evaluation.result) || !record(evaluation.result.value)) throw new Error();
+                const world = await send('Page.createIsolatedWorld', {
+                  frameId: frame.frame.id,
+                  worldName,
+                });
+                if (!record(world) || !Number.isSafeInteger(world.executionContextId))
+                  throw new Error();
+                const evaluation = await send('Runtime.evaluate', {
+                  expression,
+                  contextId: world.executionContextId,
+                  returnByValue: true,
+                });
+                if (
+                  !record(evaluation) ||
+                  evaluation.exceptionDetails ||
+                  !record(evaluation.result) ||
+                  !record(evaluation.result.value)
+                )
+                  throw new Error();
                 const data = evaluation.result.value as unknown as DocumentFacts;
-                if (typeof data.url !== 'string' || typeof data.title !== 'string' || !Array.isArray(data.nodes) || !Array.isArray(data.parents) || data.nodes.length !== data.parents.length || !Array.isArray(data.secrets) || !Array.isArray(data.embeds)) throw new Error();
-                if (!trustedUrl(data.url, sourceHost, approvedHosts) || new URL(data.url).href !== new URL(frame.frame.url).href || host(data.url) !== frameHost) throw new NavigationError();
-                if (index === 0) { page = { url: data.url, title: data.title }; observation = data.observation; rootNodeCount = data.nodes.length; rootContext = world.executionContextId as number; rootIdentities = data.identities; rootClasses = data.classes; rootSemantics = data.semantics; }
+                if (
+                  typeof data.url !== 'string' ||
+                  typeof data.title !== 'string' ||
+                  !Array.isArray(data.nodes) ||
+                  !Array.isArray(data.parents) ||
+                  data.nodes.length !== data.parents.length ||
+                  !Array.isArray(data.secrets) ||
+                  !Array.isArray(data.embeds)
+                )
+                  throw new Error();
+                if (
+                  !trustedUrl(data.url, sourceHost, approvedHosts) ||
+                  new URL(data.url).href !== new URL(frame.frame.url).href ||
+                  host(data.url) !== frameHost
+                )
+                  throw new NavigationError();
+                if (index === 0) {
+                  page = { url: data.url, title: data.title };
+                  observation = data.observation;
+                  rootNodeCount = data.nodes.length;
+                  rootContext = world.executionContextId as number;
+                  rootIdentities = data.identities;
+                  rootClasses = data.classes;
+                  rootSemantics = data.semantics;
+                }
                 for (let i = 0; i < data.nodes.length; i++) {
                   const parent = data.parents[i];
-                  if (parent !== null && (!Number.isSafeInteger(parent) || parent < 0 || parent >= i)) throw new Error();
-                  nodes.push({ ...data.nodes[i], n: base + i + 1, frame: index, ...(parent === null ? {} : { parent: base + parent + 1 }) });
+                  if (
+                    parent !== null &&
+                    (!Number.isSafeInteger(parent) || parent < 0 || parent >= i)
+                  )
+                    throw new Error();
+                  nodes.push({
+                    ...data.nodes[i],
+                    n: base + i + 1,
+                    frame: index,
+                    ...(parent === null ? {} : { parent: base + parent + 1 }),
+                  });
                 }
                 secrets.push(...data.secrets);
                 embeds.push(...data.embeds);
               } catch (error) {
-                nodes.length = base; secrets.length = secretBase; embeds.length = embedBase;
+                nodes.length = base;
+                secrets.length = secretBase;
+                embeds.length = embedBase;
                 if (index === 0 || error instanceof NavigationError) throw new Error();
                 fact.unavailable = true;
               }
             } else if (!foreign) fact.unavailable = true;
             for (const child of frame.childFrames ?? []) {
-              const matches = embeds.filter(e => e.url === child.frame.url);
-              await visit(child, foreign, parentAccessible && !fact.unavailable && matches.length === 1 && matches[0].visible);
+              const matches = embeds.filter((e) => e.url === child.frame.url);
+              await visit(
+                child,
+                foreign,
+                parentAccessible && !fact.unavailable && matches.length === 1 && matches[0].visible,
+              );
             }
           };
           await visit(root, false, true);
           for (const embed of embeds) {
             const embedHost = host(embed.url);
-            if (embedHost && !trustedUrl(embed.url, sourceHost, approvedHosts) && !frames.some(f => f.host === embedHost && f.foreign)) {
+            if (
+              embedHost &&
+              !trustedUrl(embed.url, sourceHost, approvedHosts) &&
+              !frames.some((f) => f.host === embedHost && f.foreign)
+            ) {
               if (frames.length >= 256) throw new Error();
-              frames.push({ index: frames.length, host: embedHost, foreign: true, unavailable: true });
+              frames.push({
+                index: frames.length,
+                host: embedHost,
+                foreign: true,
+                unavailable: true,
+              });
             }
           }
           const verify = await send('Page.getFrameTree');
-          if (!record(verify) || JSON.stringify(tree(verify.frameTree)) !== JSON.stringify(root) || !page || closed) throw new Error();
-          return { facts: { snapshot, page, frames, nodes, secrets }, observation, rootNodeCount, rootContext, rootIdentities, rootClasses, rootSemantics };
+          if (
+            !record(verify) ||
+            JSON.stringify(tree(verify.frameTree)) !== JSON.stringify(root) ||
+            !page ||
+            closed
+          )
+            throw new Error();
+          return {
+            facts: { snapshot, page, frames, nodes, secrets },
+            observation,
+            rootNodeCount,
+            rootContext,
+            rootIdentities,
+            rootClasses,
+            rootSemantics,
+          };
         });
         if (closed) throw new Error();
         if (overflow) throw new Error();
         result.facts.secrets.push(...history.values());
         return result;
-      } catch { throw new Error('internal'); }
+      } catch {
+        throw new Error('internal');
+      }
     }
     function projectTargets(result: Awaited<ReturnType<typeof collect>>) {
-      const { facts, rootNodeCount, rootContext, rootIdentities, rootClasses, rootSemantics } = result;
+      const { facts, rootNodeCount, rootContext, rootIdentities, rootClasses, rootSemantics } =
+        result;
       const filtered = filterTextSnapshot(facts);
-      if (!filtered.ok || closed || !Array.isArray(rootIdentities) || rootIdentities.length !== rootNodeCount || !rootIdentities.every(id => Number.isSafeInteger(id) && id > 0) || !Array.isArray(rootClasses) || rootClasses.length !== rootNodeCount || !rootClasses.every(value => value === null || value === 'blocked-payment' || value === 'blocked-change') || !Array.isArray(rootSemantics) || rootSemantics.length !== rootNodeCount || !rootSemantics.every(value => typeof value === 'string')) throw new Error('internal');
-      const elements = new Map(filtered.snapshot.elements.map(element => [element.n, element]));
-      const documentDescriptor = createHmac('sha256', descriptorKey).update(JSON.stringify({ page: facts.page, frames: facts.frames, nodes: facts.nodes, classes: rootClasses, semantics: rootSemantics })).digest('hex');
+      if (
+        !filtered.ok ||
+        closed ||
+        !Array.isArray(rootIdentities) ||
+        rootIdentities.length !== rootNodeCount ||
+        !rootIdentities.every((id) => Number.isSafeInteger(id) && id > 0) ||
+        !Array.isArray(rootClasses) ||
+        rootClasses.length !== rootNodeCount ||
+        !rootClasses.every(
+          (value) => value === null || value === 'blocked-payment' || value === 'blocked-change',
+        ) ||
+        !Array.isArray(rootSemantics) ||
+        rootSemantics.length !== rootNodeCount ||
+        !rootSemantics.every((value) => typeof value === 'string')
+      )
+        throw new Error('internal');
+      const elements = new Map(filtered.snapshot.elements.map((element) => [element.n, element]));
+      const documentDescriptor = createHmac('sha256', descriptorKey)
+        .update(
+          JSON.stringify({
+            page: facts.page,
+            frames: facts.frames,
+            nodes: facts.nodes,
+            classes: rootClasses,
+            semantics: rootSemantics,
+          }),
+        )
+        .digest('hex');
       const candidates = facts.nodes.slice(0, rootNodeCount).map((node, index) => {
         const element = elements.get(node.n);
-        return { nodeNumber: node.n, identity: `${rootContext}:${rootIdentities[index]}`, descriptor: `${documentDescriptor}:${node.n}`, visible: node.visible && !!element, enabled: !node.state?.split(' ').includes('disabled'), sourceFrame: node.frame === 0, secretField: !!node.field, prohibited: rootClasses[index], text: element?.text ?? '' };
+        return {
+          nodeNumber: node.n,
+          identity: `${rootContext}:${rootIdentities[index]}`,
+          descriptor: `${documentDescriptor}:${node.n}`,
+          visible: node.visible && !!element,
+          enabled: !node.state?.split(' ').includes('disabled'),
+          sourceFrame: node.frame === 0,
+          secretField: !!node.field,
+          prohibited: rootClasses[index],
+          text: element?.text ?? '',
+        };
       });
       return { candidates, elements };
     }
     return {
-    eventAddress(raw: string) {
-      if (closed || overflow) throw new Error('internal');
-      return filterEventAddress(raw, [...history.values()]);
-    },
-    loginObservations() {
-      if (closed) throw new Error('internal');
-      return { manualInputSeen, hasKnownSecret: history.size > 0 || overflow };
-    },
-    finishLoginObservation() {
-      if (closed) throw new Error('internal');
-      observationFinished = true;
-    },
-    async collectText(snapshot: number): Promise<unknown> {
-      const { facts } = await collect(snapshot);
-      if (closed) throw new Error('internal');
-      return facts;
-    },
-    async observeTargets(snapshot: number) {
-      const result = await collect(snapshot);
-      return { snapshotNumber: snapshot, candidates: projectTargets(result).candidates };
-    },
-    async readObservedTarget(snapshot: number, nodeNumber: number, proof: { identity: string; descriptor: string }, deep = false): Promise<{ ok: true; text: string } | { ok: false; code: 'stale' | 'internal' }> {
-      try {
-        const result = await collect(snapshot);
-        const { candidates, elements } = projectTargets(result);
-        const matches = candidates.filter(candidate => candidate.nodeNumber === nodeNumber);
-        const target = matches[0];
-        if (matches.length !== 1 || !proof || target.identity !== proof.identity || target.descriptor !== proof.descriptor || !target.visible || !target.enabled || !target.sourceFrame || target.secretField || target.prohibited !== null) return { ok: false, code: 'stale' };
-        const included = new Set([nodeNumber]);
-        const texts: string[] = [];
-        for (const node of result.facts.nodes.slice(0, result.rootNodeCount)) {
-          if (deep && node.parent !== undefined && included.has(node.parent)) included.add(node.n);
-          if (included.has(node.n)) {
-            const element = elements.get(node.n);
-            if (element?.text) texts.push(element.text);
-          }
-        }
-        return { ok: true, text: texts.join(' ') };
-      } catch { return { ok: false, code: 'internal' }; }
-    },
-    async collectFrame(snapshot: number) {
-      const collected = await collect(snapshot);
-      const { facts, observation: observed, rootNodeCount, rootContext } = collected;
-      const binding = { snapshotNumber: snapshot, candidates: projectTargets(collected).candidates };
-      if (closed) throw new Error('internal');
-      const filtered = filterTextSnapshot(facts);
-      if (!observed || !filtered.ok) throw new Error('internal');
-      let plan: { masks: Rect[]; labels: { x: number; y: number; number: number }[] } | null = null;
-      try {
-        // CDP exposes closed shadow roots without executing page-owned code.
-        const dom = await bounded(() => cdp.send('DOM.getDocument', { depth: -1, pierce: true }));
+      eventAddress(raw: string) {
+        if (closed || overflow) throw new Error('internal');
+        return filterEventAddress(raw, [...history.values()]);
+      },
+      loginObservations() {
         if (closed) throw new Error('internal');
-        const shadowRoots: number[] = [];
-        const findShadowHosts = (value: unknown): void => {
-          if (Array.isArray(value)) { for (const child of value) findShadowHosts(child); return; }
-          if (!record(value)) return;
-          if (Array.isArray(value.shadowRoots) && value.shadowRoots.some(root => !record(root) || root.shadowRootType !== 'user-agent')) {
-            for (const root of value.shadowRoots) {
-              if (!record(root)) throw new Error();
-              if (root.shadowRootType === 'user-agent') continue;
-              if (!Number.isSafeInteger(root.backendNodeId)) throw new Error();
-              shadowRoots.push(root.backendNodeId as number);
-              findShadowHosts(root);
+        return { manualInputSeen, hasKnownSecret: history.size > 0 || overflow };
+      },
+      finishLoginObservation() {
+        if (closed) throw new Error('internal');
+        observationFinished = true;
+      },
+      async collectText(snapshot: number): Promise<unknown> {
+        const { facts } = await collect(snapshot);
+        if (closed) throw new Error('internal');
+        return facts;
+      },
+      async observeTargets(snapshot: number) {
+        const result = await collect(snapshot);
+        return { snapshotNumber: snapshot, candidates: projectTargets(result).candidates };
+      },
+      async readObservedTarget(
+        snapshot: number,
+        nodeNumber: number,
+        proof: { identity: string; descriptor: string },
+        deep = false,
+      ): Promise<{ ok: true; text: string } | { ok: false; code: 'stale' | 'internal' }> {
+        try {
+          const result = await collect(snapshot);
+          const { candidates, elements } = projectTargets(result);
+          const matches = candidates.filter((candidate) => candidate.nodeNumber === nodeNumber);
+          const target = matches[0];
+          if (
+            matches.length !== 1 ||
+            !proof ||
+            target.identity !== proof.identity ||
+            target.descriptor !== proof.descriptor ||
+            !target.visible ||
+            !target.enabled ||
+            !target.sourceFrame ||
+            target.secretField ||
+            target.prohibited !== null
+          )
+            return { ok: false, code: 'stale' };
+          const included = new Set([nodeNumber]);
+          const texts: string[] = [];
+          for (const node of result.facts.nodes.slice(0, result.rootNodeCount)) {
+            if (deep && node.parent !== undefined && included.has(node.parent))
+              included.add(node.n);
+            if (included.has(node.n)) {
+              const element = elements.get(node.n);
+              if (element?.text) texts.push(element.text);
             }
           }
-          for (const key of ['children', 'contentDocument']) if (value[key]) findShadowHosts(value[key]);
-        };
-        if (!record(dom) || !record(dom.root)) throw new Error();
-        findShadowHosts(dom.root);
-        if (shadowRoots.length > 256) throw new Error();
-        if (observed.unsupported || observed.geometry.length !== rootNodeCount ||
-            !Number.isSafeInteger(observed.width) || !Number.isSafeInteger(observed.height) || observed.width < 1 || observed.height < 1) throw new Error();
-        const masks: Rect[] = [], labels: { x: number; y: number; number: number }[] = [];
-        const elements = new Map(filtered.snapshot.elements.map(element => [element.n, element]));
-        const add = (r: Rect, padding = 4) => {
-          if (![r.x, r.y, r.width, r.height].every(Number.isFinite)) throw new Error();
-          if (r.width <= 0 || r.height <= 0) return;
-          const x = Math.max(0, Math.floor(r.x - padding)), y = Math.max(0, Math.floor(r.y - padding));
-          const right = Math.min(observed.width, Math.ceil(r.x + r.width + padding));
-          const bottom = Math.min(observed.height, Math.ceil(r.y + r.height + padding));
-          if (right > x && bottom > y) masks.push({ x, y, width: right - x, height: bottom - y });
-        };
-        const protectedNodes = new Set<number>();
-        for (const backendNodeId of shadowRoots) {
-          const resolved = await bounded(() => cdp.send('DOM.resolveNode', { backendNodeId, executionContextId: rootContext }));
-          if (!record(resolved) || !record(resolved.object) || typeof resolved.object.objectId !== 'string') throw new Error();
-          const objectId = resolved.object.objectId;
-          let result: unknown;
-          try { result = await bounded(() => cdp.send('Runtime.callFunctionOn', { objectId, functionDeclaration: shadowGeometry, returnByValue: true })); }
-          finally { await bounded(() => cdp.send('Runtime.releaseObject', { objectId })); }
-          if (!record(result) || result.exceptionDetails || !record(result.result) || !record(result.result.value)) throw new Error();
-          const value = result.result.value;
-          if (!Number.isSafeInteger(value.hostId) || !Array.isArray(value.rects) || value.rects.length > 20001) throw new Error();
-          const index = collected.rootIdentities.indexOf(value.hostId as number);
-          if (index < 0) throw new Error();
-          protectedNodes.add(index);
-          for (const rect of value.rects) { if (!record(rect)) throw new Error(); add(rect as unknown as Rect); }
+          return { ok: true, text: texts.join(' ') };
+        } catch {
+          return { ok: false, code: 'internal' };
         }
-        for (let i = 0; i < rootNodeCount; i++) {
-          const node = facts.nodes[i], geometry = observed.geometry[i], element = elements.get(node.n);
-          if (geometry.mask) { add(geometry.rect, node.role === 'input' && node.field && observed.viewport ? 0 : 4); protectedNodes.add(i); }
-          // Comparing with the domain result also covers split secrets across nodes.
-          const normalized = node.text.normalize('NFKC').replace(/\p{White_Space}/gu, ' ').replace(/[\p{Cf}\p{Cc}]/gu, '').replace(/ +/g, ' ');
-          if (!element || element.text !== normalized) {
-            if (geometry.button) { add(geometry.rect); protectedNodes.add(i); }
-            else if (geometry.runs.length) { for (const run of geometry.runs) add(run); protectedNodes.add(i); }
+      },
+      async collectFrame(snapshot: number) {
+        const collected = await collect(snapshot);
+        const { facts, observation: observed, rootNodeCount, rootContext } = collected;
+        const binding = {
+          snapshotNumber: snapshot,
+          candidates: projectTargets(collected).candidates,
+        };
+        if (closed) throw new Error('internal');
+        const filtered = filterTextSnapshot(facts);
+        if (!observed || !filtered.ok) throw new Error('internal');
+        let plan: { masks: Rect[]; labels: { x: number; y: number; number: number }[] } | null =
+          null;
+        try {
+          // CDP exposes closed shadow roots without executing page-owned code.
+          const dom = await bounded(() => cdp.send('DOM.getDocument', { depth: -1, pierce: true }));
+          if (closed) throw new Error('internal');
+          const shadowRoots: number[] = [];
+          const findShadowHosts = (value: unknown): void => {
+            if (Array.isArray(value)) {
+              for (const child of value) findShadowHosts(child);
+              return;
+            }
+            if (!record(value)) return;
+            if (
+              Array.isArray(value.shadowRoots) &&
+              value.shadowRoots.some(
+                (root) => !record(root) || root.shadowRootType !== 'user-agent',
+              )
+            ) {
+              for (const root of value.shadowRoots) {
+                if (!record(root)) throw new Error();
+                if (root.shadowRootType === 'user-agent') continue;
+                if (!Number.isSafeInteger(root.backendNodeId)) throw new Error();
+                shadowRoots.push(root.backendNodeId as number);
+                findShadowHosts(root);
+              }
+            }
+            for (const key of ['children', 'contentDocument'])
+              if (value[key]) findShadowHosts(value[key]);
+          };
+          if (!record(dom) || !record(dom.root)) throw new Error();
+          findShadowHosts(dom.root);
+          if (shadowRoots.length > 256) throw new Error();
+          if (
+            observed.unsupported ||
+            observed.geometry.length !== rootNodeCount ||
+            !Number.isSafeInteger(observed.width) ||
+            !Number.isSafeInteger(observed.height) ||
+            observed.width < 1 ||
+            observed.height < 1
+          )
+            throw new Error();
+          const masks: Rect[] = [],
+            labels: { x: number; y: number; number: number }[] = [];
+          const elements = new Map(
+            filtered.snapshot.elements.map((element) => [element.n, element]),
+          );
+          const add = (r: Rect, padding = 4) => {
+            if (![r.x, r.y, r.width, r.height].every(Number.isFinite)) throw new Error();
+            if (r.width <= 0 || r.height <= 0) return;
+            const x = Math.max(0, Math.floor(r.x - padding)),
+              y = Math.max(0, Math.floor(r.y - padding));
+            const right = Math.min(observed.width, Math.ceil(r.x + r.width + padding));
+            const bottom = Math.min(observed.height, Math.ceil(r.y + r.height + padding));
+            if (right > x && bottom > y) masks.push({ x, y, width: right - x, height: bottom - y });
+          };
+          const protectedNodes = new Set<number>();
+          for (const backendNodeId of shadowRoots) {
+            const resolved = await bounded(() =>
+              cdp.send('DOM.resolveNode', { backendNodeId, executionContextId: rootContext }),
+            );
+            if (
+              !record(resolved) ||
+              !record(resolved.object) ||
+              typeof resolved.object.objectId !== 'string'
+            )
+              throw new Error();
+            const objectId = resolved.object.objectId;
+            let result: unknown;
+            try {
+              result = await bounded(() =>
+                cdp.send('Runtime.callFunctionOn', {
+                  objectId,
+                  functionDeclaration: shadowGeometry,
+                  returnByValue: true,
+                }),
+              );
+            } finally {
+              await bounded(() => cdp.send('Runtime.releaseObject', { objectId }));
+            }
+            if (
+              !record(result) ||
+              result.exceptionDetails ||
+              !record(result.result) ||
+              !record(result.result.value)
+            )
+              throw new Error();
+            const value = result.result.value;
+            if (
+              !Number.isSafeInteger(value.hostId) ||
+              !Array.isArray(value.rects) ||
+              value.rects.length > 20001
+            )
+              throw new Error();
+            const index = collected.rootIdentities.indexOf(value.hostId as number);
+            if (index < 0) throw new Error();
+            protectedNodes.add(index);
+            for (const rect of value.rects) {
+              if (!record(rect)) throw new Error();
+              add(rect as unknown as Rect);
+            }
           }
-          const r = geometry.rect;
-          if (element && r.width > 0 && r.height > 0 && r.x < observed.width && r.y < observed.height && r.x + r.width > 0 && r.y + r.height > 0)
-            labels.push({ x: Math.max(0, Math.floor(r.x)), y: Math.max(0, Math.floor(r.y)), number: element.n });
+          for (let i = 0; i < rootNodeCount; i++) {
+            const node = facts.nodes[i],
+              geometry = observed.geometry[i],
+              element = elements.get(node.n);
+            if (geometry.mask) {
+              add(geometry.rect, node.role === 'input' && node.field && observed.viewport ? 0 : 4);
+              protectedNodes.add(i);
+            }
+            // Comparing with the domain result also covers split secrets across nodes.
+            const normalized = node.text
+              .normalize('NFKC')
+              .replace(/\p{White_Space}/gu, ' ')
+              .replace(/[\p{Cf}\p{Cc}]/gu, '')
+              .replace(/ +/g, ' ');
+            if (!element || element.text !== normalized) {
+              if (geometry.button) {
+                add(geometry.rect);
+                protectedNodes.add(i);
+              } else if (geometry.runs.length) {
+                for (const run of geometry.runs) add(run);
+                protectedNodes.add(i);
+              }
+            }
+            const r = geometry.rect;
+            if (
+              element &&
+              r.width > 0 &&
+              r.height > 0 &&
+              r.x < observed.width &&
+              r.y < observed.height &&
+              r.x + r.width > 0 &&
+              r.y + r.height > 0
+            )
+              labels.push({
+                x: Math.max(0, Math.floor(r.x)),
+                y: Math.max(0, Math.floor(r.y)),
+                number: element.n,
+              });
+          }
+          observed.maskAnimationActive =
+            !Array.isArray(observed.animationTargets) ||
+            observed.animationTargets.some(
+              (target) =>
+                target === null ||
+                [...protectedNodes].some((index) =>
+                  observed.geometry[index].ancestors.includes(target),
+                ),
+            );
+          plan = { masks, labels };
+        } catch {
+          plan = null;
         }
-        observed.maskAnimationActive = !Array.isArray(observed.animationTargets) || observed.animationTargets.some(target =>
-          target === null || [...protectedNodes].some(index => observed.geometry[index].ancestors.includes(target)));
-        plan = { masks, labels };
-      } catch { plan = null; }
-      if (closed) throw new Error('internal');
-      return { facts, plan, binding, viewport: observed.viewport ?? { x: NaN, y: NaN, width: NaN, height: NaN }, revision: observed.revision, animationIds: [`document:${rootContext}`, ...observed.animationIds], viewportStable: observed.viewportStable, maskAnimationActive: observed.maskAnimationActive };
-    },
-    async close(): Promise<void> {
-      if (closed) return;
-      closed = true;
-      removeListeners(); contexts.clear(); frameUrls.clear(); history.clear(); historySize = 0;
-      let failed = false;
-      try { if (scriptId) await bounded(() => cdp.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId })); } catch { failed = true; }
-      try { await bounded(() => cdp.detach()); } catch { failed = true; }
-      if (failed) throw new Error('internal');
-    },
+        if (closed) throw new Error('internal');
+        return {
+          facts,
+          plan,
+          binding,
+          viewport: observed.viewport ?? { x: NaN, y: NaN, width: NaN, height: NaN },
+          revision: observed.revision,
+          animationIds: [`document:${rootContext}`, ...observed.animationIds],
+          viewportStable: observed.viewportStable,
+          maskAnimationActive: observed.maskAnimationActive,
+        };
+      },
+      async close(): Promise<void> {
+        if (closed) return;
+        closed = true;
+        removeListeners();
+        contexts.clear();
+        frameUrls.clear();
+        history.clear();
+        historySize = 0;
+        let failed = false;
+        try {
+          if (scriptId)
+            await bounded(() =>
+              cdp.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId }),
+            );
+        } catch {
+          failed = true;
+        }
+        try {
+          await bounded(() => cdp.detach());
+        } catch {
+          failed = true;
+        }
+        if (failed) throw new Error('internal');
+      },
     };
-  } catch { closed = true; removeListeners(); contexts.clear(); frameUrls.clear(); history.clear(); try { await bounded(() => cdp.detach()); } catch {} throw new Error('internal'); }
+  } catch {
+    closed = true;
+    removeListeners();
+    contexts.clear();
+    frameUrls.clear();
+    history.clear();
+    try {
+      await bounded(() => cdp.detach());
+    } catch {}
+    throw new Error('internal');
+  }
 }
 
 export declare const prepareDomCollector: typeof prepare;

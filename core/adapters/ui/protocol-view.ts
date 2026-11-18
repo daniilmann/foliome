@@ -43,27 +43,55 @@ const reasons: Readonly<Record<string, string>> = {
 function escapeText(value: string | number): string {
   return String(value).replace(/[&<>"']/g, (character) => {
     switch (character) {
-      case '&': return '&amp;';
-      case '<': return '&lt;';
-      case '>': return '&gt;';
-      case '"': return '&quot;';
-      default: return '&#39;';
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      default:
+        return '&#39;';
     }
   });
 }
 
 function render(rows: readonly ProtocolRow[]): string {
-  const headings = ['Время UTC', 'Источник', 'Доступ', 'Участник', 'Метод', 'Снимок', 'Узел', 'Подпись', 'Вердикт', 'Причина', 'Код', 'Итог'];
+  const headings = [
+    'Время UTC',
+    'Источник',
+    'Доступ',
+    'Участник',
+    'Метод',
+    'Снимок',
+    'Узел',
+    'Подпись',
+    'Вердикт',
+    'Причина',
+    'Код',
+    'Итог',
+  ];
   const header = headings.map((heading) => `<th scope="col">${heading}</th>`).join('');
-  const body = rows.map((row) => {
-    const values = [
-      new Date(row.atMs).toISOString(), row.sourceId, row.accessId, row.actor, row.method,
-      row.snapshotNumber, row.nodeNumber ?? '', row.label ?? '',
-      row.decision === 'allowed' ? 'разрешено' : 'заблокировано',
-      Object.hasOwn(reasons, row.reason) ? reasons[row.reason] : '', row.reason, row.outcome ?? '',
-    ];
-    return `<tr>${values.map((value) => `<td>${escapeText(value)}</td>`).join('')}</tr>`;
-  }).join('');
+  const body = rows
+    .map((row) => {
+      const values = [
+        new Date(row.atMs).toISOString(),
+        row.sourceId,
+        row.accessId,
+        row.actor,
+        row.method,
+        row.snapshotNumber,
+        row.nodeNumber ?? '',
+        row.label ?? '',
+        row.decision === 'allowed' ? 'разрешено' : 'заблокировано',
+        Object.hasOwn(reasons, row.reason) ? reasons[row.reason] : '',
+        row.reason,
+        row.outcome ?? '',
+      ];
+      return `<tr>${values.map((value) => `<td>${escapeText(value)}</td>`).join('')}</tr>`;
+    })
+    .join('');
   return `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
 }
 

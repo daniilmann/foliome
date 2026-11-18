@@ -2,34 +2,27 @@
   "name": "foliome",
   "version": "1.0.0",
   "description": "Open-source financial data infrastructure for AI agents",
-  "main": "readers/sync-all.js",
-  "scripts": {
-    "sync": "node readers/sync-all.js --import --classify",
-    "bot": "node scripts/telegram-notify.js",
-    "dashboard:dev": "cd dashboard && npm run dev",
-    "dashboard:build": "cd dashboard && npm run build",
-    "dashboard:serve": "node scripts/dashboard-server.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "test:pfs": "node scripts/pfs/demo/test.js",
-    "test:statements": "node scripts/statements/test.js"
-  },
-  "keywords": [],
-  "author": "",
   "license": "Apache-2.0",
   "type": "commonjs",
+  "engines": {
+    "node": "26.13.1"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint core base scripts/checks test",
+    "format:check": "prettier --check 'core/**/*.ts' 'base/*.js' 'scripts/checks/**/*.ts' 'test/**/*.ts' package.json tsconfig.json eslint.config.mjs .prettierrc.json",
+    "test": "node --test --test-concurrency=1 scripts/checks/unit/*.test.ts",
+    "test:stand": "node --test --test-concurrency=1 test/stand/*.test.ts",
+    "test:attacks": "node --test --test-concurrency=1 test/attacks/*.test.ts"
+  },
   "dependencies": {
-    "@dotenvx/dotenvx": "^1.59.1",
-    "@xenova/transformers": "^2.17.2",
-    "better-sqlite3": "^12.8.0",
-    "googleapis": "^171.4.0",
-    "node-telegram-bot-api": "^0.67.0",
-    "playwright": "^1.58.2"
+    "playwright-core": "1.64.1"
   },
-  "optionalDependencies": {
-    "sharp": "^0.33.5",
-    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
-  },
-  "overrides": {
-    "axios": "1.13.6"
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "eslint": "10.15.0",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0"
   }
 }

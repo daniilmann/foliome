@@ -1,9 +1,13 @@
 export type BrowserEvent = Readonly<{
-  sessionId: string; sourceId: string; accessId: string; stepNumber: number;
+  sessionId: string;
+  sourceId: string;
+  accessId: string;
+  stepNumber: number;
   kind: 'main-frame-navigation' | 'non-get-request';
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS' | 'other';
   // host and path are supplied by the trusted address filter.
-  host: string; path: string;
+  host: string;
+  path: string;
 }>;
 
 export interface PreparationPorts<Result> {
@@ -46,21 +50,21 @@ function buildPreparationSession<Result>(ports: PreparationPorts<Result>) {
         await ports.closeSource();
       } catch {
         unavailable = true;
-        throw new Error("source-close-failed");
+        throw new Error('source-close-failed');
       }
     });
   }
 
   async function open(sessionId?: string): Promise<void> {
-    if (current || unavailable) throw new Error("session-unavailable");
+    if (current || unavailable) throw new Error('session-unavailable');
     const session: Session = { sessionId, ready: false, inFlight: false, snapshotGeneration: 0 };
     current = session;
     try {
       await enqueue(async () => {
-        if (unavailable) throw new Error("session-unavailable");
+        if (unavailable) throw new Error('session-unavailable');
         await ports.openSource();
       });
-      if (current !== session) throw new Error("session-revoked");
+      if (current !== session) throw new Error('session-revoked');
       session.ready = true;
     } catch {
       if (current === session) {
@@ -70,13 +74,13 @@ function buildPreparationSession<Result>(ports: PreparationPorts<Result>) {
           // The source remains unavailable after a failed close.
         }
       }
-      throw new Error("session-open-failed");
+      throw new Error('session-open-failed');
     }
   }
 
   function bindSnapshot(snapshot: string): void {
-    if (!current?.ready) throw new Error("session-unavailable");
-    if (typeof snapshot !== "string" || !snapshot) throw new Error("snapshot-invalid");
+    if (!current?.ready) throw new Error('session-unavailable');
+    if (typeof snapshot !== 'string' || !snapshot) throw new Error('snapshot-invalid');
     current.snapshot = snapshot;
     current.snapshotGeneration++;
   }
@@ -122,13 +126,13 @@ function buildPreparationSession<Result>(ports: PreparationPorts<Result>) {
   async function readForVerdict(snapshot: string): Promise<Result> {
     const session = current;
     if (!session?.ready || session.inFlight || !session.snapshot || session.snapshot !== snapshot) {
-      throw new Error("session-unavailable");
+      throw new Error('session-unavailable');
     }
     session.inFlight = true;
     const generation = session.snapshotGeneration;
     const assertCurrent = () => {
       if (current !== session || session.snapshotGeneration !== generation) {
-        throw new Error("session-revoked");
+        throw new Error('session-revoked');
       }
     };
     try {
