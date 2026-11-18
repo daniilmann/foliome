@@ -144,11 +144,17 @@ async function createInstalled(options: Options) {
             }
           };
           events.on('framenavigated', ((frame: { url(): string }) => {
-            if (frame === page.mainFrame() && frame.url() !== 'about:blank') write('main-frame-navigation', navigationMethod, frame.url());
+            if (frame !== page.mainFrame() || frame.url() === 'about:blank') return;
+            const method = navigationMethod;
+            navigationMethod = 'other';
+            write('main-frame-navigation', method, frame.url());
           }) as (value: never) => void);
           events.on('request', ((request: { method(): string; url(): string; isNavigationRequest(): boolean; frame(): unknown }) => {
-            if (request.isNavigationRequest() && request.frame() === page.mainFrame()) navigationMethod = request.method();
-            if (request.method() !== 'GET') write('non-get-request', request.method(), request.url());
+            const method = request.method();
+            try {
+              if (request.isNavigationRequest() && request.frame() === page.mainFrame()) navigationMethod = method;
+            } catch { /* A navigation request can arrive before Playwright can resolve its frame. */ }
+            if (method !== 'GET') write('non-get-request', method, request.url());
           }) as (value: never) => void);
           await page.goto(url.href); check();
         } catch (error) { await closeSource(); throw error; }

@@ -152,7 +152,7 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
         opening = true;
         posting = true;
         status = '';
-        try { await onOpen(); } catch { status = 'session-unavailable'; }
+        try { await onOpen(); } catch { if (status === '') status = 'session-unavailable'; }
         finally { opening = false; }
         if (closed) throw new Error('refused');
         dirty = false;

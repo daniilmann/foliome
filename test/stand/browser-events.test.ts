@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { DatabaseSync } = require('node:sqlite');
+const { mkdir, rm } = require('node:fs/promises');
 const { executorStand, ownerOrigin, waitUntil } = require('./support/executor-start.ts');
 
 const marker = 'synthetic-private-error';
@@ -34,6 +35,9 @@ async function active(client: any) {
 
 test('записывает переход главного кадра и не GET запрос до чтения агента с безопасным адресом', { timeout: 60_000 }, async () => {
   await executorStand({}, async ({ kernel, paths, calls, connect }: any) => {
+    const logPath = paths.database + '.technical.log';
+    await rm(logPath, { force: true });
+    await mkdir(logPath, { mode: 0o700 });
     await openAndConfirm(kernel, calls);
     const db = new DatabaseSync(paths.database, { readOnly: true });
     try {
@@ -83,6 +87,23 @@ test('отказывает активному агенту и показывае
       await waitUntil(async () => (await body.innerText()).includes('protocol-unavailable'), 'owner reason missing');
       assert.ok(!(await body.innerText()).includes(marker));
       assert.ok(!JSON.stringify(db.prepare('SELECT * FROM action_browser_events').all()).includes(marker));
+    } finally { db.close(); }
+  });
+});
+
+test('сохраняет причину отказа записи при открытии источника', { timeout: 60_000 }, async () => {
+  await executorStand({}, async ({ kernel, paths, calls, connect }: any) => {
+    const db = new DatabaseSync(paths.database);
+    try {
+      db.exec(`CREATE TRIGGER synthetic_fail_open_event BEFORE INSERT ON action_browser_events BEGIN SELECT RAISE(ABORT, '${marker}'); END`);
+      const owner = kernel.ownerPage();
+      await owner.goto(`${ownerOrigin}/`);
+      await owner.getByRole('button', { name: 'Открыть подготовку', exact: true }).click();
+      const body = owner.locator('body');
+      await waitUntil(async () => (await body.innerText()).includes('protocol-unavailable'), 'owner lost the opening failure code');
+      assert.ok(!(await body.innerText()).includes(marker));
+      assert.equal(calls.length, 0);
+      assert.equal(code(await (await connect()).call('current_task')), 'session-unavailable');
     } finally { db.close(); }
   });
 });
