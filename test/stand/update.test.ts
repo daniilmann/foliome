@@ -47,7 +47,12 @@ test('запрещает принятие в сессии сохраняет а�
       await fs.writeFile(path.join(releaseDir, 'system/policy.conf'), 'changed after staging\n');
       assert.equal(await fs.readFile(path.join(stagingDir, 'system/policy.conf'), 'utf8'), next['system/policy.conf']);
       throw new Error('synthetic boundary failure');
-    } }), { message: 'synthetic boundary failure' });
+    } }), (error: Error) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, 'boundary-failed');
+      assert.doesNotMatch(error.message, /synthetic boundary failure/);
+      return true;
+    });
     assert.equal(checked, true);
     for (const [name, text] of Object.entries(before)) assert.equal(await fs.readFile(path.join(rootDir, name), 'utf8'), text);
     await assert.rejects(fs.lstat(path.join(rootDir, 'system/new.conf')), { code: 'ENOENT' });
@@ -139,9 +144,31 @@ test('активирует проверенный SHA после приняти�
     assert.deepEqual(await state(f.stateFile), { current: nextSha, previous: currentSha });
     assert.deepEqual(data(f.dbPath), migrated);
     assert.equal(await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'), 'next synthetic policy\n');
-    await restorePrevious({ ...restore, compatible: (_db: any, sha: string) => { compatibilityChecks++; return sha === currentSha; } });
+    let boundaryChecks = 0;
+    const previousPolicy = 'current synthetic policy\n';
+    const previousRoot = {
+      tree: { 'system/policy.conf': hashes(previousPolicy) },
+      allowedPaths: ['system/policy.conf'],
+      checkBoundary: async ({ rootDir: installed }: any) => {
+        boundaryChecks++;
+        assert.equal(await fs.readFile(path.join(installed, 'system/policy.conf'), 'utf8'), previousPolicy);
+        assert.equal(await fs.readFile(path.join(installed, 'base/launcher.js'), 'utf8'), 'next synthetic launcher\n');
+      },
+    };
+    const verifiedRestore = { ...restore, previousRoot, compatible: (_db: any, sha: string) => { compatibilityChecks++; return sha === currentSha; } };
+    const previousPolicyFile = path.join(f.releasesDir, currentSha, 'system/policy.conf');
+    await fs.writeFile(previousPolicyFile, 'tampered synthetic policy\n');
+    await assert.rejects(restorePrevious(verifiedRestore));
+    assert.equal(boundaryChecks, 0);
+    assert.deepEqual(await state(f.stateFile), { current: nextSha, previous: currentSha });
+    assert.deepEqual(data(f.dbPath), migrated);
+    assert.equal(await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'), 'next synthetic policy\n');
+    assert.equal(await fs.readFile(path.join(f.rootDir, 'base/launcher.js'), 'utf8'), 'next synthetic launcher\n');
+    await fs.writeFile(previousPolicyFile, previousPolicy);
+    await restorePrevious(verifiedRestore);
     assert.ok(restoreChecks >= 1);
-    assert.equal(compatibilityChecks, 2);
+    assert.equal(compatibilityChecks, 3);
+    assert.equal(boundaryChecks, 1);
     assert.deepEqual(await state(f.stateFile), { current: currentSha, previous: null });
     assert.deepEqual(data(f.dbPath), migrated);
     assert.equal(await fs.readFile(path.join(f.rootDir, 'system/policy.conf'), 'utf8'), 'current synthetic policy\n');

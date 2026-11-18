@@ -63,7 +63,12 @@ test('ставит и восстанавливает основу и остав�
 
     const empty = await fixture();
     try {
-      await assert.rejects(installInitial({ ...empty, checkBoundary: async () => { throw new Error('synthetic boundary failure'); } }), { message: 'synthetic boundary failure' });
+      await assert.rejects(installInitial({ ...empty, checkBoundary: async () => { throw new Error('synthetic boundary failure'); } }), (error: Error) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, 'boundary-failed');
+        assert.doesNotMatch(error.message, /synthetic boundary failure/);
+        return true;
+      });
       await absent(empty.activeFile);
       for (const name of Object.keys(files)) await absent(path.join(empty.rootDir, name));
     } finally { await fs.rm(empty.dir, { recursive: true, force: true }); }
