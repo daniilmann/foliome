@@ -105,3 +105,30 @@ test('отзывает право ожидающего вызова включа
     assert.deepEqual(f.calls, ['open', 'verdict', 'read', 'outcome', 'verdict', 'read', 'outcome']);
   }
 });
+
+test('сохраняет итог начатого чтения после закрытия и не отзывает новую сессию', async () => {
+  const { createPreparationSession } = await import('../../../core/use-cases/preparation.ts');
+  let finishRead!: (value: string) => void;
+  let signalReadStarted!: () => void;
+  const readResult = new Promise<string>((resolve) => { finishRead = resolve; });
+  const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+  const outcomes: string[] = [];
+  const session = createPreparationSession({
+    openSource: async () => {}, closeSource: async () => {}, saveVerdict: async () => {},
+    read: async () => { signalReadStarted(); return readResult; },
+    saveOutcome: async (value: string) => { outcomes.push(value); },
+  });
+  await session.open();
+  session.bindSnapshot('old-snapshot');
+  const pending = session.readForVerdict('old-snapshot');
+  await readStarted;
+  await session.close();
+  await session.open();
+  session.bindSnapshot('fresh-snapshot');
+  finishRead('old-result');
+  await assert.rejects(pending, { message: 'session-revoked' });
+  assert.deepEqual(outcomes, ['old-result']);
+  assert.equal(await session.readForVerdict('fresh-snapshot'), 'old-result');
+  assert.deepEqual(outcomes, ['old-result', 'old-result']);
+  await session.close();
+});

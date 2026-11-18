@@ -1,4 +1,5 @@
 import type { DatabaseSync } from 'node:sqlite';
+import type { BrowserEvent } from '../../use-cases/preparation.ts';
 
 type Reason = 'allowed' | 'unsupported' | 'not-declared' | 'value-not-allowed' | 'not-found' |
   'ambiguous' | 'hidden' | 'disabled' | 'covered' | 'stale' | 'foreign-frame' | 'foreign-host' |
@@ -64,12 +65,27 @@ function create(database: DatabaseSync, clock: Clock) {
         at_ms INTEGER NOT NULL CHECK (at_ms BETWEEN 0 AND 9007199254740991),
         status TEXT NOT NULL CHECK (status IN ('ok', 'stale', 'internal', 'limit'))
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS action_browser_events (
+        id INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND 9007199254740991),
+        at_ms INTEGER NOT NULL CHECK (at_ms BETWEEN 0 AND 9007199254740991),
+        session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 128 AND session_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        source_id TEXT NOT NULL CHECK (length(source_id) BETWEEN 1 AND 128 AND source_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        access_id TEXT NOT NULL CHECK (length(access_id) BETWEEN 1 AND 128 AND access_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        step_number INTEGER NOT NULL CHECK (step_number BETWEEN 1 AND 9007199254740991),
+        kind TEXT NOT NULL CHECK (kind IN ('main-frame-navigation', 'non-get-request')),
+        method TEXT NOT NULL CHECK (method IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'other')),
+        host TEXT NOT NULL CHECK (length(host) BETWEEN 1 AND 253),
+        path TEXT NOT NULL CHECK (length(path) BETWEEN 1 AND 2048)
+      ) STRICT;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_update BEFORE UPDATE ON action_verdicts BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_delete BEFORE DELETE ON action_verdicts BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_replace BEFORE INSERT ON action_verdicts WHEN EXISTS (SELECT 1 FROM action_verdicts WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_outcomes_no_update BEFORE UPDATE ON action_outcomes BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_outcomes_no_delete BEFORE DELETE ON action_outcomes BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_outcomes_no_replace BEFORE INSERT ON action_outcomes WHEN EXISTS (SELECT 1 FROM action_outcomes WHERE verdict_id = NEW.verdict_id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_browser_events_no_update BEFORE UPDATE ON action_browser_events BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_browser_events_no_delete BEFORE DELETE ON action_browser_events BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_browser_events_no_replace BEFORE INSERT ON action_browser_events WHEN EXISTS (SELECT 1 FROM action_browser_events WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
     `);
     database.exec('RELEASE action_protocol_schema');
   } catch (error) {
@@ -81,6 +97,9 @@ function create(database: DatabaseSync, clock: Clock) {
     (at_ms, session_id, source_id, access_id, snapshot_number, node_number, method, action_class, actor, decision, reason)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?)`);
   const insertOutcome = database.prepare('INSERT INTO action_outcomes (verdict_id, at_ms, status) VALUES (?, ?, ?)');
+  const insertBrowserEvent = database.prepare(`INSERT INTO action_browser_events
+    (at_ms, session_id, source_id, access_id, step_number, kind, method, host, path)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   function time(): number {
     if (database.isTransaction) throw new Error('active transaction');
     const value = clock();
@@ -108,6 +127,17 @@ function create(database: DatabaseSync, clock: Clock) {
         throw new Error('invalid outcome');
       }
       insertOutcome.run(value.verdictId, time(), value.status);
+    },
+    appendBrowserEvent(value: BrowserEvent): void {
+      if (!identifier(value.sessionId) || !identifier(value.sourceId) || !identifier(value.accessId) ||
+        !integer(value.stepNumber, 1) || !['main-frame-navigation', 'non-get-request'].includes(value.kind) ||
+        !['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'other'].includes(value.method) ||
+        typeof value.host !== 'string' || value.host.length < 1 || value.host.length > 253 ||
+        typeof value.path !== 'string' || value.path.length < 1 || value.path.length > 2048) {
+        throw new Error('invalid browser event');
+      }
+      insertBrowserEvent.run(time(), value.sessionId, value.sourceId, value.accessId,
+        value.stepNumber, value.kind, value.method, value.host, value.path);
     },
   };
 }

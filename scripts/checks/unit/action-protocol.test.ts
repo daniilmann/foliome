@@ -239,18 +239,19 @@ test('при отказе записи вердикта итога навига�
           protocolUnavailable: async () => { unavailable++; },
         };
         const session = createPreparationSession(ports) as unknown as {
-          open(): Promise<void>; bindSnapshot(snapshot: string): void;
+          open(sessionId?: string): Promise<void>; bindSnapshot(snapshot: string): void;
           readForVerdict(snapshot: string): Promise<string>;
           recordBrowserEvent(event: BrowserEvent): Promise<void>;
         };
-        await session.open();
+        const event = browserEvents.find((value) => value.kind === failure);
+        if (event) await session.open(event.sessionId);
+        else await session.open();
         session.bindSnapshot('snapshot-1');
         if (failure !== 'outcome') database.exec('PRAGMA query_only = ON');
         if (failure === 'verdict' || failure === 'outcome') {
           await assert.rejects(session.readForVerdict('snapshot-1'), { message: 'protocol-unavailable' });
         } else {
-          const event = browserEvents.find((value) => value.kind === failure)!;
-          await assert.rejects(session.recordBrowserEvent(event), { message: 'protocol-unavailable' });
+          await assert.rejects(session.recordBrowserEvent(event!), { message: 'protocol-unavailable' });
         }
         assert.equal((writeError as { errcode?: number } | undefined)?.errcode, 8);
         assert.equal(closes, 1);
@@ -265,6 +266,55 @@ test('при отказе записи вердикта итога навига�
       }
     });
   }
+});
+
+test('отклоняет старое событие браузера после открытия новой сессии и сохраняет её работоспособность', async () => {
+  const { createPreparationSession } = await import('../../../core/use-cases/preparation.ts');
+  const stored: BrowserEvent[] = [];
+  let closes = 0;
+  const session = createPreparationSession({
+    openSource: async () => {},
+    closeSource: async () => { closes++; },
+    saveVerdict: async () => {},
+    read: async () => 'fixture-result',
+    saveOutcome: async () => {},
+    saveBrowserEvent: async (event: BrowserEvent) => {
+      stored.push(event);
+      if (event.sessionId === 'session-1') throw new Error('unexpected stale event');
+    },
+  }) as unknown as {
+    open(sessionId?: string): Promise<void>; close(): Promise<void>;
+    bindSnapshot(snapshot: string): void; readForVerdict(snapshot: string): Promise<string>;
+    recordBrowserEvent(event: BrowserEvent): Promise<void>;
+  };
+  await session.open('session-1');
+  await session.close();
+  await session.open('session-2');
+  await assert.rejects(session.recordBrowserEvent(browserEvents[0]));
+  assert.deepEqual(stored, []);
+  assert.equal(closes, 1);
+  const freshEvent = { ...browserEvents[0], sessionId: 'session-2' };
+  await session.recordBrowserEvent(freshEvent);
+  assert.deepEqual(stored, [freshEvent]);
+  session.bindSnapshot('fresh-snapshot');
+  assert.equal(await session.readForVerdict('fresh-snapshot'), 'fixture-result');
+  await session.close();
+});
+
+test('отклоняет событие браузера без привязки идентификатора сессии', async () => {
+  const { createPreparationSession } = await import('../../../core/use-cases/preparation.ts');
+  const stored: BrowserEvent[] = [];
+  const session = createPreparationSession({
+    openSource: async () => {}, closeSource: async () => {}, saveVerdict: async () => {},
+    read: async () => 'fixture-result', saveOutcome: async () => {},
+    saveBrowserEvent: async (event: BrowserEvent) => { stored.push(event); },
+  });
+  await session.open();
+  await assert.rejects(session.recordBrowserEvent(browserEvents[0]));
+  assert.deepEqual(stored, []);
+  session.bindSnapshot('snapshot');
+  assert.equal(await session.readForVerdict('snapshot'), 'fixture-result');
+  await session.close();
 });
 
 test('дозаписывает событие браузера в таблицу STRICT', async () => {

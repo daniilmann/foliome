@@ -1,12 +1,23 @@
+export type BrowserEvent = Readonly<{
+  sessionId: string; sourceId: string; accessId: string; stepNumber: number;
+  kind: 'main-frame-navigation' | 'non-get-request';
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS' | 'other';
+  // host and path are supplied by the trusted address filter.
+  host: string; path: string;
+}>;
+
 export interface PreparationPorts<Result> {
   openSource(): Promise<void>;
   closeSource(): Promise<void>;
   saveVerdict(): Promise<void>;
   read(): Promise<Result>;
   saveOutcome(value: Result): Promise<void>;
+  saveBrowserEvent?(event: BrowserEvent): Promise<void>;
+  protocolUnavailable?(code: 'protocol-unavailable'): Promise<void>;
 }
 
 type Session = {
+  sessionId?: string;
   ready: boolean;
   inFlight: boolean;
   snapshot?: string;
@@ -40,9 +51,9 @@ function buildPreparationSession<Result>(ports: PreparationPorts<Result>) {
     });
   }
 
-  async function open(): Promise<void> {
+  async function open(sessionId?: string): Promise<void> {
     if (current || unavailable) throw new Error("session-unavailable");
-    const session: Session = { ready: false, inFlight: false, snapshotGeneration: 0 };
+    const session: Session = { sessionId, ready: false, inFlight: false, snapshotGeneration: 0 };
     current = session;
     try {
       await enqueue(async () => {
@@ -74,6 +85,40 @@ function buildPreparationSession<Result>(ports: PreparationPorts<Result>) {
     return current ? closeSession(current) : lifecycle;
   }
 
+  async function record(session: Session, operation: () => Promise<void>): Promise<void> {
+    try {
+      await operation();
+    } catch {
+      if (current === session) {
+        const closing = closeSession(session);
+        try {
+          await closing;
+        } catch {
+          // A failed close already makes the source unavailable.
+        }
+        try {
+          await ports.protocolUnavailable?.('protocol-unavailable');
+        } catch {
+          // Notification failure must not expose its contents or restore the session.
+        }
+      }
+      throw new Error('protocol-unavailable');
+    }
+  }
+
+  async function recordBrowserEvent(event: BrowserEvent): Promise<void> {
+    const session = current;
+    if (!session?.ready) throw new Error('session-unavailable');
+    if (!session.sessionId || event.sessionId !== session.sessionId) {
+      throw new Error('session-unavailable');
+    }
+    await record(session, async () => {
+      if (!ports.saveBrowserEvent) throw new Error('protocol-unavailable');
+      await ports.saveBrowserEvent(event);
+    });
+    if (current !== session) throw new Error('session-revoked');
+  }
+
   async function readForVerdict(snapshot: string): Promise<Result> {
     const session = current;
     if (!session?.ready || session.inFlight || !session.snapshot || session.snapshot !== snapshot) {
@@ -86,24 +131,11 @@ function buildPreparationSession<Result>(ports: PreparationPorts<Result>) {
         throw new Error("session-revoked");
       }
     };
-    const record = async (operation: () => Promise<void>) => {
-      try {
-        await operation();
-      } catch {
-        try {
-          await closeSession(session);
-        } catch {
-          // A failed close already makes the source unavailable.
-        }
-        throw new Error("protocol-unavailable");
-      }
-    };
-
     try {
-      await record(() => ports.saveVerdict());
+      await record(session, () => ports.saveVerdict());
       assertCurrent();
       const result = await ports.read();
-      await record(() => ports.saveOutcome(result));
+      await record(session, () => ports.saveOutcome(result));
       assertCurrent();
       return result;
     } finally {
@@ -111,7 +143,7 @@ function buildPreparationSession<Result>(ports: PreparationPorts<Result>) {
     }
   }
 
-  return { open, bindSnapshot, close, readForVerdict };
+  return { open, bindSnapshot, close, readForVerdict, recordBrowserEvent };
 }
 
 exports.createPreparationSession = buildPreparationSession;
