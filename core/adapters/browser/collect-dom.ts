@@ -1,4 +1,5 @@
 const { filterTextSnapshot } = require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
+const { createHmac, randomBytes } = require('node:crypto') as typeof import('node:crypto');
 
 type Cdp = {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
@@ -21,11 +22,11 @@ type Secret = { value: string; kind: 'login' | 'password' | 'code' };
 type Rect = { x: number; y: number; width: number; height: number };
 type Geometry = { rect: Rect; runs: Rect[]; mask: boolean };
 type Observation = { geometry: Geometry[]; width: number; height: number; revision: number; animationIds: string[]; viewportStable: boolean; maskAnimationActive: boolean; unsupported: boolean };
-type DocumentFacts = { url: string; title: string; nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[]; parents: (number | null)[]; secrets: Secret[]; embeds: { url: string; visible: boolean }[]; observation: Observation };
+type DocumentFacts = { url: string; title: string; nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[]; parents: (number | null)[]; identities: number[]; classes: ('blocked-payment' | 'blocked-change' | null)[]; semantics: string[]; secrets: Secret[]; embeds: { url: string; visible: boolean }[]; observation: Observation };
 
 // This expression is owned by the adapter and runs only in its isolated world.
 const expression = `(() => {
-  const nodes = [], parents = [], secrets = [], embeds = [], geometry = [];
+  const nodes = [], parents = [], identities = [], classes = [], semantics = [], secrets = [], embeds = [], geometry = [];
   const state = globalThis.__foliomeObservation || (globalThis.__foliomeObservation = (() => {
     const state = { revision: 0, ids: new WeakMap(), next: 1 };
     new MutationObserver(() => { state.revision++; }).observe(document, { subtree: true, attributes: true, childList: true, characterData: true });
@@ -67,10 +68,10 @@ const expression = `(() => {
       fact.field = closedField || type === 'password' ? 'sealed' : value ? 'filled' : 'empty';
       if (value) secrets.push({ value, kind: type === 'password' ? 'password' : 'login' });
     }
-    const state = [];
-    if (element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true') state.push('disabled');
-    if (element.getAttribute('aria-checked') === 'true' || element.checked === true) state.push('checked');
-    if (state.length) fact.state = state.join(' ');
+    const nodeState = [];
+    if (element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true') nodeState.push('disabled');
+    if (element.getAttribute('aria-checked') === 'true' || element.checked === true) nodeState.push('checked');
+    if (nodeState.length) fact.state = nodeState.join(' ');
     if (tag === 'A' && element.hasAttribute('href')) fact.href = element.href;
     const attrs = {};
     for (const key of safeAttrs) if (element.hasAttribute(key)) attrs[key] = element.getAttribute(key);
@@ -80,6 +81,13 @@ const expression = `(() => {
       const range = document.createRange(); range.selectNodeContents(child);
       for (const r of range.getClientRects()) if (r.width > 0 && r.height > 0) runs.push(rectValue(r));
     }
+    if (!state.ids.has(element)) state.ids.set(element, state.next++);
+    identities.push(state.ids.get(element));
+    const label = [text, element.getAttribute('aria-label') || '', element.getAttribute('title') || '', element.value && (tag === 'BUTTON' || tag === 'INPUT' && ['button', 'submit', 'reset'].includes(element.type)) ? element.value : ''].join(' ').toLowerCase();
+    semantics.push(JSON.stringify([tag, label, element.getAttribute('type'), element.getAttribute('aria-expanded'), element.getAttribute('aria-haspopup'), element.getAttribute('aria-controls'), element.getAttribute('aria-pressed'), element.getAttribute('autocomplete')]));
+    const payment = /(?:pay(?:ment)?|transfer|оплат|плат[её]ж|перевод)/iu.test(label);
+    const change = /(?:save|delete|remove|change|сохран|удал|измен)/iu.test(label) || tag === 'INPUT' && ['submit', 'reset'].includes(element.type) || tag === 'BUTTON' && element.type === 'submit';
+    classes.push(payment ? 'blocked-payment' : change ? 'blocked-change' : null);
     const index = nodes.length; nodes.push(fact); parents.push(parent);
     geometry.push({ rect: rectValue(rect), runs, mask: field || tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED' });
     if (!field) for (const child of element.children) visit(child, visible ? index : parent, subtreeVisible);
@@ -90,7 +98,7 @@ const expression = `(() => {
   const animationIds = animations.map(a => { if (!state.ids.has(a)) state.ids.set(a, state.next++); return String(state.ids.get(a)); }).sort();
   const viewport = visualViewport;
   const viewportStable = !!viewport && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.width === innerWidth && viewport.height === innerHeight;
-  return { url: location.href, title: document.title, nodes, parents, secrets, embeds, observation: { geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, viewportStable, maskAnimationActive: animations.length > 0, unsupported } };
+  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, viewportStable, maskAnimationActive: animations.length > 0, unsupported } };
 })()`;
 
 const worldName = 'foliome-dom-collector';
@@ -159,6 +167,7 @@ function trustedUrl(value: string, sourceHost: string, approvedHosts: ReadonlySe
 }
 
 async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: readonly string[] }) {
+  const descriptorKey = randomBytes(32);
   let closed = false;
   let scriptId: string | undefined;
   const contexts = new Map<number, { frameId: string; origin: string }>();
@@ -234,6 +243,8 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           let observation: Observation | undefined;
           let rootNodeCount = 0;
           let rootContext = 0;
+          let rootIdentities: number[] = [], rootClasses: DocumentFacts['classes'] = [];
+          let rootSemantics: string[] = [];
           const embeds: { url: string; visible: boolean }[] = [];
           const visit = async (frame: FrameTree, foreignAncestor: boolean, parentAccessible: boolean): Promise<void> => {
             if (frames.length >= 256) throw new Error();
@@ -252,7 +263,7 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
                 const data = evaluation.result.value as unknown as DocumentFacts;
                 if (typeof data.url !== 'string' || typeof data.title !== 'string' || !Array.isArray(data.nodes) || !Array.isArray(data.parents) || data.nodes.length !== data.parents.length || !Array.isArray(data.secrets) || !Array.isArray(data.embeds)) throw new Error();
                 if (!trustedUrl(data.url, sourceHost, approvedHosts) || new URL(data.url).href !== new URL(frame.frame.url).href || host(data.url) !== frameHost) throw new NavigationError();
-                if (index === 0) { page = { url: data.url, title: data.title }; observation = data.observation; rootNodeCount = data.nodes.length; rootContext = world.executionContextId as number; }
+                if (index === 0) { page = { url: data.url, title: data.title }; observation = data.observation; rootNodeCount = data.nodes.length; rootContext = world.executionContextId as number; rootIdentities = data.identities; rootClasses = data.classes; rootSemantics = data.semantics; }
                 for (let i = 0; i < data.nodes.length; i++) {
                   const parent = data.parents[i];
                   if (parent !== null && (!Number.isSafeInteger(parent) || parent < 0 || parent >= i)) throw new Error();
@@ -281,13 +292,25 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           }
           const verify = await send('Page.getFrameTree');
           if (!record(verify) || JSON.stringify(tree(verify.frameTree)) !== JSON.stringify(root) || !page || closed) throw new Error();
-          return { facts: { snapshot, page, frames, nodes, secrets }, observation, rootNodeCount, rootContext };
+          return { facts: { snapshot, page, frames, nodes, secrets }, observation, rootNodeCount, rootContext, rootIdentities, rootClasses, rootSemantics };
         });
         if (closed) throw new Error();
         if (overflow) throw new Error();
         result.facts.secrets.push(...history.values());
         return result;
       } catch { throw new Error('internal'); }
+    }
+    function projectTargets(result: Awaited<ReturnType<typeof collect>>) {
+      const { facts, rootNodeCount, rootContext, rootIdentities, rootClasses, rootSemantics } = result;
+      const filtered = filterTextSnapshot(facts);
+      if (!filtered.ok || closed || !Array.isArray(rootIdentities) || rootIdentities.length !== rootNodeCount || !rootIdentities.every(id => Number.isSafeInteger(id) && id > 0) || !Array.isArray(rootClasses) || rootClasses.length !== rootNodeCount || !rootClasses.every(value => value === null || value === 'blocked-payment' || value === 'blocked-change') || !Array.isArray(rootSemantics) || rootSemantics.length !== rootNodeCount || !rootSemantics.every(value => typeof value === 'string')) throw new Error('internal');
+      const elements = new Map(filtered.snapshot.elements.map(element => [element.n, element]));
+      const documentDescriptor = createHmac('sha256', descriptorKey).update(JSON.stringify({ page: facts.page, frames: facts.frames, nodes: facts.nodes, classes: rootClasses, semantics: rootSemantics })).digest('hex');
+      const candidates = facts.nodes.slice(0, rootNodeCount).map((node, index) => {
+        const element = elements.get(node.n);
+        return { nodeNumber: node.n, identity: `${rootContext}:${rootIdentities[index]}`, descriptor: `${documentDescriptor}:${node.n}`, visible: node.visible && !!element, enabled: !node.state?.split(' ').includes('disabled'), sourceFrame: node.frame === 0, secretField: !!node.field, prohibited: rootClasses[index], text: element?.text ?? '' };
+      });
+      return { candidates, elements };
     }
     return {
     loginObservations() {
@@ -302,6 +325,29 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
       const { facts } = await collect(snapshot);
       if (closed) throw new Error('internal');
       return facts;
+    },
+    async observeTargets(snapshot: number) {
+      const result = await collect(snapshot);
+      return { snapshotNumber: snapshot, candidates: projectTargets(result).candidates };
+    },
+    async readObservedTarget(snapshot: number, nodeNumber: number, proof: { identity: string; descriptor: string }, deep = false): Promise<{ ok: true; text: string } | { ok: false; code: 'stale' | 'internal' }> {
+      try {
+        const result = await collect(snapshot);
+        const { candidates, elements } = projectTargets(result);
+        const matches = candidates.filter(candidate => candidate.nodeNumber === nodeNumber);
+        const target = matches[0];
+        if (matches.length !== 1 || !proof || target.identity !== proof.identity || target.descriptor !== proof.descriptor || !target.visible || !target.enabled || !target.sourceFrame || target.secretField || target.prohibited !== null) return { ok: false, code: 'stale' };
+        const included = new Set([nodeNumber]);
+        const texts: string[] = [];
+        for (const node of result.facts.nodes.slice(0, result.rootNodeCount)) {
+          if (deep && node.parent !== undefined && included.has(node.parent)) included.add(node.n);
+          if (included.has(node.n)) {
+            const element = elements.get(node.n);
+            if (element?.text) texts.push(element.text);
+          }
+        }
+        return { ok: true, text: texts.join(' ') };
+      } catch { return { ok: false, code: 'internal' }; }
     },
     async collectFrame(snapshot: number) {
       const { facts, observation: observed, rootNodeCount, rootContext } = await collect(snapshot);
@@ -318,7 +364,7 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           if (!record(value)) return false;
           return (Array.isArray(value.shadowRoots) && value.shadowRoots.some(root => !record(root) || root.shadowRootType !== 'user-agent')) || Object.entries(value).some(([key, child]) => key !== 'shadowRoots' && hasShadow(child));
         };
-        if (!record(dom) || !record(dom.root) || hasShadow(dom) || observed.unsupported || observed.geometry.length !== rootNodeCount ||
+        if (!record(dom) || !record(dom.root) || hasShadow(dom) || facts.frames.some(frame => frame.index !== 0 && !frame.foreign) || observed.unsupported || observed.geometry.length !== rootNodeCount ||
             !Number.isSafeInteger(observed.width) || !Number.isSafeInteger(observed.height) || observed.width < 1 || observed.height < 1) throw new Error();
         const masks: Rect[] = [], labels: { x: number; y: number; number: number }[] = [];
         const elements = new Map(filtered.snapshot.elements.map(element => [element.n, element]));
