@@ -108,7 +108,7 @@ function syntheticPorts() {
 }
 
 // Partial 3.5: DOM collection and filtering only; storage and selector checks remain open.
-test('выдаёт и хранит фильтрованный текст и проверяет условия селектора по маскам', { timeout: 60_000 }, async () => {
+test('выдаёт и хранит фильтрованный текст и проверяет условия селектора по маскам', { timeout: 60_000 }, async (t: any) => {
   const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
   const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
   const { randomBytes } = require('node:crypto');
@@ -127,6 +127,9 @@ test('выдаёт и хранит фильтрованный текст и пр
             <label for="password">Password label</label><input id="password" type="password" value="${password}">
             <label for="text">Text label</label><input id="text" type="text" value="${textValue}">
             <div style="display:none">Display hidden marker</div><div aria-hidden="true">Aria hidden marker</div>
+            <div style="display:contents"><span>Contents visible marker</span></div>
+            <div style="display:none"><span>Hidden ancestor marker</span></div>
+            <div contenteditable="true" role="textbox" aria-label="Editable field">Editable private marker</div>
             <button disabled>Disabled control</button>
             <div><span>4111 1111</span><span> 1111 1111</span></div>
             <iframe src="https://foreign.invalid/frame"></iframe>
@@ -143,7 +146,7 @@ test('выдаёт и хранит фильтрованный текст и пр
       });
       const page = await context.newPage();
       const cdp = await context.newCDPSession(page);
-      const collector = await prepareDomCollector(cdp);
+      const collector = await prepareDomCollector(cdp, { sourceHost: 'cabinet.invalid', approvedHosts: [] });
       try {
         await page.goto(`${origin}/overview`, { waitUntil: 'load' });
         const result = filterTextSnapshot(await collector.collectText(27));
@@ -163,6 +166,25 @@ test('выдаёт и хранит фильтрованный текст и пр
         const numbers = snapshot.elements.map((item: any) => item.n);
         assert.ok(numbers.length > 0 && numbers.every((n: number) => Number.isSafeInteger(n) && n > 0));
         assert.equal(new Set(numbers).size, numbers.length);
+        await t.test('показывает видимого потомка display contents', () => {
+          assert.ok(output.includes('Contents visible marker'));
+        });
+        await t.test('скрывает потомка скрытого предка', () => {
+          assert.equal(output.includes('Hidden ancestor marker'), false);
+        });
+        await t.test('contenteditable оставляет состояние поля без содержимого', () => {
+          assert.equal(output.includes('Editable private marker'), false);
+          const editable = snapshot.elements.find((item: any) => item.attrs?.['aria-label'] === 'Editable field');
+          assert.ok(editable);
+          assert.ok(['filled', 'sealed'].includes(editable.field));
+          assert.equal(editable.text, '');
+        });
+        await t.test('чужой основной фрейм отклоняется', async () => {
+          await page.goto('https://foreign.invalid/frame', { waitUntil: 'load' });
+          let foreign: unknown;
+          try { foreign = await collector.collectText(28); } catch { foreign = undefined; }
+          assert.equal(filterTextSnapshot(foreign).ok, false);
+        });
       } finally { await collector.close(); }
       let afterClose: unknown;
       try { afterClose = await collector.collectText(28); } catch { afterClose = undefined; }
