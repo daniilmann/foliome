@@ -17,7 +17,8 @@ role = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(role)
 
 
-class WorktreeTests(unittest.TestCase):
+class WorktreeSetup:
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -42,6 +43,8 @@ class WorktreeTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
 
+
+class WorktreeTests(WorktreeSetup, unittest.TestCase):
     def test_run_requires_code_clone(self):
         with patch.object(role, "__file__", str(self.base / "copy/agents/role.py")):
             with self.assertRaises(SystemExit):
@@ -105,15 +108,13 @@ class WorktreeTests(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 1, "клон не чистый", "")
             return real_run(cmd, **kwargs)
 
-        args = argparse.Namespace(cd=self.trees["code"], code="B", claude_unavailable=False,
-                                  codex_unavailable=False, effort=None, sandbox=None)
+        args = argparse.Namespace(cd=self.trees["code"], code="B", simple=False, effort=None, sandbox=None)
         with patch.object(role, "user", return_value=role.REG["zone_user"]), \
                 patch.object(role.subprocess, "run", side_effect=command), \
-                patch.object(role, "run_codex") as codex, patch.object(role, "run_claude") as claude:
+                patch.object(role, "run_codex") as codex:
             with self.assertRaises(SystemExit):
                 role.cmd_run(args)
             codex.assert_not_called()
-            claude.assert_not_called()
 
     def test_worktree_diff_tracks_untracked_and_committed_content(self):
         cwd = self.trees["code"]
@@ -147,90 +148,72 @@ class WorktreeTests(unittest.TestCase):
         self.assertNotIn("SOURCECRAFT_SYNTHETIC", env)
 
 
-class ClaudeTests(unittest.TestCase):
-    session = "00000000-0000-4000-8000-000000000000"
-    model = role.REG["roles"]["DA"]["model"]
+class CodexOnlyTests(WorktreeSetup, unittest.TestCase):
+    def call_review(self, *, actual_sandbox="read-only", simple=False, flags=()):
+        prompt = self.base / "brief"
+        prompt.write_text("Проверь синтетическое изменение", encoding="utf-8")
+        journal = self.base / "calls.jsonl"
+        session_dir = self.base / "codex/sessions/2026/11/18"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session_id = "00000000-0000-4000-8000-000000000001"
+        real_run = subprocess.run
 
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name).resolve()
-        self.projects = self.base / "projects"
-        self.transcript = self.projects / "synthetic" / (self.session + ".jsonl")
-        self.transcript.parent.mkdir(parents=True)
-        self.fixture = Path(__file__).parent / "fixtures/claude-root.jsonl"
-        self.transcript.write_bytes(self.fixture.read_bytes())
-        self.agent_dir = self.base / "root/agents"
-        self.agent_dir.mkdir(parents=True)
-        (self.agent_dir / "foliome-da.md").write_text("---\neffort: high\ntools: Read\n---\nSynthetic\n")
-        self.prompt = self.base / "brief.txt"
-        self.prompt.write_text("Синтетический бриф")
-        self.args = argparse.Namespace(code="DA", cd=str(self.base / "worktree"),
-            claude_unavailable=False, codex_unavailable=False, effort=None, sandbox=None, simple=False,
-            reason=None, out=str(self.base / "answer.txt"), journal=str(self.base / "calls.jsonl"),
-            prompt_file=str(self.prompt))
-        self.result = {"session_id": self.session, "modelUsage": {self.model: {}, "claude-haiku-5-5": {}},
-                       "result": "Синтетический ответ"}
-        self.stack = contextlib.ExitStack()
-        self.addCleanup(self.stack.close)
-        for name, value in [("CLAUDE_PROJECTS", str(self.projects)), ("OUT", str(self.agent_dir)),
-                            ("ROOT", str(self.agent_dir.parent))]:
-            self.stack.enter_context(patch.object(role, name, value))
-        self.stack.enter_context(patch.object(role, "run_worktree", return_value=self.args.cd))
-        self.stack.enter_context(patch.object(role, "session_check"))
-        self.stack.enter_context(patch.object(role, "role_env", return_value={}))
-        self.stack.enter_context(patch.object(role, "user", return_value=role.REG["zone_user"]))
-        self.stack.enter_context(patch.object(role, "fingerprint", return_value={"head": "synthetic", "changes": ""}))
-        self.stack.enter_context(patch.object(role, "worktree_diff", return_value={"patch": "diff synthetic\n"}))
-        self.stack.enter_context(patch.object(role, "diff_output", return_value={"patch": "", "error": None}))
-        self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-        self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        def command(cmd, **kwargs):
+            if cmd[0] != "codex":
+                return real_run(cmd, **kwargs)
+            self.assertEqual(cmd[1], "exec")
+            self.assertIn("apps", cmd)
+            self.assertEqual(cmd[cmd.index("-s") + 1], "read-only")
+            model = role.REG["simple"]["codex"] if simple else "gpt-6.2-sol"
+            self.assertEqual(cmd[cmd.index("-m") + 1], model)
+            self.assertEqual(kwargs["input"], prompt.read_text())
+            rollout = session_dir / f"rollout-{session_id}.jsonl"
+            records = [
+                {"type": "session_meta", "payload": {"id": session_id, "cwd": self.trees["code"]}},
+                {"type": "turn_context", "payload": {
+                    "model": model, "effort": "high", "sandbox_policy": {"type": actual_sandbox}
+                }},
+            ]
+            rollout.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+            Path(cmd[cmd.index("-o") + 1]).write_text("Ревью завершено", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "", f"session id: {session_id}\n")
 
-    def run_wrapper(self, expected, provider_exit=0):
-        result = subprocess.CompletedProcess([], provider_exit, json.dumps(self.result), "")
-        with patch.object(role.subprocess, "run", return_value=result), self.assertRaises(SystemExit) as exc:
-            role.cmd_run(self.args)
-        self.assertEqual(exc.exception.code, expected)
-        return json.loads(Path(self.args.journal).read_text().splitlines()[-1])
+        argv = ["run", "TR", "--prompt-file", str(prompt), "--journal", str(journal),
+                "--cd", self.trees["code"], *flags]
+        if simple:
+            argv.append("--simple")
+        with patch.object(role, "CODEX_HOME", str(session_dir.parents[3])), \
+                patch.object(role, "user", return_value=role.REG["zone_user"]), \
+                patch.object(role, "session_check"), patch.object(role.subprocess, "run", side_effect=command), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exc:
+            role.main(argv)
+        record = json.loads(journal.read_text().splitlines()[-1]) if journal.exists() else None
+        return exc.exception.code, record
 
-    def test_claude_root_model_with_service_usage(self):
-        record = self.run_wrapper(0)
-        self.assertEqual(record["actual"]["model"], self.model)
-        self.assertEqual(record["actual"]["service_models"], sorted(self.result["modelUsage"]))
-        self.assertEqual(record["actual"]["model_usage"], self.result["modelUsage"])
+    def test_review_uses_fresh_codex_session(self):
+        status, record = self.call_review()
+        self.assertEqual(status, 0)
+        self.assertEqual(record["side"], "codex")
+        self.assertEqual(record["requested"]["model"], "gpt-6.2-sol")
+        self.assertEqual(record["actual"]["session_id"], "00000000-0000-4000-8000-000000000001")
+        self.assertEqual(record["actual"]["sandbox"], "read-only")
         self.assertEqual(record["findings"], [])
-        self.assertIn("finished_at", record)
-        self.assertEqual(record["diff"]["before"]["patch"], "diff synthetic\n")
-        self.assertEqual(record["diff"]["after"]["patch"], "diff synthetic\n")
 
-    def test_claude_wrong_or_missing_root_model(self):
-        entries = [json.loads(line) for line in self.fixture.read_text().splitlines()]
-        for model in ("other-model", None, ""):
-            entries[1]["message"]["model"] = model
-            self.transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
-            with self.subTest(model=model):
-                self.run_wrapper(3)
-        self.transcript.unlink()
-        self.assertFalse(self.run_wrapper(3, provider_exit=1)["unavailable"])
+    def test_simple_review_uses_terra(self):
+        status, record = self.call_review(simple=True)
+        self.assertEqual(status, 0)
+        self.assertEqual(record["actual"]["model"], "gpt-6.1-terra")
 
-    def test_claude_sidechain_ignored(self):
-        self.run_wrapper(0)
-        nested = self.transcript.parent / self.session / "subagents"
-        nested.mkdir(parents=True)
-        (nested / "child.jsonl").write_text('{"type":"assistant","message":{"model":"other"}}\n')
-        self.assertEqual(self.run_wrapper(0)["actual"]["model"], self.model)
-        entry = {"type": "assistant", "sessionId": self.session, "isSidechain": False,
-                 "message": {"model": "other-model"}}
-        with self.transcript.open("a") as fh:
-            fh.write(json.dumps(entry) + "\n")
-        self.assertEqual(self.run_wrapper(3)["actual"]["model"], [self.model, "other-model"])
+    def test_review_cannot_request_a_writable_sandbox(self):
+        status, record = self.call_review(flags=("--sandbox", "workspace-write", "--reason", "синтетика"))
+        self.assertEqual(status, 1)
+        self.assertIsNone(record)
 
-    def test_claude_invalid_transcript_and_unavailable(self):
-        with self.transcript.open("a") as fh:
-            fh.write("broken JSON\n")
-        self.assertTrue(self.run_wrapper(3)["findings"])
-        self.result = {}
-        self.assertTrue(self.run_wrapper(1, provider_exit=1)["unavailable"])
+    def test_review_rejects_unexpected_actual_sandbox(self):
+        status, record = self.call_review(actual_sandbox="workspace-write")
+        self.assertEqual(status, 3)
+        self.assertEqual(record["wrapper_exit"], 3)
+        self.assertIn("read-only", record["findings"][0])
 
 
 class EscalationTests(unittest.TestCase):

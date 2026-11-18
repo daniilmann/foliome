@@ -3,18 +3,12 @@
 
 Команды:
   list                  — реестр ролей.
-  build [--fallback]    — собрать субагентов Claude в .claude/agents/ (model, effort, tools, maxTurns из реестра) и
-                          инструкции ролей Codex в agents/codex/ — из определений плагинов ecc и voltagent учётки, где
-                          идёт сборка. --fallback: ещё Claude-версии пишущих ролей (Codex недоступен).
+  build                — собрать инструкции ролей из нативных определений Codex ECC и VoltAgent.
   run CODE --prompt-file F --journal J --cd DIR [--simple] [--effort E] [--sandbox S] [--reason R]
-           [--claude-unavailable | --codex-unavailable]
-                        — запустить роль: Claude — `claude -p --agent foliome-<код>` из корня репозитория (файлы ролей
-                          основной ветки), рабочая папка задачи — --cd; Codex — `codex exec` с моделью, effort, песочницей
-                          и инструкциями флагами, без коннекторов ChatGPT. В журнал: запрос и ответ дословно, запрошенная
-                          и фактическая модель, SHA и файлы до и после. Фактическая модель или effort не те или есть
-                          находка (субагент, коннекторы, правка папки проверяющей ролью, корень Codex не найден) — код
-                          выхода 3. Поставщик недоступен (роль упала, модели и новых сессий нет) — код роли и
-                          unavailable в журнале.
+                       — запустить свежую сессию codex exec с инструкциями роли и без коннекторов.
+                         Ревью — только read-only. В журнал — запрос, ответ, SHA, diff, настройки
+                         и фактические параметры сессии. Несовпадение модели, effort или нарушение
+                         ограничений роли даёт код 3. При недоступности Codex вызов можно повторить позже.
   state --cd DIR        — отпечаток рабочей папки (HEAD и хеш изменений): O сверяет его до и после проверяющей роли.
   log --journal J --kind K --role CODE (--text T | --text-file F)
                         — записать в журнал решение оркестратора, вывод проверок или заметку.
@@ -30,25 +24,15 @@
                           F — новый файл, ни один существующий источник не перезаписывается.
 Проверка учётки здесь — защита от ошибки, а не граница: границу держит учётка ОС (ADR-000, ADR-001).
 """
-import argparse, datetime, glob, hashlib, json, os, pwd, re, subprocess, sys, tempfile
+import argparse, datetime, glob, hashlib, json, os, pwd, re, subprocess, sys, tempfile, tomllib
 from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 HERE = os.path.join(ROOT, "agents")
 SNAP = os.path.join(HERE, "codex")
-OUT = os.path.join(ROOT, ".claude", "agents")
-PREFIX = "foliome-"
-MARK = "Сгенерировано agents/role.py build"
 REG = json.load(open(os.path.join(HERE, "roles.json"), encoding="utf-8"))
 COMMON = open(os.path.join(HERE, "common-overlay.md"), encoding="utf-8").read().strip()
-CLAUDE_PLUGINS = os.path.expanduser("~/.claude/plugins/cache")
-CODEX_HOME = os.path.expanduser("~/.codex")
-CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
-READ_TOOLS = ["Read", "Grep", "Glob"]
-WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
-SPAWN_TOOLS = {"Agent", "Task"}  # субагенты не порождают субагентов (ADR-022 п. 9)
-CODEX_ADAPTER = ("You are the agent below, adapted as a Codex role. Treat Claude Code tool names as capability hints; "
-                 "use only tools available in this Codex session.\n\n")
+CODEX_HOME = os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex"))
 DEV_CONFIG = os.path.expanduser("~/.config/foliome/dev.json")  # настройка `dev` вне кода (ADR-024 А.1)
 OPENSPEC_ENV = {"OPENSPEC_TELEMETRY": "0", "DO_NOT_TRACK": "1", "OPENSPEC_NO_UPDATE_CHECK": "1"}
 
@@ -109,82 +93,21 @@ def user():
     return pwd.getpwuid(os.geteuid()).pw_name  # не из переменных окружения
 
 
-# ---------- определения агентов ----------
-def version_key(path):
-    """Версия каталога плагина: релиз 2.0.0 старше 2.0.0-rc.1."""
-    ver = next((part for part in path.split(os.sep) if re.match(r"^\d+\.\d+", part)), "0")
-    core, _, pre = ver.partition("-")
-    return ([int(x) for x in re.findall(r"\d+", core)], 0 if pre else 1, pre)
-
-
-def claude_def_path(agent):
-    """ecc:X или voltagent-<sub>:X → файл определения последней версии плагина."""
-    plugin, name = agent.split(":", 1)
-    if plugin == "ecc":
-        pat = os.path.join(CLAUDE_PLUGINS, "ecc", "ecc", "*", "agents", f"{name}.md")
-    else:
-        pat = os.path.join(CLAUDE_PLUGINS, "voltagent-subagents", plugin, "*", f"{name}.md")
-    found = sorted(glob.glob(pat), key=version_key)
-    if not found:
-        die(f"нет определения {agent} ({pat}): установите плагины ecc и voltagent в этой учётке")
-    return found[-1]
-
-
-def codex_to_claude_agent(codex_agent):
-    """ecc-X → ecc:X; voltagent-X → voltagent-<sub>:X."""
-    if codex_agent.startswith("ecc-"):
-        return "ecc:" + codex_agent[4:]
-    name = codex_agent[len("voltagent-"):]
-    hits = glob.glob(os.path.join(CLAUDE_PLUGINS, "voltagent-subagents", "*", "*", f"{name}.md"))
-    subs = sorted({h.split(os.sep)[-3] for h in hits})
-    if len(subs) != 1:
-        die(f"Claude-агент для {codex_agent}: найдено {subs or 'ничего'}")
-    return subs[0] + ":" + name
-
-
-def claude_to_codex_agent(agent):
-    plugin, name = agent.split(":", 1)
-    return ("ecc-" if plugin == "ecc" else "voltagent-") + name
-
-
-def split_frontmatter(text):
-    m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
-    if not m:
-        return {}, text
-    fm = {}
-    for line in m.group(1).splitlines():
-        if ":" in line and not line.startswith(" "):
-            k, v = line.split(":", 1)
-            fm[k.strip()] = v.strip()
-    return fm, m.group(2)
-
-
-def parse_tools(raw):
-    if not raw:
-        return list(READ_TOOLS)
-    return [t.strip().strip('"\'') for t in raw.strip().strip("[]").split(",") if t.strip()]
-
-
 # ---------- сборка ----------
-def build_claude(code, role, agent, model, review, suffix=""):
-    src = claude_def_path(agent)
-    fm, body = split_frontmatter(open(src, encoding="utf-8").read())
-    base = parse_tools(fm.get("tools"))
-    tools = [t for t in base + [t for t in role.get("tools_add", []) if t not in base] if t not in SPAWN_TOOLS]
-    if review:
-        tools = [t for t in tools if t not in WRITE_TOOLS] or list(READ_TOOLS)
-    name = f"{PREFIX}{code.lower()}{suffix}"
-    desc = f"foliome, роль {code} (ADR-022): {role['when']}. Агент {agent}; модель {model}, effort {role['effort']}."
-    text = "\n".join([
-        "---", f"name: {name}", f"description: {json.dumps(desc, ensure_ascii=False)}", f"tools: {', '.join(tools)}",
-        f"model: {model}", f"effort: {role['effort']}", f"maxTurns: {REG['max_turns']['review' if review else 'default']}",
-        "---", "", f"<!-- {MARK}. Не править руками: правится реестр agents/roles.json. -->",
-        f"<!-- Источник: {os.path.relpath(src, os.path.expanduser('~'))} -->", "",
-        COMMON, "", f"## Оговорка роли {code}", "", role["overlay"], "", "## Исходное определение агента", "",
-        body.strip(), ""])
-    path = os.path.join(OUT, f"{name}.md")
-    open(path, "w", encoding="utf-8").write(scrub(text))
-    return path
+def codex_role_instructions(agent):
+    """Из нативного определения берём текст. Модель, effort и sandbox берём из реестра."""
+    pack, name = agent.split("-", 1)
+    if pack not in ("ecc", "voltagent") or not re.fullmatch(r"[a-z][a-z0-9-]+", name):
+        die(f"неизвестное определение роли Codex: {agent}")
+    source = Path(CODEX_HOME, "agents", pack, name + ".toml")
+    try:
+        with source.open("rb") as fh:
+            instructions = tomllib.load(fh).get("developer_instructions")
+    except (OSError, ValueError) as exc:
+        die(f"не удалось прочитать определение {agent} из {source}: {exc}")
+    if not isinstance(instructions, str) or not instructions.strip():
+        die(f"в {source} нет текста developer_instructions")
+    return scrub(instructions.strip() + "\n")
 
 
 # Определения плагинов публикуются в этом публичном репозитории: ссылки на задачи с номером убираются,
@@ -196,35 +119,14 @@ def scrub(text):
     return TASK_REF.sub(lambda m: m.group(1) + m.group(2) + "<n>", text)
 
 
-def build_codex(agent):
-    """Инструкции роли Codex = определение того же агента из плагина Claude (TOML агентов Codex не нужны)."""
-    _, body = split_frontmatter(open(claude_def_path(codex_to_claude_agent(agent)), encoding="utf-8").read())
-    path = os.path.join(SNAP, f"{agent}.md")
-    open(path, "w", encoding="utf-8").write(scrub(CODEX_ADAPTER + body.strip() + "\n"))
-    return path
-
-
-def cmd_build(a):
-    os.makedirs(OUT, exist_ok=True)
+def cmd_build(_):
+    snapshots = {agent: codex_role_instructions(agent)
+                 for agent in sorted({r["agent"] for r in REG["roles"].values()})}
     os.makedirs(SNAP, exist_ok=True)
-    for old in glob.glob(os.path.join(OUT, f"{PREFIX}*.md")):  # только наши сгенерированные файлы
-        if MARK in open(old, encoding="utf-8").read():
-            os.remove(old)
-    for old in glob.glob(os.path.join(SNAP, "*.md")):  # agents/codex/ целиком генерируется
-        os.remove(old)
-    made = []
-    for code, r in REG["roles"].items():
-        if r["side"] == "claude":
-            made.append(build_claude(code, r, r["agent"], r["model"], r.get("review", False)))
-            if r.get("review"):
-                made.append(build_claude(code, r, r["agent"], REG["simple"]["claude"], True, suffix="-simple"))
-        else:
-            made.append(build_codex(r["agent"]))
-            if a.fallback:
-                made.append(build_claude(code, r, codex_to_claude_agent(r["agent"]), "claude-opus-5-5", False,
-                                         suffix="-claude"))
-    for p in made:
-        print(os.path.relpath(p, ROOT))
+    for agent, instructions in snapshots.items():
+        path = Path(SNAP, agent + ".md")
+        path.write_text(instructions, encoding="utf-8")
+        print(os.path.relpath(path, ROOT))
 
 
 # ---------- запуск ----------
@@ -368,7 +270,7 @@ def codex_context(new_files, cwd, root_id):
                 ids.add(s["id"])
                 grown = True
     root = roots[0]
-    return {"model": root["model"], "effort": root["effort"], "sandbox": root["sandbox"], "rollout": root["rollout"],
+    return {"session_id": root["id"], "model": root["model"], "effort": root["effort"], "sandbox": root["sandbox"], "rollout": root["rollout"],
             "tokens": root["tokens"], "cli_version": root["cli_version"],
             "subagents": [brief(s) for s in mine[1:]], "other_sessions": [brief(s) for s in sessions if s not in mine],
             # только корень: файл потомка повторяет историю родителя; вложенные порождения видны по файлам потомков
@@ -395,76 +297,6 @@ def run_codex(role, code, model, effort, sandbox, prompt, cwd, out):
     return r, ctx, response
 
 
-def claude_root_model(session_id):
-    """Модели ответов корня Claude Code; формат закреплён синтетической фикстурой тестов.
-
-    Только projects/*/<session_id>.jsonl, без каталогов subagents и строк isSidechain.
-    Ошибка чтения или ответ без модели делает сверку неполной даже при других верных ответах.
-    """
-    ctx = {"model": None, "transcript": None}
-    if not isinstance(session_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", session_id):
-        return dict(ctx, error="не определён session_id корневого транскрипта Claude")
-    paths = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", session_id + ".jsonl"))
-    if len(paths) != 1:
-        return dict(ctx, error=f"корневых транскриптов Claude: {len(paths)}")
-    ctx["transcript"] = paths[0]
-    models, errors = set(), []
-    try:
-        with open(paths[0], encoding="utf-8") as fh:
-            for number, line in enumerate(fh, 1):
-                try:
-                    entry = json.loads(line)
-                    if not isinstance(entry, dict):
-                        raise ValueError("запись не объект")
-                except ValueError:
-                    errors.append(f"строка {number}: повреждён JSON")
-                    continue
-                if entry.get("isSidechain") is True or entry.get("type") != "assistant":
-                    continue
-                if entry.get("sessionId") != session_id:
-                    errors.append(f"строка {number}: другая или неизвестная сессия")
-                    continue
-                message = entry.get("message")
-                model = message.get("model") if isinstance(message, dict) else None
-                if not isinstance(model, str) or not model.strip():
-                    errors.append(f"строка {number}: нет модели ответа")
-                else:
-                    models.add(model)
-    except (OSError, UnicodeError) as exc:
-        errors.append(f"транскрипт не прочитан: {exc}")
-    models = sorted(models)
-    ctx["model"] = models[0] if len(models) == 1 else (models or None)
-    if not models:
-        errors.append("нет моделей ответов корня Claude")
-    if errors:
-        ctx["error"] = "; ".join(errors)
-    return ctx
-
-
-def run_claude(name, model, prompt, cwd):
-    agent_file = os.path.join(OUT, f"{name}.md")
-    if not os.path.exists(agent_file):
-        die(f"нет {os.path.relpath(agent_file, ROOT)}: выполните build" + (" --fallback" if name.endswith("-claude") else ""))
-    fm, _ = split_frontmatter(open(agent_file, encoding="utf-8").read())
-    cmd = ["claude", "-p", "--agent", name, "--permission-mode", "dontAsk", "--output-format", "json", "--strict-mcp-config",
-           "--allowedTools", *parse_tools(fm.get("tools"))]
-    if cwd != ROOT:
-        cmd += ["--add-dir", cwd]
-    env = dict(role_env(), ENABLE_CLAUDEAI_MCP_SERVERS="false")  # без коннекторов claude.ai (ADR-022 п. 6)
-    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=ROOT, env=env)  # файлы ролей — из корня
-    try:
-        d = json.loads(r.stdout)
-    except ValueError:
-        d = {}
-    if not isinstance(d, dict):
-        d = {}
-    usage = d.get("modelUsage")
-    ctx = dict(claude_root_model(d.get("session_id")), effort=fm.get("effort"),
-               sandbox=None, rollout=d.get("session_id"), tokens=d.get("usage"), cost_usd=d.get("total_cost_usd"),
-               service_models=sorted(usage) if isinstance(usage, dict) else [], model_usage=usage)
-    return r, ctx, d.get("result") or ""
-
-
 def append(journal, rec):
     os.makedirs(os.path.dirname(os.path.abspath(journal)), exist_ok=True)
     with open(journal, "a", encoding="utf-8") as fh:
@@ -478,16 +310,13 @@ def cmd_run(a):
     me = user()
     if (REG["p1_started"] or role.get("phase") != "design") and me != REG["zone_user"]:
         die(f"роль {code} работает только в учётке `{REG['zone_user']}` (ADR-022 п. 6), сейчас `{me}`")
-    side = role["side"]
-    if side == "claude" and a.claude_unavailable:  # ревьюер в Codex, только чтение (ADR-022 п. 8)
-        side = "codex"
-        role.update(agent=claude_to_codex_agent(role["agent"]), model=REG["roles"]["B"]["model"],
-                    sandbox="read-only" if role.get("review") else "danger-full-access")
-    elif side == "codex" and a.codex_unavailable:  # пишущая роль — субагент Claude того же агента
-        side = "claude-fallback"
-    if (a.effort and a.effort != role["effort"]) or (a.sandbox and a.sandbox != role.get("sandbox")):
-        if not a.reason:
-            die("отступ от реестра — только с --reason")
+    model = REG["simple"]["codex"] if a.simple else role["model"]
+    effort = a.effort or role["effort"]
+    sandbox = a.sandbox or role["sandbox"]
+    if role["sandbox"] == "read-only" and sandbox != "read-only":
+        die(f"роль {code} работает только в песочнице read-only")
+    if (effort != role["effort"] or sandbox != role["sandbox"]) and not a.reason:
+        die("отступ от реестра — только с --reason")
     if REG["p1_started"] or role.get("phase") != "design":  # то же условие, что у проверки учётки
         session_check()
     prompt = open(a.prompt_file, encoding="utf-8").read()
@@ -502,21 +331,7 @@ def cmd_run(a):
     before = {"task": fingerprint(cwd), "root": fingerprint(ROOT)}
     before_diff = worktree_diff(cwd)
     started = now()
-    if side == "codex":
-        model = REG["simple"]["codex"] if a.simple else role["model"]
-        effort = a.effort or role["effort"]
-        sandbox = a.sandbox or role.get("sandbox", "read-only")
-        r, ctx, response = run_codex(role, code, model, effort, sandbox, prompt, cwd, out)
-    else:
-        if a.simple and side == "claude":
-            name, model = f"{PREFIX}{code.lower()}-simple", REG["simple"]["claude"]
-        elif side == "claude-fallback":
-            name, model = f"{PREFIX}{code.lower()}-claude", "claude-opus-5-5"
-        else:
-            name, model = f"{PREFIX}{code.lower()}", role["model"]
-        effort, sandbox = role["effort"], None
-        r, ctx, response = run_claude(name, model, prompt, cwd)
-        open(out, "w", encoding="utf-8").write(response)
+    r, ctx, response = run_codex(role, code, model, effort, sandbox, prompt, cwd, out)
     after = {"task": fingerprint(cwd), "root": fingerprint(ROOT)}
     after_diff = worktree_diff(cwd)
     finished = now()
@@ -526,7 +341,7 @@ def cmd_run(a):
         changed = (git(cwd, "diff", "--name-only", f"{bh}..{ah}") or "").splitlines()
     committed = diff_output(cwd, "diff", "--binary", "--no-ext-diff", "--no-textconv", bh, ah, "--") if bh and ah else None
     touched = before != after
-    findings = []  # нарушения правил ADR-022 ролью; на стороне Claude субагенты и MCP закрыты списком инструментов
+    findings = []
     if ctx.get("subagents") or ctx.get("spawn_calls"):
         findings.append(f"роль породила субагентов: сессий {len(ctx.get('subagents') or [])}, "
                         f"вызовов spawn_agent {ctx.get('spawn_calls', 0)} (ADR-022 п. 9)")
@@ -534,26 +349,25 @@ def cmd_run(a):
         findings.append(f"в сессии роли коннекторы ChatGPT или MCP: {ctx.get('mcp_calls') or 'выданы'} (ADR-022 п. 6)")
     if role.get("review") and touched:
         findings.append("проверяющая роль изменила рабочую папку (ADR-022 п. 7)")
-    # поставщик недоступен: роль упала, модели нет и ни одной новой сессии — код роли, O переходит по ADR-022 п. 8
+    if ctx.get("rollout") and sandbox == "read-only" and ctx.get("sandbox") != "read-only":
+        findings.append("сессия роли не подтвердила песочницу read-only (ADR-026)")
     unavailable = (r.returncode != 0 and ctx.get("model") is None
-                   and not ctx.get("rollout") and not ctx.get("service_models") and not ctx.get("tokens")
+                   and not ctx.get("rollout") and not ctx.get("tokens")
                    and not ctx.get("subagents") and not ctx.get("other_sessions"))
-    if side == "codex" and ctx.get("error") and not unavailable:  # без корня субагентов и коннекторы не проверить
+    if ctx.get("error") and not unavailable:
         findings.append(f"{ctx['error']} — проверка субагентов и коннекторов не проведена (ADR-022 п. 7)")
-    if side != "codex" and ctx.get("error") and not unavailable:
-        findings.append(f"{ctx['error']} — модель корня Claude не проверена полностью (ADR-022 п. 7)")
-    mismatch = ctx.get("model") != model or (side == "codex" and ctx.get("effort") != effort)
+    mismatch = ctx.get("model") != model or ctx.get("effort") != effort
     # находка и чужая модель важнее кода выхода роли: иначе их можно принять за «поставщик недоступен»
     wrapper_exit = 3 if findings or (mismatch and not unavailable) else r.returncode
     append(a.journal, {
-        "ts": started, "finished_at": finished, "kind": "call", "role": code, "side": side, "agent": role["agent"], "user": me,
+        "ts": started, "finished_at": finished, "kind": "call", "role": code, "side": "codex", "agent": role["agent"], "user": me,
         "requested": {"model": model, "effort": effort, "sandbox": sandbox}, "actual": ctx,
         "reason": a.reason, "cwd": cwd, "before": before, "after": after, "changed_files": changed,
         "diff": {"before": before_diff, "after": after_diff, "committed": committed},
         "reviewer_touched_files": touched if role.get("review") else None, "findings": findings,
         "unavailable": unavailable, "exit": r.returncode, "wrapper_exit": wrapper_exit, "prompt": prompt, "response": response,
     })
-    print(f"роль {code} ({side}): {ctx.get('model')} / {ctx.get('effort')}; exit {r.returncode}; ответ — {out}")
+    print(f"роль {code} (codex): {ctx.get('model')} / {ctx.get('effort')}; exit {r.returncode}; ответ — {out}")
     if mismatch:
         print(f"ВНИМАНИЕ: запрошено {model}/{effort}, фактически {ctx.get('model')}/{ctx.get('effort')} "
               f"{ctx.get('error', '')}", file=sys.stderr)
@@ -786,14 +600,13 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", required=True)
     sp.add_parser("list").set_defaults(f=cmd_list)
-    b = sp.add_parser("build"); b.add_argument("--fallback", action="store_true"); b.set_defaults(f=cmd_build)
+    sp.add_parser("build").set_defaults(f=cmd_build)
     r = sp.add_parser("run"); r.add_argument("code"); r.add_argument("--prompt-file", required=True)
     r.add_argument("--journal", required=True); r.add_argument("--cd", required=True); r.add_argument("--simple", action="store_true")
     r.add_argument("--effort", choices=["low", "medium", "high"])
     r.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
     r.add_argument("--reason"); r.add_argument("--out")
-    fb = r.add_mutually_exclusive_group(); fb.add_argument("--claude-unavailable", action="store_true")
-    fb.add_argument("--codex-unavailable", action="store_true"); r.set_defaults(f=cmd_run)
+    r.set_defaults(f=cmd_run)
     st = sp.add_parser("state"); st.add_argument("--cd", default=ROOT); st.set_defaults(f=cmd_state)
     lg = sp.add_parser("log"); lg.add_argument("--journal", required=True)
     lg.add_argument("--kind", required=True, choices=["decision", "check", "note"])
