@@ -8,7 +8,7 @@ const { execFileSync }: typeof import('node:child_process') = require('node:chil
 
 /* Proposed closed port in base/release-observation.js:
  * observeRelease({ repository, commit, manifest, allowedPaths, artifacts,
- *   verifyPublisher, activate }) -> Promise<{ok:true, tree, stagingDir} |
+ *   verifyPublisher, stagingRoot }) -> Promise<{ok:true, tree, stagingDir} |
  *   {ok:false, code:'tree'|'artifact'|'signature'}>.
  * manifest is independently supplied: {commit, files:{path:{mode,blobSha,sha256}}}.
  * The adapter reads the exact Git commit's recursive ls-tree and blob bytes, rehashes
@@ -18,7 +18,7 @@ const { execFileSync }: typeof import('node:child_process') = require('node:chil
  * entry is the registry package archive and its signature is the registry proof.
  * verifyPublisher({name, bytes, signature}) is an independently supplied verifier,
  * called with the actual archive bytes and detached proof, and returns a boolean.
- * The adapter checks all hashes and signatures before activate({stagingDir}) is called.
+ * The adapter stages checked bytes as files only after hash and signature verification.
  * Refusal returns only the bounded code above, never untrusted exception text.
  */
 const git = (dir: string, ...args: string[]) =>
@@ -57,8 +57,8 @@ async function fixture() {
     await fs.writeFile(signaturePath, crypto.sign('sha256', bytes, privateKey));
     artifacts.push({ name, archivePath, signaturePath, sha256: digest(bytes) });
   }
-  let activations = 0;
-  let staged = '';
+  const stagingRoot = path.join(dir, 'verified');
+  await fs.mkdir(stagingRoot, { mode: 0o700 });
   const verified: string[] = [];
   const verifyPublisher = async ({
     name,
@@ -76,11 +76,6 @@ async function fixture() {
     verified.push(name);
     return crypto.verify('sha256', bytes, publicKey, signature);
   };
-  const activate = async ({ stagingDir }: { stagingDir: string }) => {
-    assert.notEqual(stagingDir, repository);
-    activations++;
-    staged = await fs.readFile(path.join(stagingDir, 'marker.txt'), 'utf8');
-  };
   return {
     dir,
     repository,
@@ -89,10 +84,9 @@ async function fixture() {
     marker,
     artifacts,
     verifyPublisher,
-    activate,
+    stagingRoot,
     verified,
     allowedPaths: ['marker.txt'],
-    activation: () => ({ activations, staged }),
   };
 }
 
@@ -119,7 +113,8 @@ test('наблюдает точный Git commit и проверяет реал�
       { path: 'marker.txt', mode: '100644', blobSha: blob(f.marker), sha256: digest(f.marker) },
     ]);
     assert.deepEqual(f.verified.sort(), ['registry', 'runtime', 'tool']);
-    assert.deepEqual(f.activation(), { activations: 1, staged: f.marker.toString('utf8') });
+    assert.equal(path.dirname(result.stagingDir), f.stagingRoot);
+    assert.deepEqual(await fs.readFile(path.join(result.stagingDir, 'marker.txt')), f.marker);
   });
 });
 
@@ -156,7 +151,7 @@ test('отклоняет несовпадающий commit, лишний пут�
       }
       const result = await port().observeRelease(f);
       assert.deepEqual(result, { ok: false, code: 'tree' }, kind);
-      assert.equal(f.activation().activations, 0, kind);
+      assert.deepEqual(await fs.readdir(f.stagingRoot), [], kind);
       assert.deepEqual(f.verified, [], kind);
     });
   }
@@ -184,7 +179,7 @@ test('отклоняет неверный digest или отказ незави�
         { ok: false, code: kind === 'hash' ? 'artifact' : 'signature' },
         kind,
       );
-      assert.equal(f.activation().activations, 0, kind);
+      assert.deepEqual(await fs.readdir(f.stagingRoot), [], kind);
     });
   }
 });
