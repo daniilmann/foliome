@@ -44,7 +44,8 @@ class OrchestratorTests(unittest.TestCase):
         return {"type": "session_meta", "payload": {"source": source, "id": self.session_id, "cwd": str(self.cwd)}}
 
     def evaluate(self, marker, offset=0, resume_id=None):
-        evidence = orchestrator.startup_evidence(self.trace, marker, offset)
+        world = orchestrator.world_state_before(self.trace, offset) if offset else None
+        evidence = orchestrator.startup_evidence(self.trace, marker, offset, world)
         self.assertIsNotNone(evidence)
         return orchestrator.verify_evidence(*evidence, self.settings, self.cwd, resume_id)
 
@@ -80,6 +81,20 @@ class OrchestratorTests(unittest.TestCase):
                     self.evaluate("resume", size, self.session_id)
         self.write([self.metadata(), *self.turn("previous", "start"), *self.turn("resumed", "resume")])
         self.assertEqual(self.evaluate("resume", size, self.session_id), self.session_id)
+
+    def test_resume_merges_the_current_inventory_delta(self):
+        self.write([self.metadata(), *self.turn("previous", "start")])
+        offset = self.trace.stat().st_size
+        for tools in ({"collaboration.spawn_agent": {}}, {"mcp__codex_apps__example": {}}):
+            with self.subTest(tools=tools):
+                resumed = self.turn("resumed", "resume", full=False, tools=tools)
+                resumed[2]["payload"]["state"].pop("apps_instructions")
+                self.write([self.metadata(), *self.turn("previous", "start"), *resumed])
+                if "mcp__codex_apps__example" in tools:
+                    with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
+                        self.evaluate("resume", offset, self.session_id)
+                else:
+                    self.assertEqual(self.evaluate("resume", offset, self.session_id), self.session_id)
 
     def test_resume_accepts_only_verified_project_session(self):
         self.trace.touch()

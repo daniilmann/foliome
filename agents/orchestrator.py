@@ -24,7 +24,40 @@ class StartupRejected(Exception):
     """The active session has insufficient or mismatched startup evidence."""
 
 
-def startup_evidence(path, marker, offset=0):
+def apply_world_state(previous, payload):
+    """Codex writes a full inventory on start and incremental changes on resume."""
+    state = payload.get("state") if isinstance(payload, dict) else None
+    if not isinstance(state, dict):
+        return None
+    full = payload.get("full")
+    if full is True:
+        return state
+    if full is not False or previous is None:
+        return None
+    effective = {**previous, **state}
+    if "top_level_tools" in state:
+        before, changes = previous.get("top_level_tools"), state["top_level_tools"]
+        if not isinstance(before, dict) or not isinstance(changes, dict):
+            return None
+        # Keep observed tool names when the trace supplies only a patch of the map.
+        effective["top_level_tools"] = {**before, **changes}
+    return effective
+
+
+def world_state_before(path, offset):
+    state = None
+    with path.open("rb") as trace:
+        while trace.tell() < offset:
+            line = trace.readline()
+            if not line or not line.endswith(b"\n") or trace.tell() > offset:
+                return None
+            row = json.loads(line)
+            if isinstance(row, dict) and row.get("type") == "world_state":
+                state = apply_world_state(state, row.get("payload") or {})
+    return state
+
+
+def startup_evidence(path, marker, offset=0, prior_world=None):
     """Read tool and model evidence for the turn with this launch's user marker."""
     with path.open(encoding="utf-8") as trace:
         meta = json.loads(trace.readline())
@@ -37,6 +70,7 @@ def startup_evidence(path, marker, offset=0):
             trace.seek(offset)
 
         turn = {}
+        world = prior_world
         for line in trace:
             if not line.endswith("\n"):
                 break
@@ -47,8 +81,12 @@ def startup_evidence(path, marker, offset=0):
             kind = row.get("type")
             if kind == "event_msg" and payload.get("type") == "task_started":
                 turn = {"id": payload.get("turn_id")}
-            elif kind == "world_state" and payload.get("full") is True:
-                turn["state"] = payload.get("state")
+            elif kind == "world_state":
+                world = apply_world_state(world, payload)
+                if world is None:
+                    turn.pop("state", None)
+                else:
+                    turn["state"] = world
             elif kind == "turn_context" and payload.get("turn_id") == turn.get("id"):
                 turn["context"] = payload
             elif kind == "response_item" and payload.get("type") == "additional_tools":
@@ -113,7 +151,7 @@ def save_result(path, result):
     os.replace(f.name, path)
 
 
-def verify_startup(process, marker, prior_paths, resumed, offset, settings, cwd, session_id):
+def verify_startup(process, marker, prior_paths, resumed, offset, prior_world, settings, cwd, session_id):
     deadline = time.monotonic() + STARTUP_TIMEOUT
     while process.poll() is None and time.monotonic() < deadline:
         paths = {Path(path): 0 for path in role.rollouts() - prior_paths}
@@ -122,7 +160,7 @@ def verify_startup(process, marker, prior_paths, resumed, offset, settings, cwd,
         matches = []
         for path, position in paths.items():
             try:
-                evidence = startup_evidence(path, marker, position)
+                evidence = startup_evidence(path, marker, position, prior_world if path == resumed else None)
             except (OSError, ValueError):
                 continue
             if evidence:
@@ -153,7 +191,8 @@ def launch(settings, cwd, journal, session_id=None, resumed=None):
     prior_paths = role.rollouts()
     try:
         offset = resumed.stat().st_size if resumed else 0
-    except OSError:
+        prior_world = world_state_before(resumed, offset) if resumed else None
+    except (OSError, ValueError):
         print("Codex O: журнал продолжения недоступен.", file=sys.stderr)
         return None
     terminal = termios.tcgetattr(sys.stdin)
@@ -162,7 +201,7 @@ def launch(settings, cwd, journal, session_id=None, resumed=None):
     child = subprocess.Popen(command(settings, cwd, journal.parent, prompt, session_id),
                              env={**os.environ, **role.OPENSPEC_ENV})
     try:
-        verified = verify_startup(child, marker, prior_paths, resumed, offset, settings, cwd, session_id)
+        verified = verify_startup(child, marker, prior_paths, resumed, offset, prior_world, settings, cwd, session_id)
         if verified is not None:
             rollout, actual_id = verified
             save_result(result_path, {**result, **settings, "session_id": actual_id,
