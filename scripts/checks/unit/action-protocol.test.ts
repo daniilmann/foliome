@@ -186,3 +186,105 @@ for (const table of ['action_verdicts', 'action_outcomes'] as const) {
     }
   });
 }
+
+type BrowserEvent = {
+  sessionId: string; sourceId: string; accessId: string; stepNumber: number;
+  kind: 'main-frame-navigation' | 'non-get-request'; method: string; host: string; path: string;
+};
+
+const browserEvents: BrowserEvent[] = [
+  { sessionId: 'session-1', sourceId: 'source-1', accessId: 'access-1', stepNumber: 1,
+    kind: 'main-frame-navigation', method: 'GET', host: 'example.test', path: '/fixture' },
+  { sessionId: 'session-1', sourceId: 'source-1', accessId: 'access-1', stepNumber: 2,
+    kind: 'non-get-request', method: 'POST', host: 'example.test', path: '/fixture' },
+];
+
+test('при отказе записи вердикта итога навигации главного фрейма или не-GET отзывает сессию в том числе без команды агента', async (t: import('node:test').TestContext) => {
+  const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+  const { createPreparationSession } = await import('../../../core/use-cases/preparation.ts');
+
+  for (const failure of ['verdict', 'outcome', 'main-frame-navigation', 'non-get-request'] as const) {
+    await t.test(failure, async () => {
+      const database = new DatabaseSync(':memory:');
+      try {
+        const protocol = createActionProtocol(database, () => 1) as unknown as {
+          appendVerdict(value: typeof allowedVerdict): number;
+          appendOutcome(value: { verdictId: number; status: 'ok' }): void;
+          appendBrowserEvent(value: BrowserEvent): void;
+        };
+        let verdictId = 0;
+        let reads = 0;
+        let closes = 0;
+        let unavailable = 0;
+        let writeError: unknown;
+        const write = (operation: () => void) => {
+          try {
+            operation();
+          } catch (error) {
+            writeError = error;
+            throw error;
+          }
+        };
+        const ports = {
+          openSource: async () => {},
+          closeSource: async () => { closes++; },
+          saveVerdict: async () => { write(() => { verdictId = protocol.appendVerdict(allowedVerdict); }); },
+          read: async () => {
+            reads++;
+            if (failure === 'outcome') database.exec('PRAGMA query_only = ON');
+            return 'fixture-result';
+          },
+          saveOutcome: async () => { write(() => protocol.appendOutcome({ verdictId, status: 'ok' })); },
+          saveBrowserEvent: async (event: BrowserEvent) => { write(() => protocol.appendBrowserEvent(event)); },
+          protocolUnavailable: async () => { unavailable++; },
+        };
+        const session = createPreparationSession(ports) as unknown as {
+          open(): Promise<void>; bindSnapshot(snapshot: string): void;
+          readForVerdict(snapshot: string): Promise<string>;
+          recordBrowserEvent(event: BrowserEvent): Promise<void>;
+        };
+        await session.open();
+        session.bindSnapshot('snapshot-1');
+        if (failure !== 'outcome') database.exec('PRAGMA query_only = ON');
+        if (failure === 'verdict' || failure === 'outcome') {
+          await assert.rejects(session.readForVerdict('snapshot-1'), { message: 'protocol-unavailable' });
+        } else {
+          const event = browserEvents.find((value) => value.kind === failure)!;
+          await assert.rejects(session.recordBrowserEvent(event), { message: 'protocol-unavailable' });
+        }
+        assert.equal((writeError as { errcode?: number } | undefined)?.errcode, 8);
+        assert.equal(closes, 1);
+        assert.equal(reads, failure === 'outcome' ? 1 : 0);
+        await assert.rejects(session.readForVerdict('snapshot-1'));
+        assert.equal(reads, failure === 'outcome' ? 1 : 0);
+        assert.equal(database.prepare('SELECT count(*) AS n FROM action_verdicts').get().n, failure === 'outcome' ? 1 : 0);
+        assert.equal(database.prepare('SELECT count(*) AS n FROM action_outcomes').get().n, 0);
+        assert.equal(unavailable, 1);
+      } finally {
+        database.close();
+      }
+    });
+  }
+});
+
+test('дозаписывает событие браузера в таблицу STRICT', async () => {
+  const { createActionProtocol } = await import('../../../core/adapters/store/action-protocol.ts');
+  const database = new DatabaseSync(':memory:');
+  try {
+    const protocol = createActionProtocol(database, () => 1) as unknown as {
+      appendBrowserEvent(value: BrowserEvent): void;
+    };
+    protocol.appendBrowserEvent(browserEvents[0]);
+    const schema = database.prepare('PRAGMA table_list').all().find((entry: { name: string }) => entry.name === 'action_browser_events');
+    assert.equal(schema.strict, 1);
+    const row = database.prepare('SELECT session_id, source_id, access_id, step_number, kind, method, host, path FROM action_browser_events').get();
+    assert.deepEqual({ ...row }, {
+      session_id: 'session-1', source_id: 'source-1', access_id: 'access-1', step_number: 1,
+      kind: 'main-frame-navigation', method: 'GET', host: 'example.test', path: '/fixture',
+    });
+    assert.throws(() => database.exec("UPDATE action_browser_events SET path = '/other'"));
+    assert.throws(() => database.exec('DELETE FROM action_browser_events'));
+  } finally {
+    database.close();
+  }
+});
