@@ -9,4 +9,9 @@ export default [
       '@typescript-eslint/no-require-imports': 'off',
     },
   },
+  {
+    // Stand fixtures exercise dynamically shaped browser and IPC messages.
+    files: ['test/stand/**/*.ts'],
+    rules: { '@typescript-eslint/no-explicit-any': 'off' },
+  },
 ];

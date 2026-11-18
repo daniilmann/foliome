@@ -1,4 +1,3 @@
-const assert = require('node:assert/strict');
 const net = require('node:net');
 const { once } = require('node:events');
 const { mkdtemp, rm } = require('node:fs/promises');
