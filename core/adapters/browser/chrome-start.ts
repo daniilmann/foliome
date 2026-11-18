@@ -2,6 +2,7 @@ type Browser = { close(): Promise<void> };
 
 type ChromeLaunchOptions = {
   channel: 'chrome';
+  headless: false;
   chromiumSandbox: true;
   args: string[];
   ignoreDefaultArgs: string[];
@@ -56,6 +57,7 @@ async function start<T extends Browser>(
       const browser = await ports.launch(
         {
           channel: 'chrome',
+          headless: false,
           chromiumSandbox: true,
           args: ['--disable-sync'],
           ignoreDefaultArgs: [

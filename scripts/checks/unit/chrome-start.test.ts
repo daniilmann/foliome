@@ -36,6 +36,7 @@ test('после проверки подписи запускает Chrome по 
       assert.equal(signal.aborted, false);
       assert.deepEqual(options, {
         channel: 'chrome',
+        headless: false,
         chromiumSandbox: true,
         args: ['--disable-sync'],
         ignoreDefaultArgs: [
