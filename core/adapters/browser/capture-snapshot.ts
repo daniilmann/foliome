@@ -24,6 +24,7 @@ type Frame = Readonly<{
   viewport?: Viewport;
   viewportStable: boolean;
   maskAnimationActive: boolean;
+  participatingWorlds?: unknown;
 }>;
 type DeviationCode = 'retake' | 'unstable' | 'limit' | 'error';
 export type SnapshotDeviationFlag =
@@ -276,7 +277,11 @@ async function capture(
         !isDeepStrictEqual([...baseline.animationIds].sort(), [...second.animationIds].sort())
       )
         differences.push('animations');
-      if (baseline.revision !== second.revision) differences.push('observer');
+      if (
+        baseline.revision !== second.revision ||
+        !isDeepStrictEqual(baseline.participatingWorlds, second.participatingWorlds)
+      )
+        differences.push('observer');
       if (
         !baseline.viewportStable ||
         !second.viewportStable ||

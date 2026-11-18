@@ -473,6 +473,11 @@ async function prepare(
             rootClasses: DocumentFacts['classes'] = [];
           let rootSemantics: string[] = [];
           const embeds: { url: string; visible: boolean }[] = [];
+          const participatingWorlds: {
+            frameId: string;
+            context: number;
+            observation: Observation;
+          }[] = [];
           const visit = async (
             frame: FrameTree,
             foreignAncestor: boolean,
@@ -534,6 +539,8 @@ async function prepare(
                   rootClasses = data.classes;
                   rootSemantics = data.semantics;
                 }
+                if (!data.observation || !Number.isSafeInteger(data.observation.revision))
+                  throw new Error();
                 for (let i = 0; i < data.nodes.length; i++) {
                   const parent = data.parents[i];
                   if (
@@ -550,6 +557,11 @@ async function prepare(
                 }
                 secrets.push(...data.secrets);
                 embeds.push(...data.embeds);
+                participatingWorlds.push({
+                  frameId: frame.frame.id,
+                  context: world.executionContextId as number,
+                  observation: data.observation,
+                });
               } catch (error) {
                 nodes.length = base;
                 secrets.length = secretBase;
@@ -600,6 +612,7 @@ async function prepare(
             rootIdentities,
             rootClasses,
             rootSemantics,
+            participatingWorlds,
           };
         });
         if (closed) throw new Error();
@@ -892,6 +905,7 @@ async function prepare(
           animationIds: [`document:${rootContext}`, ...observed.animationIds],
           viewportStable: observed.viewportStable,
           maskAnimationActive: observed.maskAnimationActive,
+          participatingWorlds: collected.participatingWorlds,
         };
       },
       async close(): Promise<void> {
