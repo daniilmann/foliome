@@ -1452,6 +1452,197 @@ test(
   },
 );
 
+test(
+  'нарисованные номера защищены вместе с запасом и конечным оформлением',
+  { timeout: 120_000 },
+  async (t: import('node:test').TestContext) => {
+    const cases = [
+      {
+        name: 'соседние span',
+        body: '<div id="target" class="mark"><span>4111 </span><span>1111 </span><span>1111 </span><span>1111</span></div>',
+        kind: 'split',
+      },
+      {
+        name: 'aria-hidden',
+        body: '<div id="target" class="mark" aria-hidden="true">4111 1111 1111 1111</div>',
+        kind: 'text',
+      },
+      {
+        name: 'before literal',
+        body: '<style>#target::before{content:"4111 1111 1111 1111";position:absolute;left:0;top:0}</style><div id="target" class="mark"></div>',
+        kind: 'pseudo',
+      },
+      {
+        name: 'before attr вне host',
+        body: '<style>#target::before{content:attr(data-card);position:absolute;left:40px;top:20px}</style><div id="target" class="mark" data-card="4111 1111 1111 1111"></div>',
+        kind: 'outside',
+      },
+      {
+        name: 'text-shadow',
+        body: '<div id="target" class="mark" style="text-shadow:0 35px 0 rgb(240,30,50)">4111 1111 1111 1111</div>',
+        kind: 'shadow',
+      },
+      {
+        name: 'drop-shadow',
+        body: '<div id="target" class="mark" style="filter:drop-shadow(0 35px 0 rgb(240,30,50))">4111 1111 1111 1111</div>',
+        kind: 'shadow',
+      },
+      {
+        name: 'reflect',
+        body: '<div id="target" class="mark" style="-webkit-box-reflect:below 12px">4111 1111 1111 1111</div>',
+        kind: 'reflect',
+      },
+      {
+        name: 'svg use',
+        body: '<svg style="position:absolute;left:20px;top:20px;width:300px;height:110px"><defs><text id="glyph" x="0" y="20" fill="rgb(240,30,50)" font-family="monospace" font-size="20">4111 1111 1111 1111</text></defs><use href="#glyph" x="30" y="30"/></svg>',
+        kind: 'svg',
+      },
+    ];
+    for (const fixture of cases)
+      await t.test(fixture.name, async () => {
+        await measuredPage(
+          `<style>.mark{left:20px;top:20px;color:rgb(240,30,50);font:20px/24px monospace;white-space:pre;width:max-content}</style>${fixture.body}<div id="ordinary" style="left:330px;top:180px;width:70px;height:40px;background:rgb(20,100,220)"></div>`,
+          async ({ page, capture, decode }: any) => {
+            const before = await decode(await capture.raw());
+            // The first twelve digits are sensitive. The final four may remain visible.
+            const region = await page.evaluate((kind: string) => {
+              if (kind === 'svg') {
+                const glyph = document.querySelector('#glyph') as SVGTextElement;
+                const box = glyph.getBBox();
+                return {
+                  x: 50 + box.x,
+                  y: 50 + box.y,
+                  width: glyph.getSubStringLength(0, 14),
+                  height: box.height,
+                };
+              }
+              const host = document.querySelector('#target')!;
+              if (kind === 'pseudo' || kind === 'outside') {
+                const box = host.getBoundingClientRect();
+                return {
+                  x: box.x + (kind === 'outside' ? 40 : 0),
+                  y: box.y + (kind === 'outside' ? 20 : 0),
+                  width: (() => {
+                    const context = document.createElement('canvas').getContext('2d')!;
+                    context.font = '20px monospace';
+                    return context.measureText('4111 1111 1111 1111').width;
+                  })(),
+                  height: 24,
+                };
+              }
+              const range = document.createRange();
+              if (kind === 'split') {
+                range.setStart(host.querySelectorAll('span')[0].firstChild!, 0);
+                range.setEnd(host.querySelectorAll('span')[2].firstChild!, 4);
+              } else {
+                range.setStart(host.firstChild!, 0);
+                range.setEnd(host.firstChild!, 14);
+              }
+              const box = range.getBoundingClientRect();
+              return { x: box.x, y: box.y, width: box.width, height: box.height };
+            }, fixture.kind);
+            const areas = [region];
+            if (fixture.kind === 'shadow') areas.push({ ...region, x: region.x, y: region.y + 35 });
+            if (fixture.kind === 'reflect') {
+              const host = await page.locator('#target').boundingBox();
+              assert.ok(host);
+              areas.push({
+                x: host.x,
+                y: host.y + host.height + 12,
+                width: host.width,
+                height: host.height,
+              });
+            }
+            for (const area of areas) {
+              let colored = 0;
+              for (let y = Math.ceil(area.y); y < Math.floor(area.y + area.height); y++)
+                for (let x = Math.ceil(area.x); x < Math.floor(area.x + area.width); x++) {
+                  const p = pixelAt(before, x, y);
+                  if (p[0] > 150 && p[0] > p[1] * 2 && p[0] > p[2] * 2) colored++;
+                }
+              assert.ok(colored > 0, `${fixture.name}: region must contain rendered red pixels`);
+            }
+            const result = await capture.result();
+            assert.equal(result.ok, true);
+            assert.ok(
+              Buffer.isBuffer(result.image.bytes),
+              `finite ${fixture.name}: ${result.image.code}`,
+            );
+            const after = await decode(result.image.bytes);
+            const labels = await numberedLabelAreas(page);
+            for (const span of await page.locator('#target span').all()) {
+              const box = await span.boundingBox();
+              if (box)
+                labels.push({
+                  x: Math.max(0, Math.floor(box.x)),
+                  y: Math.max(0, Math.floor(box.y)),
+                });
+            }
+            for (const area of areas)
+              assertRectBlack(
+                after,
+                { x: area.x - 4, y: area.y - 4, width: area.width + 8, height: area.height + 8 },
+                labels,
+              );
+            assert.deepEqual(pixelAt(before, 370, 200), [20, 100, 220, 255]);
+            assert.deepEqual(pixelAt(after, 370, 200), [20, 100, 220, 255]);
+          },
+        );
+      });
+  },
+);
+
+test(
+  'принятый остаток: синтетические метки img и canvas остаются видимыми',
+  { timeout: 60_000 },
+  async () => {
+    const image = encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="220" height="40"><text x="0" y="25" fill="rgb(240,30,50)" font-family="monospace" font-size="18">4111 1111 1111 1111</text></svg>`,
+    );
+    await measuredPage(
+      `<img style="position:absolute;left:20px;top:30px" width="220" height="40" src="data:image/svg+xml,${image}"><canvas width="220" height="40" style="position:absolute;left:20px;top:100px"></canvas><script>const c=document.querySelector('canvas').getContext('2d');c.fillStyle='rgb(240,30,50)';c.font='18px monospace';c.fillText('4111 1111 1111 1111',0,25)</script>`,
+      async ({ capture, decode }: any) => {
+        const before = await decode(await capture.raw());
+        const result = await capture.result();
+        assert.equal(result.ok, true);
+        assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
+        const after = await decode(result.image.bytes);
+        for (const top of [30, 100]) {
+          let colored = 0;
+          for (let y = top; y < top + 40; y++)
+            for (let x = 30; x < 200; x++) {
+              const pixel = pixelAt(before, x, y);
+              if (pixel[0] > 150 && pixel[0] > pixel[1] * 2 && pixel[0] > pixel[2] * 2) {
+                colored++;
+                assert.deepEqual(pixelAt(after, x, y), pixel, `marker at ${x},${y}`);
+              }
+            }
+          assert.ok(colored > 0, 'number must actually be drawn');
+        }
+      },
+    );
+  },
+);
+
+test('закрытый shadow обозначен недоступным в текстовом снимке', { timeout: 60_000 }, async () => {
+  await measuredPage(
+    '<div id="target" style="left:20px;top:20px;width:120px;height:60px"></div><div id="ordinary" style="left:300px;top:30px">Readable marker</div><script>document.querySelector("#target").attachShadow({mode:"closed"}).append(document.createTextNode("Hidden marker"))</script>',
+    async ({ capture }: any) => {
+      const result = await capture.result();
+      assert.equal(result.ok, true);
+      const output = JSON.stringify(result.snapshot);
+      assert.ok(output.includes('Readable marker'));
+      assert.equal(output.includes('Hidden marker'), false);
+      // Proposed minimal representation: state on the host, analogous to unavailable frames.
+      assert.ok(
+        result.snapshot.elements.some(
+          (element: any) => element.attrs?.id === 'target' && element.state === 'unavailable',
+        ),
+      );
+    },
+  );
+});
+
 async function measuredPage(body: string, run: (fixture: any) => Promise<void>) {
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   const { prepareDomCollector } =
