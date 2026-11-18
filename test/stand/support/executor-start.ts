@@ -31,10 +31,15 @@ async function stand(overrides: any, run: (fixture: any) => Promise<void>) {
   const calls: any[] = [];
   const chromeLaunches: any[] = [];
   const clients: any[] = [];
-  let finishProcess!: (code: number | null) => void;
-  const finished = new Promise<number | null>(resolve => { finishProcess = resolve; });
+  const processes: { finish: (code: number | null) => void }[] = [];
   let stops = 0;
-  const processHandle = { started: true, finished, stop: async () => { stops++; finishProcess(null); } };
+  const finishProcess = (code: number | null, index = processes.length - 1) => processes[index].finish(code);
+  function newProcess() {
+    let finish!: (code: number | null) => void;
+    const finished = new Promise<number | null>(resolve => { finish = resolve; });
+    processes.push({ finish });
+    return { started: true, finished, stop: async () => { stops++; } };
+  }
   const paths = { home: join(dir, 'home'), app: join(dir, 'app'), data: join(dir, 'data'), channel: join(dir, 'channel'), socket: join(dir, 'channel.sock'), database: join(dir, 'core.db'), sshConfig: join(dir, 'data', 'ssh_config') };
   const good = { permissions: { home: true, app: true, data: true, channel: true, socket: true }, adminMembers: ['root', 'synthetic-owner'], canary: 'refused' };
   const observation = { ...good, ...overrides.observation };
@@ -44,7 +49,7 @@ async function stand(overrides: any, run: (fixture: any) => Promise<void>) {
     kernel = await createInstalledKernel({
       paths, ownerName: 'synthetic-owner', executorUid,
       observeMacOS: async () => observation,
-      runProcess: async (...args: any[]) => { calls.push(args); if (overrides.spawnFails) throw new Error(secretMarker); return overrides.processResult ?? processHandle; },
+      runProcess: async (...args: any[]) => { calls.push(args); if (overrides.spawnFails) throw new Error(secretMarker); return overrides.processResult ?? newProcess(); },
       launchChrome: async () => {
         chromeLaunches.push('launch');
         const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
@@ -53,8 +58,12 @@ async function stand(overrides: any, run: (fixture: any) => Promise<void>) {
           const context = await newContext(...args);
           // Registered first: product owner-window routing retains priority.
           await context.route('**/*', async (route: any) => {
-            if (route.request().method() === 'GET' && route.request().url() === sourceUrl) {
-              await route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Synthetic source</title><input type="password" aria-label="Synthetic password"><p>Synthetic visible text</p>' });
+            const request = route.request();
+            const url = new URL(request.url());
+            if (url.origin === 'https://cabinet.invalid' && request.method() === 'GET' && ['/overview', '/next'].includes(url.pathname)) {
+              await route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Synthetic source</title><input type="password" aria-label="Synthetic password"><p>Synthetic visible text</p><a href="/next?unknown=synthetic-query-marker">Next</a><form method="post" action="/submit?unknown=synthetic-query-marker"><input name="payload" value="synthetic-body-marker"><button>Submit synthetic</button></form>' });
+            } else if (url.origin === 'https://cabinet.invalid' && request.method() === 'POST' && url.pathname === '/submit') {
+              await route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Synthetic submitted</title><p>Synthetic result</p>' });
             } else await route.abort();
           });
           return context;
