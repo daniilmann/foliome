@@ -60,7 +60,15 @@ type NodeFact = {
 };
 type Secret = { value: string; kind: 'login' | 'password' | 'code' };
 type Rect = { x: number; y: number; width: number; height: number };
-type Geometry = { rect: Rect; runs: Rect[]; mask: boolean; button: boolean; ancestors: number[] };
+type Geometry = {
+  rect: Rect;
+  runs: Rect[];
+  mask: boolean;
+  button: boolean;
+  ancestors: number[];
+  frameUrl: string | null;
+  transformed: boolean;
+};
 type Viewport = { x: number; y: number; width: number; height: number };
 type Observation = {
   viewport: Viewport;
@@ -73,6 +81,7 @@ type Observation = {
   viewportStable: boolean;
   maskAnimationActive: boolean;
   unsupported: boolean;
+  unobservedEmbeds: boolean;
 };
 type DocumentFacts = {
   url: string;
@@ -86,10 +95,28 @@ type DocumentFacts = {
   embeds: { url: string; visible: boolean }[];
   observation: Observation;
 };
+type ParticipatingWorld = {
+  frameId: string;
+  parentFrameId: string | null;
+  url: string;
+  context: number;
+  base: number;
+  count: number;
+  identities: number[];
+  observation: Observation;
+  projection?: Region;
+};
+type Region = { x: number; y: number; clip: Rect };
+type Label = { x: number; y: number; number: number };
+type Plan = { masks: Rect[]; labels: Label[] };
+type WorldPlan = Plan & { maskAnimationActive: boolean };
 
 // This expression is owned by the adapter and runs only in its isolated world.
+const hasTransform = `style => style.transform !== 'none' || style.perspective !== 'none' ||
+  style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' || style.offsetPath !== 'none'`;
 const expression = `(() => {
   const nodes = [], parents = [], identities = [], classes = [], semantics = [], secrets = [], embeds = [], geometry = [];
+  const visitedEmbeds = new Set(), hasTransform = ${hasTransform};
   const state = globalThis.__foliomeObservation || (globalThis.__foliomeObservation = (() => {
     const state = { revision: 0, ids: new WeakMap(), next: 1, watched: new WeakSet() };
     state.observer = new MutationObserver(() => { state.revision++; });
@@ -111,14 +138,17 @@ const expression = `(() => {
     const style = getComputedStyle(element), rect = element.getBoundingClientRect();
     const subtreeVisible = ancestorsVisible && style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) > 0 && !element.hasAttribute('hidden') && !element.hasAttribute('inert') && element.getAttribute('aria-hidden') !== 'true';
     const visible = subtreeVisible && rect.width > 0 && rect.height > 0;
-    if ((tag === 'IFRAME' || tag === 'FRAME') && element.src) embeds.push({ url: element.src, visible });
+    const frame = tag === 'IFRAME' || tag === 'FRAME';
+    const embed = frame || tag === 'OBJECT' || tag === 'EMBED';
+    const frameUrl = frame && element.src ? element.src : null;
+    if (frameUrl) embeds.push({ url: frameUrl, visible });
+    if (embed) visitedEmbeds.add(element);
     for (const pseudo of ['::before', '::after']) {
       const content = getComputedStyle(element, pseudo).content;
       if (content !== 'none' && content !== 'normal') unsupported = true;
     }
     if (style.textShadow !== 'none' || style.filter !== 'none' || style.webkitBoxReflect !== 'none' && style.webkitBoxReflect !== '' ||
-        style.transform !== 'none' || style.perspective !== 'none' || style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' ||
-        style.offsetPath !== 'none' || style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth || '0') > 0 || (style.zoom !== '1' && style.zoom !== 'normal') || tag === 'USE' || tag === 'SVG') unsupported = true;
+        style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth || '0') > 0 || (style.zoom !== '1' && style.zoom !== 'normal') || tag === 'USE' || tag === 'SVG') unsupported = true;
     const role = (element.getAttribute('role') || tag.toLowerCase()).toLowerCase();
     const closedField = element.isContentEditable || element.hasAttribute('contenteditable') || role === 'slider';
     const type = tag === 'INPUT' ? element.type.toLowerCase() : '';
@@ -161,7 +191,7 @@ const expression = `(() => {
       if (!state.ids.has(current)) state.ids.set(current, state.next++);
       ancestors.push(state.ids.get(current));
     }
-    geometry.push({ rect: rectValue(rect), runs, button, ancestors, mask: field || tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED' });
+    geometry.push({ rect: rectValue(rect), runs, button, ancestors, frameUrl, transformed: hasTransform(style), mask: field || embed });
     if (!field) for (const child of element.children) visit(child, visible ? index : parent, subtreeVisible);
   };
   if (!document.documentElement) throw new Error();
@@ -174,10 +204,34 @@ const expression = `(() => {
   });
   const viewport = visualViewport;
   const viewportStable = !!viewport && devicePixelRatio === 1 && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.pageLeft === scrollX && viewport.pageTop === scrollY && viewport.width === innerWidth && viewport.height === innerHeight;
-  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported } };
+  const unobservedEmbeds = Array.from(document.querySelectorAll('iframe,frame,object,embed')).some(el => !visitedEmbeds.has(el));
+  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported, unobservedEmbeds } };
 })()`;
 
 const worldName = 'foliome-dom-collector';
+// Invoked on the frame owner resolved by CDP in the parent's isolated world.
+const frameGeometry = `function() {
+  if (!(this instanceof HTMLIFrameElement || this instanceof HTMLFrameElement) ||
+      !this.isConnected || this.ownerDocument !== document) throw new Error();
+  const state = globalThis.__foliomeObservation;
+  if (!state || !state.ids.has(this)) throw new Error();
+  const hasTransform = ${hasTransform}, transforms = [];
+  const style = getComputedStyle(this), bounds = this.getBoundingClientRect();
+  for (let el = this; el; el = el.parentElement) {
+    if (!state.ids.has(el)) throw new Error();
+    if (hasTransform(getComputedStyle(el))) transforms.push(state.ids.get(el));
+  }
+  const left = parseFloat(style.paddingLeft), top = parseFloat(style.paddingTop);
+  return {
+    id: state.ids.get(this), src: this.src, transforms,
+    rect: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+    content: {
+      x: bounds.x + this.clientLeft + left, y: bounds.y + this.clientTop + top,
+      width: this.clientWidth - left - parseFloat(style.paddingRight),
+      height: this.clientHeight - top - parseFloat(style.paddingBottom),
+    },
+  };
+}`;
 // Invoked on the exact CDP-resolved root in the collector's isolated world.
 const shadowGeometry = `function() {
   if (!(this instanceof ShadowRoot) || !this.host.isConnected || this.host.ownerDocument !== document) throw new Error();
@@ -269,6 +323,156 @@ function bounded<T>(operation: () => Promise<T>): Promise<T> {
 }
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+function positiveId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+function rect(value: unknown): value is Rect {
+  return record(value) && [value.x, value.y, value.width, value.height].every(Number.isFinite);
+}
+function sameRect(a: Rect, b: Rect): boolean {
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+}
+function intersection(a: Rect, b: Rect): Rect | undefined {
+  const x = Math.max(a.x, b.x),
+    y = Math.max(a.y, b.y);
+  const width = Math.min(a.x + a.width, b.x + b.width) - x,
+    height = Math.min(a.y + a.height, b.y + b.height) - y;
+  if (width > 0 && height > 0) return { x, y, width, height };
+}
+function observedGeometry(world: ParticipatingWorld): boolean {
+  const { observation, count, identities } = world;
+  if (
+    observation.unsupported !== false ||
+    observation.unobservedEmbeds === true ||
+    !Array.isArray(observation.geometry) ||
+    observation.geometry.length !== count ||
+    !Number.isSafeInteger(observation.width) ||
+    !Number.isSafeInteger(observation.height) ||
+    observation.width < 1 ||
+    observation.height < 1
+  )
+    return false;
+  if (observation.viewport === undefined) return world.parentFrameId === null;
+  return (
+    rect(observation.viewport) &&
+    observation.unobservedEmbeds === false &&
+    Array.isArray(observation.animationTargets) &&
+    observation.animationTargets.every((target) => target === null || positiveId(target)) &&
+    Array.isArray(identities) &&
+    identities.length === count &&
+    identities.every(positiveId) &&
+    observation.geometry.every(
+      (geometry, index) =>
+        typeof geometry.transformed === 'boolean' &&
+        typeof geometry.button === 'boolean' &&
+        (geometry.frameUrl === null || typeof geometry.frameUrl === 'string') &&
+        Array.isArray(geometry.ancestors) &&
+        geometry.ancestors[0] === identities[index] &&
+        geometry.ancestors.every(positiveId),
+    )
+  );
+}
+async function inspectNode(
+  cdp: Cdp,
+  backendNodeId: number,
+  executionContextId: number,
+  functionDeclaration: string,
+): Promise<Record<string, unknown>> {
+  const resolved = await bounded(() =>
+    cdp.send('DOM.resolveNode', { backendNodeId, executionContextId }),
+  );
+  if (!record(resolved) || !record(resolved.object) || typeof resolved.object.objectId !== 'string')
+    throw new Error();
+  const objectId = resolved.object.objectId;
+  try {
+    const result = await bounded(() =>
+      cdp.send('Runtime.callFunctionOn', { objectId, functionDeclaration, returnByValue: true }),
+    );
+    if (
+      !record(result) ||
+      result.exceptionDetails ||
+      !record(result.result) ||
+      !record(result.result.value)
+    )
+      throw new Error();
+    return result.result.value;
+  } finally {
+    await bounded(() => cdp.send('Runtime.releaseObject', { objectId }));
+  }
+}
+async function frameOwner(cdp: Cdp, child: ParticipatingWorld, parent: ParticipatingWorld) {
+  const owner = await bounded(() => cdp.send('DOM.getFrameOwner', { frameId: child.frameId }));
+  if (!record(owner) || !positiveId(owner.backendNodeId)) throw new Error();
+  const { backendNodeId } = owner;
+  const value = await inspectNode(cdp, backendNodeId, parent.context, frameGeometry);
+  if (
+    !positiveId(value.id) ||
+    value.src !== child.url ||
+    !rect(value.rect) ||
+    !Array.isArray(value.transforms) ||
+    !value.transforms.every(positiveId)
+  )
+    throw new Error();
+  const index = parent.identities.indexOf(value.id);
+  const geometry = parent.observation.geometry[index];
+  if (
+    index < 0 ||
+    index !== parent.identities.lastIndexOf(value.id) ||
+    !geometry ||
+    geometry.frameUrl !== value.src ||
+    geometry.mask !== true ||
+    !sameRect(value.rect, geometry.rect) ||
+    !Array.isArray(geometry.ancestors)
+  )
+    throw new Error();
+  return {
+    backendNodeId,
+    index,
+    bounds: value.rect,
+    content: value.content,
+    transforms: value.transforms,
+  };
+}
+async function childRegion(
+  cdp: Cdp,
+  child: ParticipatingWorld,
+  owner: Awaited<ReturnType<typeof frameOwner>>,
+  parent: Region,
+): Promise<Region | undefined> {
+  const { observation } = child;
+  const { content } = owner;
+  if (
+    !observedGeometry(child) ||
+    observation.viewportStable !== true ||
+    !rect(content) ||
+    content.width !== observation.width ||
+    content.height !== observation.height ||
+    content.width !== observation.viewport.width ||
+    content.height !== observation.viewport.height ||
+    content.x < owner.bounds.x ||
+    content.y < owner.bounds.y ||
+    content.x + content.width > owner.bounds.x + owner.bounds.width ||
+    content.y + content.height > owner.bounds.y + owner.bounds.height
+  )
+    return;
+  const global = { ...content, x: parent.x + content.x, y: parent.y + content.y };
+  const clip = intersection(global, parent.clip);
+  if (!clip) return;
+  // The CDP quad is already in the top viewport. Require it to match the local measurements.
+  const model = await bounded(() =>
+    cdp.send('DOM.getBoxModel', { backendNodeId: owner.backendNodeId }),
+  );
+  const { x, y, width, height } = global;
+  const quad = [x, y, x + width, y, x + width, y + height, x, y + height];
+  const measured = record(model) && record(model.model) ? model.model.content : undefined;
+  if (
+    !Array.isArray(measured) ||
+    measured.length !== quad.length ||
+    !quad.every((coordinate, index) => coordinate === measured[index])
+  )
+    return;
+  return { x, y, clip };
 }
 function tree(value: unknown): FrameTree {
   if (
@@ -473,15 +677,12 @@ async function prepare(
             rootClasses: DocumentFacts['classes'] = [];
           let rootSemantics: string[] = [];
           const embeds: { url: string; visible: boolean }[] = [];
-          const participatingWorlds: {
-            frameId: string;
-            context: number;
-            observation: Observation;
-          }[] = [];
+          const participatingWorlds: ParticipatingWorld[] = [];
           const visit = async (
             frame: FrameTree,
             foreignAncestor: boolean,
             parentAccessible: boolean,
+            parentFrameId: string | null,
           ): Promise<void> => {
             if (frames.length >= 256) throw new Error();
             const frameHost = host(frame.frame.url);
@@ -559,7 +760,12 @@ async function prepare(
                 embeds.push(...data.embeds);
                 participatingWorlds.push({
                   frameId: frame.frame.id,
+                  parentFrameId,
+                  url: data.url,
                   context: world.executionContextId as number,
+                  base,
+                  count: data.nodes.length,
+                  identities: data.identities,
                   observation: data.observation,
                 });
               } catch (error) {
@@ -576,10 +782,11 @@ async function prepare(
                 child,
                 foreign,
                 parentAccessible && !fact.unavailable && matches.length === 1 && matches[0].visible,
+                frame.frame.id,
               );
             }
           };
-          await visit(root, false, true);
+          await visit(root, false, true, null);
           for (const embed of embeds) {
             const embedHost = host(embed.url);
             if (
@@ -733,7 +940,7 @@ async function prepare(
       },
       async collectFrame(snapshot: number) {
         const collected = await collect(snapshot);
-        const { facts, observation: observed, rootNodeCount, rootContext } = collected;
+        const { facts, observation: observed, rootContext, participatingWorlds } = collected;
         const binding = {
           snapshotNumber: snapshot,
           candidates: projectTargets(collected).candidates,
@@ -741,8 +948,7 @@ async function prepare(
         if (closed) throw new Error('internal');
         const filtered = filterTextSnapshot(facts);
         if (!observed || !filtered.ok) throw new Error('internal');
-        let plan: { masks: Rect[]; labels: { x: number; y: number; number: number }[] } | null =
-          null;
+        let plan: Plan | null = null;
         try {
           // CDP exposes closed shadow roots without executing page-owned code.
           const dom = await bounded(() => cdp.send('DOM.getDocument', { depth: -1, pierce: true }));
@@ -774,123 +980,192 @@ async function prepare(
           if (!record(dom) || !record(dom.root)) throw new Error();
           findShadowHosts(dom.root);
           if (shadowRoots.length > 256) throw new Error();
-          if (
-            observed.unsupported ||
-            observed.geometry.length !== rootNodeCount ||
-            !Number.isSafeInteger(observed.width) ||
-            !Number.isSafeInteger(observed.height) ||
-            observed.width < 1 ||
-            observed.height < 1
-          )
-            throw new Error();
-          const masks: Rect[] = [],
-            labels: { x: number; y: number; number: number }[] = [];
+          const [root] = participatingWorlds;
+          if (!root || !observedGeometry(root)) throw new Error();
           const elements = new Map(
             filtered.snapshot.elements.map((element) => [element.n, element]),
           );
-          const add = (r: Rect, padding = 4) => {
-            if (![r.x, r.y, r.width, r.height].every(Number.isFinite)) throw new Error();
-            if (r.width <= 0 || r.height <= 0) return;
-            const x = Math.max(0, Math.floor(r.x - padding)),
-              y = Math.max(0, Math.floor(r.y - padding));
-            const right = Math.min(observed.width, Math.ceil(r.x + r.width + padding));
-            const bottom = Math.min(observed.height, Math.ceil(r.y + r.height + padding));
-            if (right > x && bottom > y) masks.push({ x, y, width: right - x, height: bottom - y });
-          };
-          const protectedNodes = new Set<number>();
+          const shadows: { index: number; rects: Rect[] }[] = [];
           for (const backendNodeId of shadowRoots) {
-            const resolved = await bounded(() =>
-              cdp.send('DOM.resolveNode', { backendNodeId, executionContextId: rootContext }),
+            const { hostId, rects } = await inspectNode(
+              cdp,
+              backendNodeId,
+              rootContext,
+              shadowGeometry,
             );
             if (
-              !record(resolved) ||
-              !record(resolved.object) ||
-              typeof resolved.object.objectId !== 'string'
+              !positiveId(hostId) ||
+              !Array.isArray(rects) ||
+              rects.length > 20001 ||
+              !rects.every(rect)
             )
               throw new Error();
-            const objectId = resolved.object.objectId;
-            let result: unknown;
-            try {
-              result = await bounded(() =>
-                cdp.send('Runtime.callFunctionOn', {
-                  objectId,
-                  functionDeclaration: shadowGeometry,
-                  returnByValue: true,
-                }),
-              );
-            } finally {
-              await bounded(() => cdp.send('Runtime.releaseObject', { objectId }));
-            }
-            if (
-              !record(result) ||
-              result.exceptionDetails ||
-              !record(result.result) ||
-              !record(result.result.value)
-            )
-              throw new Error();
-            const value = result.result.value;
-            if (
-              !Number.isSafeInteger(value.hostId) ||
-              !Array.isArray(value.rects) ||
-              value.rects.length > 20001
-            )
-              throw new Error();
-            const index = collected.rootIdentities.indexOf(value.hostId as number);
+            const index = root.identities.indexOf(hostId);
             if (index < 0) throw new Error();
-            protectedNodes.add(index);
-            for (const rect of value.rects) {
-              if (!record(rect)) throw new Error();
-              add(rect as unknown as Rect);
-            }
+            shadows.push({ index, rects });
           }
-          for (let i = 0; i < rootNodeCount; i++) {
-            const node = facts.nodes[i],
-              geometry = observed.geometry[i],
-              element = elements.get(node.n);
-            if (geometry.mask) {
-              add(geometry.rect, node.role === 'input' && node.field && observed.viewport ? 0 : 4);
-              protectedNodes.add(i);
-            }
-            // Comparing with the domain result also covers split secrets across nodes.
-            const normalized = node.text
-              .normalize('NFKC')
-              .replace(/\p{White_Space}/gu, ' ')
-              .replace(/[\p{Cf}\p{Cc}]/gu, '')
-              .replace(/ +/g, ' ');
-            if (!element || element.text !== normalized) {
-              if (geometry.button) {
-                add(geometry.rect);
-                protectedNodes.add(i);
-              } else if (geometry.runs.length) {
-                for (const run of geometry.runs) add(run);
-                protectedNodes.add(i);
+          const children = new Map<string, ParticipatingWorld[]>();
+          for (const world of participatingWorlds) {
+            if (world.parentFrameId === null) continue;
+            const siblings = children.get(world.parentFrameId) ?? [];
+            siblings.push(world);
+            children.set(world.parentFrameId, siblings);
+          }
+          const buildPlan = async (
+            world: ParticipatingWorld,
+            region: Region,
+          ): Promise<WorldPlan> => {
+            const { observation, base, identities } = world;
+            const masks: Rect[] = [],
+              labels: Label[] = [];
+            const translate = (r: Rect, padding: number) => ({
+              x: region.x + r.x - padding,
+              y: region.y + r.y - padding,
+              width: r.width + padding * 2,
+              height: r.height + padding * 2,
+            });
+            const add = (r: Rect, padding = 4) => {
+              if (!rect(r)) throw new Error();
+              if (r.width <= 0 || r.height <= 0) return;
+              const clipped = intersection(translate(r, padding), region.clip);
+              if (!clipped) return;
+              const x = Math.floor(clipped.x),
+                y = Math.floor(clipped.y);
+              masks.push({
+                x,
+                y,
+                width: Math.ceil(clipped.x + clipped.width) - x,
+                height: Math.ceil(clipped.y + clipped.height) - y,
+              });
+            };
+            const protectedNodes = new Set<number>();
+            if (world === root)
+              for (const shadow of shadows) {
+                protectedNodes.add(shadow.index);
+                for (const bounds of shadow.rects) add(bounds);
+              }
+
+            const transformIds = new Set<number>();
+            for (const [index, geometry] of observation.geometry.entries())
+              if (geometry.transformed) transformIds.add(identities[index]);
+
+            const owners = new Set<number>();
+            const transformedOwners = new Set<number>();
+            const coveredTransforms = new Set<number>();
+            const partial = new Map<number, WorldPlan>();
+            for (const child of children.get(world.frameId) ?? []) {
+              let owner;
+              try {
+                owner = await frameOwner(cdp, child, world);
+              } catch {
+                continue;
+              }
+              const geometry = observation.geometry[owner.index];
+              const transforms = geometry.ancestors.filter((id) => transformIds.has(id));
+              if (
+                !facts.nodes[base + owner.index].visible ||
+                transforms.length !== owner.transforms.length ||
+                !transforms.every((id, index) => id === owner.transforms[index])
+              )
+                continue;
+              if (owners.has(owner.index)) throw new Error();
+              owners.add(owner.index);
+              if (transforms.length) {
+                transformedOwners.add(owner.index);
+                for (const id of transforms) coveredTransforms.add(id);
+                continue;
+              }
+              try {
+                const projected = await childRegion(cdp, child, owner, region);
+                if (projected) {
+                  partial.set(owner.index, await buildPlan(child, projected));
+                  child.projection = projected;
+                }
+              } catch {
+                // Keep the full owner mask if the child plan cannot be established.
               }
             }
-            const r = geometry.rect;
-            if (
-              element &&
-              r.width > 0 &&
-              r.height > 0 &&
-              r.x < observed.width &&
-              r.y < observed.height &&
-              r.x + r.width > 0 &&
-              r.y + r.height > 0
-            )
-              labels.push({
-                x: Math.max(0, Math.floor(r.x)),
-                y: Math.max(0, Math.floor(r.y)),
-                number: element.n,
-              });
-          }
-          observed.maskAnimationActive =
-            !Array.isArray(observed.animationTargets) ||
-            observed.animationTargets.some(
-              (target) =>
-                target === null ||
-                [...protectedNodes].some((index) =>
-                  observed.geometry[index].ancestors.includes(target),
-                ),
-            );
+            if (transformIds.size !== coveredTransforms.size) throw new Error();
+
+            for (const [i, geometry] of observation.geometry.entries()) {
+              const node = facts.nodes[base + i],
+                element = elements.get(node.n);
+              const r = geometry.rect;
+              if (
+                !rect(r) ||
+                typeof geometry.mask !== 'boolean' ||
+                (node.field && !geometry.mask) ||
+                !Array.isArray(geometry.runs)
+              )
+                throw new Error();
+              const transformedOwner = transformedOwners.has(i);
+              if (geometry.mask) {
+                if (!partial.has(i)) {
+                  const exactBounds =
+                    transformedOwner ||
+                    (node.role === 'input' && node.field && observation.viewport);
+                  add(r, exactBounds ? 0 : 4);
+                }
+                protectedNodes.add(i);
+              }
+              // Comparing with the domain result also covers split secrets across nodes.
+              const normalized = node.text
+                .normalize('NFKC')
+                .replace(/\p{White_Space}/gu, ' ')
+                .replace(/[\p{Cf}\p{Cc}]/gu, '')
+                .replace(/ +/g, ' ');
+              if (!element || element.text !== normalized) {
+                if (geometry.button) {
+                  add(r);
+                  protectedNodes.add(i);
+                } else if (geometry.runs.length) {
+                  for (const run of geometry.runs) add(run);
+                  protectedNodes.add(i);
+                }
+              }
+              const clipped = intersection(translate(r, 0), region.clip);
+              if (element && clipped) {
+                const labelClip = transformedOwner ? clipped : world === root ? null : region.clip;
+                const round = labelClip ? Math.ceil : Math.floor;
+                const x = round(clipped.x),
+                  y = round(clipped.y);
+                if (
+                  !labelClip ||
+                  (x + 4 * String(element.n).length + 1 <= labelClip.x + labelClip.width &&
+                    y + 7 <= labelClip.y + labelClip.height)
+                )
+                  labels.push({ x, y, number: element.n });
+              }
+            }
+            const protectedIds = new Set<number>();
+            for (const index of protectedNodes) {
+              const ancestors = observation.geometry[index].ancestors;
+              if (
+                coveredTransforms.size &&
+                ancestors.some((id) => coveredTransforms.has(id)) &&
+                !transformedOwners.has(index)
+              )
+                throw new Error();
+              for (const id of ancestors ?? []) protectedIds.add(id);
+            }
+            let maskAnimationActive =
+              !Array.isArray(observation.animationTargets) ||
+              observation.animationTargets.some(
+                (target) => target === null || protectedIds.has(target),
+              );
+            for (const child of partial.values()) {
+              for (const mask of child.masks) masks.push(mask);
+              for (const label of child.labels) labels.push(label);
+              maskAnimationActive ||= child.maskAnimationActive;
+            }
+            return { masks, labels, maskAnimationActive };
+          };
+          const { masks, labels, maskAnimationActive } = await buildPlan(root, {
+            x: 0,
+            y: 0,
+            clip: { x: 0, y: 0, width: observed.width, height: observed.height },
+          });
+          observed.maskAnimationActive = maskAnimationActive;
           plan = { masks, labels };
         } catch {
           plan = null;
@@ -905,7 +1180,7 @@ async function prepare(
           animationIds: [`document:${rootContext}`, ...observed.animationIds],
           viewportStable: observed.viewportStable,
           maskAnimationActive: observed.maskAnimationActive,
-          participatingWorlds: collected.participatingWorlds,
+          participatingWorlds,
         };
       },
       async close(): Promise<void> {
