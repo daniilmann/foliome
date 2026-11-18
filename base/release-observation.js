@@ -258,4 +258,8 @@ async function observeRelease(input) {
   }
 }
 
-module.exports = { observeRelease };
+module.exports = {
+  observeRelease,
+  createProductionPublisherVerifier: require('./publisher-verification.js')
+    .createProductionPublisherVerifier,
+};
