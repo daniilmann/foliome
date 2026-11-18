@@ -21,14 +21,26 @@ type Accept = Common & {
   allowed: boolean;
   sessionActive: boolean;
   migrate: (db: Database) => void | Promise<void>;
+  lifecycle?: (event: {
+    phase: 'before-commit' | 'after-commit';
+    db: Database;
+  }) => void | Promise<void>;
+};
+type Launch = {
+  dbPath: string;
+  stateFile: string;
+  verify: (selected: string, db: Database) => boolean | Promise<boolean>;
+  execute: (selected: string, db: Database) => void | Promise<void>;
 };
 export declare function acceptUpdate(options: Accept): Promise<void>;
 export declare function restorePrevious(options: Common): Promise<void>;
+export declare function launchVerified(options: Launch): Promise<void>;
 
 declare const require: NodeRequire;
 declare const exports: {
   acceptUpdate: typeof acceptUpdate;
   restorePrevious: typeof restorePrevious;
+  launchVerified: typeof launchVerified;
 };
 const fs = require('node:fs/promises') as typeof import('node:fs/promises');
 const path = require('node:path') as typeof import('node:path');
@@ -41,19 +53,30 @@ async function exclusive<T>(file: string, work: () => Promise<T>): Promise<T> {
   const key = path.resolve(file);
   if (locks.has(key)) throw new Error('busy');
   locks.add(key);
-  let lock: import('node:fs/promises').FileHandle | undefined;
+  let db: InstanceType<typeof DatabaseSync> | undefined;
   try {
-    lock = await fs.open(`${key}.lock`, 'wx', 0o600);
+    const lockPath = `${key}.lease.sqlite`;
+    try {
+      const handle = await fs.open(lockPath, 'wx', 0o600);
+      await handle.close();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    const stat = await fs.lstat(lockPath);
+    if (
+      !stat.isFile() ||
+      stat.isSymbolicLink() ||
+      stat.nlink !== 1 ||
+      stat.uid !== process.getuid?.() ||
+      (stat.mode & 0o077) !== 0
+    )
+      throw new Error('lease');
+    db = new DatabaseSync(lockPath);
+    db.exec('BEGIN EXCLUSIVE');
     return await work();
   } finally {
     try {
-      if (lock) {
-        try {
-          await lock.close();
-        } finally {
-          await fs.unlink(`${key}.lock`);
-        }
-      }
+      db?.close();
     } finally {
       locks.delete(key);
     }
@@ -79,11 +102,60 @@ async function readState(file: string): Promise<State> {
 async function writeState(file: string, state: State): Promise<void> {
   const temp = `${file}.${crypto.randomBytes(16).toString('hex')}`;
   try {
-    await fs.writeFile(temp, JSON.stringify(state), { flag: 'wx', mode: 0o600 });
+    const handle = await fs.open(temp, 'wx', 0o600);
+    try {
+      await handle.writeFile(JSON.stringify(state));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await fs.rename(temp, file);
+    const dir = await fs.open(path.dirname(path.resolve(file)), 'r');
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
   } finally {
     await fs.rm(temp, { force: true });
   }
+}
+function marker(db: Database): State | null {
+  const exists = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'activation_state'")
+    .get();
+  if (!exists) return null;
+  const row = db
+    .prepare('SELECT current_sha, previous_sha FROM activation_state WHERE id = 1')
+    .get();
+  if (
+    !row ||
+    typeof row.current_sha !== 'string' ||
+    !shaPattern.test(row.current_sha) ||
+    !(
+      row.previous_sha === null ||
+      (typeof row.previous_sha === 'string' && shaPattern.test(row.previous_sha))
+    ) ||
+    row.current_sha === row.previous_sha
+  )
+    throw new Error('state');
+  return { current: row.current_sha, previous: row.previous_sha as string | null };
+}
+function setMarker(db: Database, state: State): void {
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS activation_state (id INTEGER PRIMARY KEY CHECK (id = 1), current_sha TEXT NOT NULL, previous_sha TEXT) STRICT',
+  );
+  db.prepare(
+    'INSERT INTO activation_state (id, current_sha, previous_sha) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET current_sha = excluded.current_sha, previous_sha = excluded.previous_sha',
+  ).run(state.current, state.previous);
+}
+async function selectedState(db: Database, file: string): Promise<State> {
+  const committed = marker(db);
+  if (committed) {
+    await writeState(file, committed);
+    return committed;
+  }
+  return readState(file);
 }
 async function copyDatabase(file: string): Promise<string> {
   const temp = `${file}.${crypto.randomBytes(16).toString('hex')}.check`;
@@ -107,7 +179,13 @@ exports.acceptUpdate = async function acceptUpdate(options) {
         !shaPattern.test(options.sha)
       )
         throw new Error('refused');
-      const state = await readState(options.stateFile);
+      const selectionDb = new DatabaseSync(options.dbPath);
+      let state: State;
+      try {
+        state = await selectedState(selectionDb, options.stateFile);
+      } finally {
+        selectionDb.close();
+      }
       if (options.sha === state.current) throw new Error('refused');
       const copy = await copyDatabase(options.dbPath);
       try {
@@ -130,33 +208,36 @@ exports.acceptUpdate = async function acceptUpdate(options) {
       } finally {
         await fs.rm(copy, { force: true });
       }
-      const temp = `${options.stateFile}.${crypto.randomBytes(16).toString('hex')}`;
-      await fs.writeFile(temp, JSON.stringify({ current: options.sha, previous: state.current }), {
-        flag: 'wx',
-        mode: 0o600,
-      });
-      // A process killed between pointer publication and SQLite commit needs recovery.
-      let db: InstanceType<typeof DatabaseSync> | undefined;
-      let stateChanged = false;
+      const next = { current: options.sha, previous: state.current };
+      const db = new DatabaseSync(options.dbPath);
+      let committed = false;
       try {
-        db = new DatabaseSync(options.dbPath);
         db.exec('BEGIN IMMEDIATE');
         await options.migrate(db);
-        await fs.rename(temp, options.stateFile);
-        stateChanged = true;
+        setMarker(db, next);
+        await options.lifecycle?.({ phase: 'before-commit', db });
         db.exec('COMMIT');
-      } catch (e) {
+        committed = true;
+        // A timing observer cannot turn a committed activation into a rejection.
         try {
-          db?.exec('ROLLBACK');
+          await options.lifecycle?.({ phase: 'after-commit', db });
         } catch {
-          /* no transaction */
+          /* the transaction is already committed */
         }
-        if (stateChanged) await writeState(options.stateFile, state);
-        throw e;
+      } catch (error) {
+        if (!committed) {
+          try {
+            db.exec('ROLLBACK');
+          } catch {
+            /* no transaction */
+          }
+        }
+        throw error;
       } finally {
-        db?.close();
-        await fs.rm(temp, { force: true });
+        db.close();
       }
+      // The committed database is authoritative even if the projection fails.
+      await writeState(options.stateFile, next).catch(() => {});
     });
   } catch {
     throw new Error('update-failed');
@@ -165,7 +246,13 @@ exports.acceptUpdate = async function acceptUpdate(options) {
 exports.restorePrevious = async function restorePrevious(options) {
   try {
     await exclusive(options.stateFile, async () => {
-      const state = await readState(options.stateFile);
+      const selectionDb = new DatabaseSync(options.dbPath);
+      let state: State;
+      try {
+        state = await selectedState(selectionDb, options.stateFile);
+      } finally {
+        selectionDb.close();
+      }
       if (!state.previous) throw new Error('refused');
       const copy = await copyDatabase(options.dbPath);
       try {
@@ -181,28 +268,56 @@ exports.restorePrevious = async function restorePrevious(options) {
         await fs.rm(copy, { force: true });
       }
       if (!options.previousRoot) throw new Error('unverified-root');
-      const temp = `${options.stateFile}.${crypto.randomBytes(16).toString('hex')}`;
-      try {
-        await fs.writeFile(temp, JSON.stringify({ current: state.previous, previous: null }), {
-          flag: 'wx',
-          mode: 0o600,
-        });
-        const { installRoot } = require('../../../base/install-root.js') as {
-          installRoot: (options: object) => Promise<void>;
-        };
-        await installRoot({
-          ...options.previousRoot,
-          releaseDir: path.join(options.releasesDir, state.previous),
-          rootDir: options.rootDir,
-          sha: state.previous,
-          selectedOnly: true,
-          finalize: () => fs.rename(temp, options.stateFile),
-        });
-      } finally {
-        await fs.rm(temp, { force: true });
-      }
+      const restored = { current: state.previous, previous: null };
+      const { installRoot } = require('../../../base/install-root.js') as {
+        installRoot: (options: object) => Promise<void>;
+      };
+      await installRoot({
+        ...options.previousRoot,
+        releaseDir: path.join(options.releasesDir, state.previous),
+        rootDir: options.rootDir,
+        sha: state.previous,
+        selectedOnly: true,
+        finalize: () => {
+          const db = new DatabaseSync(options.dbPath);
+          try {
+            db.exec('BEGIN IMMEDIATE');
+            try {
+              setMarker(db, restored);
+              db.exec('COMMIT');
+            } catch (error) {
+              try {
+                db.exec('ROLLBACK');
+              } catch {
+                /* no transaction */
+              }
+              throw error;
+            }
+          } finally {
+            db.close();
+          }
+        },
+      });
+      await writeState(options.stateFile, restored).catch(() => {});
     });
   } catch {
     throw new Error('restore-failed');
+  }
+};
+
+exports.launchVerified = async function launchVerified(options) {
+  try {
+    await exclusive(options.stateFile, async () => {
+      const db = new DatabaseSync(options.dbPath);
+      try {
+        const state = await selectedState(db, options.stateFile);
+        if ((await options.verify(state.current, db)) !== true) throw new Error('refused');
+        await options.execute(state.current, db);
+      } finally {
+        db.close();
+      }
+    });
+  } catch {
+    throw new Error('launch-failed');
   }
 };
