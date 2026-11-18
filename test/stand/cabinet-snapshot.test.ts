@@ -109,6 +109,85 @@ function syntheticPorts() {
   };
 }
 
+test('сохраняет историю ручного ввода между документами и скрывает эхо без подтверждения входа', { timeout: 60_000 }, async (t: any) => {
+  const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
+  const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
+  const { captureCabinetSnapshot } = await import('../../core/adapters/browser/capture-snapshot.ts') as any;
+  const { randomBytes } = require('node:crypto');
+  const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
+  for (const kind of ['login', 'password', 'code']) {
+    for (const check of ['observations', 'filtered echo', 'PNG gate', 'closed collector']) await t.test(`${kind}: ${check}`, async () => {
+      const value = `synthetic${kind}${randomBytes(16).toString('hex')}`;
+      const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
+      try {
+        const context = await browser.newContext({ serviceWorkers: 'block' });
+        try {
+          await context.route('**/*', async (route: any) => {
+            const request = route.request();
+            if (request.method() !== 'GET') return route.abort();
+            if (request.url() === `${origin}/login`) return route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic login</title><label for="entry">Synthetic ${kind}</label><input id="entry" type="${kind === 'password' ? 'password' : 'text'}" autocomplete="${kind === 'login' ? 'username' : kind === 'password' ? 'current-password' : 'one-time-code'}"><a href="/next">Continue</a>` });
+            if (request.url() === `${origin}/next`) return route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>Synthetic next</title><p>Echo: ${value}</p>` });
+            return route.abort();
+          });
+          const page = await context.newPage();
+          const cdp = await context.newCDPSession(page);
+          const collector = await prepareDomCollector(cdp, { sourceHost: 'cabinet.invalid', approvedHosts: [] });
+          let closed = false;
+          try {
+            await page.goto(`${origin}/login`, { waitUntil: 'load' });
+            if (check === 'observations') assert.deepEqual(await collector.loginObservations(), { manualInputSeen: false, hasKnownSecret: false });
+            await page.locator('#entry').click();
+            await page.locator('#entry').pressSequentially(value);
+            await page.getByRole('link', { name: 'Continue' }).click();
+            assert.equal(page.url(), `${origin}/next`);
+            assert.equal(await page.locator('#entry').count(), 0);
+            if (check === 'observations') {
+              const expected = { manualInputSeen: true, hasKnownSecret: true };
+              assert.deepEqual(await collector.loginObservations(), expected);
+              await page.reload({ waitUntil: 'load' });
+              assert.deepEqual(await collector.loginObservations(), expected);
+              await page.goto(`${origin}/login`, { waitUntil: 'load' });
+              assert.deepEqual(await collector.loginObservations(), expected);
+            } else if (check === 'filtered echo') {
+              const raw = await collector.collectText(42);
+              assert.ok(raw.secrets.some((secret: any) => secret.value === value));
+              const filtered = filterTextSnapshot(raw);
+              assert.equal(filtered.ok, true);
+              if (!filtered.ok) return;
+              assert.equal(filtered.snapshot.snapshot, 42);
+              const echo = filtered.snapshot.elements.find((element: any) => element.text.startsWith('Echo:'));
+              assert.equal(echo?.text, 'Echo: [секрет]');
+              assert.equal(JSON.stringify(filtered.snapshot).includes(value), false);
+            } else if (check === 'PNG gate') {
+              const timer = clock();
+              let captures = 0;
+              const result = await captureCabinetSnapshot({
+                collect: () => collector.collectFrame(43),
+                capturePng: async () => { captures++; return Buffer.from((await cdp.send('Page.captureScreenshot', { format: 'png' })).data, 'base64'); },
+                now: timer.now, sleep: timer.sleep, recordDeviation: async () => {},
+              }, () => ({ sessionId: 'synthetic-session', sessionActive: true, loginStep: true, manualInputSeen: true, hasKnownSecret: true, hasNonEmptyFields: false, completion: null }), 5000);
+              assert.equal(result.ok, true);
+              assert.deepEqual(result.image, { code: 'login-step' });
+              assert.equal(captures, 0);
+            } else {
+              assert.equal(typeof collector.loginObservations, 'function');
+              assert.deepEqual(await collector.loginObservations(), { manualInputSeen: true, hasKnownSecret: true });
+              await collector.close();
+              closed = true;
+              let afterClose: unknown;
+              try { afterClose = await collector.loginObservations(); } catch { afterClose = undefined; }
+              assert.notDeepEqual(afterClose, { manualInputSeen: true, hasKnownSecret: true });
+              let textAfterClose: unknown;
+              try { textAfterClose = await collector.collectText(44); } catch { textAfterClose = undefined; }
+              assert.equal(filterTextSnapshot(textAfterClose).ok, false);
+            }
+          } finally { if (!closed) await collector.close(); }
+        } finally { await context.close(); }
+      } finally { await browser.close(); }
+    });
+  }
+});
+
 test('собирает видимый DOM в изолированном мире указанного источника', { timeout: 60_000 }, async (t: any) => {
   const { prepareDomCollector } = await import('../../core/adapters/browser/collect-dom.ts') as any;
   const { filterTextSnapshot } = await import('../../core/domain/snapshot-filter.ts');
