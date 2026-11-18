@@ -10,7 +10,7 @@ test('подтверждает возврат управления только 
   const endpoint = '/owner/login/complete';
   const completed: string[] = [];
   const adapter = createOwnerLoginConfirmation({
-    ownerFrame, origin, endpoint, complete: (sessionId: string) => completed.push(sessionId),
+    ownerFrame, origin, endpoint, complete: (sessionId: string) => { completed.push(sessionId); return true; },
   });
   const request = {
     method: 'POST', path: endpoint, frame: ownerFrame, origin,
@@ -54,3 +54,30 @@ test('подтверждает возврат управления только 
   });
   assert.deepEqual(completed, ['session-1', 'session-2']);
 });
+
+for (const [name, failure] of [
+  ['false', () => false],
+  ['синхронное исключение', () => { throw new Error('completion failed'); }],
+  ['Promise', () => Promise.resolve(true) as unknown as boolean],
+] as const) {
+  test(`не выдаёт подтверждение при результате complete: ${name} и расходует nonce`, async () => {
+    const { createOwnerLoginConfirmation } = await import('../../../core/adapters/ui/owner-login-confirmation.ts');
+    const ownerFrame = {};
+    const origin = 'https://owner.example';
+    const endpoint = '/owner/login/complete';
+    let attempts = 0;
+    const adapter = createOwnerLoginConfirmation({
+      ownerFrame, origin, endpoint,
+      complete: () => { attempts++; return attempts === 1 ? failure() : true; },
+    });
+    const request = {
+      method: 'POST', path: endpoint, frame: ownerFrame, origin,
+      body: { sessionId: 'session-1', nonce: 'nonce-1' },
+    };
+
+    adapter.begin({ sessionId: 'session-1', nonce: 'nonce-1' });
+    assert.equal(adapter.handle(request), null);
+    assert.equal(adapter.handle(request), null);
+    assert.equal(attempts, 1);
+  });
+}
