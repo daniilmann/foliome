@@ -626,15 +626,16 @@ test('защищает подписи input и сохраняет обычные
       if (kind === 'ordinary') for (const marker of ['Checkbox marker', 'Radio marker', 'Button marker', 'Submit marker', 'Reset marker']) assert.ok(output.includes(marker), marker);
       assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
       const after = await decode(result.image.bytes);
+      const labels = await numberedLabelAreas(page);
       if (kind === 'secret') {
-        assertRectBlack(after, target);
+        assertRectBlack(after, target, labels);
       } else {
         for (const selector of ['label', '#button', '#submit', '#reset']) {
           const elements = page.locator(selector);
           for (let i = 0; i < await elements.count(); i++) {
             const box = await elements.nth(i).boundingBox();
             assert.ok(box);
-            assertVisibleUnchanged(before, after, box);
+            assertVisibleUnchanged(before, after, box, labels);
           }
         }
       }
@@ -658,7 +659,7 @@ test('CSS анимация блокирует только маску и её п
       assert.ok(JSON.stringify(result.snapshot).includes('Readable marker'));
       if (position === 'distant' || position === 'none') {
         assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
-        assertRectBlack(await decode(result.image.bytes), box);
+        assertRectBlack(await decode(result.image.bytes), box, await numberedLabelAreas(page));
       } else {
         assert.deepEqual(result.image, { code: 'unstable' });
       }
@@ -683,8 +684,9 @@ test('закрытый shadow host и разрешённый фрейм не р�
       assert.ok(JSON.stringify(result.snapshot).includes('Readable marker'));
       assert.ok(Buffer.isBuffer(result.image.bytes), `image status: ${result.image.code}`);
       const after = await decode(result.image.bytes);
-      assertRectBlack(after, box);
-      assertVisibleUnchanged(before, after, ordinary);
+      const labels = await numberedLabelAreas(page);
+      assertRectBlack(after, box, labels);
+      assertVisibleUnchanged(before, after, ordinary, labels);
     });
   });
 });
@@ -729,18 +731,37 @@ function pixelAt(image: any, x: number, y: number) {
   return image.data.slice((y * image.width + x) * 4, (y * image.width + x) * 4 + 4);
 }
 
-function assertRectBlack(image: any, box: any) {
+type LabelArea = { x: number; y: number };
+
+async function numberedLabelAreas(page: any): Promise<LabelArea[]> {
+  // These fixed-size fixtures have fewer than 100 numbered nodes, including the child frame.
+  // Measure label positions independently from the product's redaction plan.
+  const elements = page.locator('html, body, div, label, input, iframe');
+  assert.ok(await elements.count() < 90);
+  const rectangles = await Promise.all((await elements.all()).map((element: any) => element.boundingBox()));
+  return rectangles.filter((box: any) => box && box.width > 0 && box.height > 0)
+    .map((box: any) => ({ x: Math.max(0, Math.floor(box.x)), y: Math.max(0, Math.floor(box.y)) }));
+}
+
+function isNumberedLabelPixel(x: number, y: number, labels: LabelArea[]): boolean {
+  return labels.some(label => x >= label.x && x < label.x + 9 && y >= label.y && y < label.y + 7);
+}
+
+function assertRectBlack(image: any, box: any, labels: LabelArea[]) {
   for (let y = Math.ceil(box.y); y < Math.floor(box.y + box.height); y++) {
     for (let x = Math.ceil(box.x); x < Math.floor(box.x + box.width); x++) {
-      assert.deepEqual(pixelAt(image, x, y), [0, 0, 0, 255], `pixel ${x},${y}`);
+      const pixel = pixelAt(image, x, y);
+      if (isNumberedLabelPixel(x, y, labels) && pixel.every((channel: number) => channel === 255)) continue;
+      assert.deepEqual(pixel, [0, 0, 0, 255], `pixel ${x},${y}`);
     }
   }
 }
 
-function assertVisibleUnchanged(before: any, after: any, box: any) {
+function assertVisibleUnchanged(before: any, after: any, box: any, labels: LabelArea[]) {
   let visible = 0;
   for (let y = Math.ceil(box.y); y < Math.floor(box.y + box.height); y++) {
     for (let x = Math.ceil(box.x); x < Math.floor(box.x + box.width); x++) {
+      if (isNumberedLabelPixel(x, y, labels)) continue;
       const pixel = pixelAt(before, x, y);
       if (pixel[0] !== 30 || pixel[1] !== 180 || pixel[2] !== 70) visible++;
       assert.deepEqual(pixelAt(after, x, y), pixel, `visible pixel ${x},${y}`);
