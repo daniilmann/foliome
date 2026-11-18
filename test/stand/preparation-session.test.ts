@@ -33,7 +33,7 @@ function deferred() {
 
 async function stand(run: (f: any) => Promise<void>) {
   // Runtime is the missing composition under test, not a fixture implementation.
-  const { createPreparationRuntime } = require('../../core/use-cases/preparation-runtime.ts');
+  const { createPreparationRuntime } = require('../../core/main.ts');
   const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
   const { prepareDomCollector } = require('../../core/adapters/browser/collect-dom.ts');
   const { attachOwnerWindow } = require('../../core/adapters/ui/owner-window.ts');
