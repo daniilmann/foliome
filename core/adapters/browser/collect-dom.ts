@@ -1,3 +1,5 @@
+const { filterTextSnapshot } = require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
+
 type Cdp = {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
   detach(): Promise<void>;
@@ -6,11 +8,24 @@ type FrameTree = { frame: { id: string; url: string }; childFrames?: FrameTree[]
 type FrameFact = { index: number; host: string; foreign: boolean; unavailable: boolean };
 type NodeFact = { n: number; frame: number; parent?: number; visible: boolean; role: string; text: string; state?: string; field?: 'empty' | 'filled' | 'sealed'; href?: string; attrs?: Record<string, string> };
 type Secret = { value: string; kind: 'login' | 'password' | 'code' };
-type DocumentFacts = { url: string; title: string; nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[]; parents: (number | null)[]; secrets: Secret[]; embeds: { url: string; visible: boolean }[] };
+type Rect = { x: number; y: number; width: number; height: number };
+type Geometry = { rect: Rect; runs: Rect[]; mask: boolean };
+type Observation = { geometry: Geometry[]; width: number; height: number; revision: number; animationIds: string[]; viewportStable: boolean; maskAnimationActive: boolean; unsupported: boolean };
+type DocumentFacts = { url: string; title: string; nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[]; parents: (number | null)[]; secrets: Secret[]; embeds: { url: string; visible: boolean }[]; observation: Observation };
 
 // This expression is owned by the adapter and runs only in its isolated world.
 const expression = `(() => {
-  const nodes = [], parents = [], secrets = [], embeds = [];
+  const nodes = [], parents = [], secrets = [], embeds = [], geometry = [];
+  const state = globalThis.__foliomeObservation || (globalThis.__foliomeObservation = (() => {
+    const state = { revision: 0, ids: new WeakMap(), next: 1 };
+    new MutationObserver(() => { state.revision++; }).observe(document, { subtree: true, attributes: true, childList: true, characterData: true });
+    for (const event of ['scroll', 'resize', 'pointerover', 'pointerout', 'focusin', 'transitionstart', 'animationstart'])
+      addEventListener(event, () => { state.revision++; }, true);
+    if (visualViewport) for (const event of ['scroll', 'resize']) visualViewport.addEventListener(event, () => { state.revision++; });
+    return state;
+  })());
+  let unsupported = false;
+  const rectValue = r => ({ x: r.x, y: r.y, width: r.width, height: r.height });
   const forbidden = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT']);
   const fieldRoles = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton', 'slider']);
   const safeAttrs = ['id', 'name', 'class', 'data-testid', 'type', 'autocomplete', 'placeholder', 'aria-label'];
@@ -22,6 +37,13 @@ const expression = `(() => {
     const subtreeVisible = ancestorsVisible && style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) > 0 && !element.hasAttribute('hidden') && !element.hasAttribute('inert') && element.getAttribute('aria-hidden') !== 'true';
     const visible = subtreeVisible && rect.width > 0 && rect.height > 0;
     if ((tag === 'IFRAME' || tag === 'FRAME') && element.src) embeds.push({ url: element.src, visible });
+    for (const pseudo of ['::before', '::after']) {
+      const content = getComputedStyle(element, pseudo).content;
+      if (content !== 'none' && content !== 'normal') unsupported = true;
+    }
+    if (style.textShadow !== 'none' || style.filter !== 'none' || style.webkitBoxReflect !== 'none' && style.webkitBoxReflect !== '' ||
+        style.transform !== 'none' || style.perspective !== 'none' || style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' ||
+        style.offsetPath !== 'none' || style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth || '0') > 0 || (style.zoom !== '1' && style.zoom !== 'normal') || tag === 'USE' || tag === 'SVG') unsupported = true;
     const role = (element.getAttribute('role') || tag.toLowerCase()).toLowerCase();
     const closedField = element.isContentEditable || element.hasAttribute('contenteditable') || role === 'slider';
     const field = closedField || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || fieldRoles.has(role);
@@ -42,12 +64,22 @@ const expression = `(() => {
     const attrs = {};
     for (const key of safeAttrs) if (element.hasAttribute(key)) attrs[key] = element.getAttribute(key);
     if (Object.keys(attrs).length) fact.attrs = attrs;
+    const runs = [];
+    if (!field) for (const child of element.childNodes) if (child.nodeType === 3 && child.nodeValue) {
+      const range = document.createRange(); range.selectNodeContents(child);
+      for (const r of range.getClientRects()) if (r.width > 0 && r.height > 0) runs.push(rectValue(r));
+    }
     const index = nodes.length; nodes.push(fact); parents.push(parent);
+    geometry.push({ rect: rectValue(rect), runs, mask: field || tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED' });
     if (!field) for (const child of element.children) visit(child, visible ? index : parent, subtreeVisible);
   };
   if (!document.documentElement) throw new Error();
   visit(document.documentElement, null, true);
-  return { url: location.href, title: document.title, nodes, parents, secrets, embeds };
+  const animations = document.getAnimations().filter(a => a.playState === 'running' || a.playState === 'pending');
+  const animationIds = animations.map(a => { if (!state.ids.has(a)) state.ids.set(a, state.next++); return String(state.ids.get(a)); }).sort();
+  const viewport = visualViewport;
+  const viewportStable = !!viewport && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.width === innerWidth && viewport.height === innerHeight;
+  return { url: location.href, title: document.title, nodes, parents, secrets, embeds, observation: { geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, viewportStable, maskAnimationActive: animations.length > 0, unsupported } };
 })()`;
 
 const worldName = 'foliome-dom-collector';
@@ -94,8 +126,7 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
     const registered = await bounded(() => cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: 'void 0', worldName }));
     if (!record(registered) || typeof registered.identifier !== 'string') throw new Error();
     scriptId = registered.identifier;
-    return {
-    async collectText(snapshot: number): Promise<unknown> {
+    async function collect(snapshot: number) {
       if (closed || !Number.isSafeInteger(snapshot) || snapshot < 1) throw new Error('internal');
       try {
         const expires = performance.now() + deadline;
@@ -111,6 +142,9 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           if (!rootHost || !trustedUrl(root.frame.url, sourceHost, approvedHosts)) throw new Error();
           const frames: FrameFact[] = [], nodes: NodeFact[] = [], secrets: Secret[] = [];
           let page: { url: string; title: string } | undefined;
+          let observation: Observation | undefined;
+          let rootNodeCount = 0;
+          let rootContext = 0;
           const embeds: { url: string; visible: boolean }[] = [];
           const visit = async (frame: FrameTree, foreignAncestor: boolean, parentAccessible: boolean): Promise<void> => {
             if (frames.length >= 256) throw new Error();
@@ -129,7 +163,7 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
                 const data = evaluation.result.value as unknown as DocumentFacts;
                 if (typeof data.url !== 'string' || typeof data.title !== 'string' || !Array.isArray(data.nodes) || !Array.isArray(data.parents) || data.nodes.length !== data.parents.length || !Array.isArray(data.secrets) || !Array.isArray(data.embeds)) throw new Error();
                 if (!trustedUrl(data.url, sourceHost, approvedHosts) || new URL(data.url).href !== new URL(frame.frame.url).href || host(data.url) !== frameHost) throw new NavigationError();
-                if (index === 0) page = { url: data.url, title: data.title };
+                if (index === 0) { page = { url: data.url, title: data.title }; observation = data.observation; rootNodeCount = data.nodes.length; rootContext = world.executionContextId as number; }
                 for (let i = 0; i < data.nodes.length; i++) {
                   const parent = data.parents[i];
                   if (parent !== null && (!Number.isSafeInteger(parent) || parent < 0 || parent >= i)) throw new Error();
@@ -158,11 +192,59 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
           }
           const verify = await send('Page.getFrameTree');
           if (!record(verify) || JSON.stringify(tree(verify.frameTree)) !== JSON.stringify(root) || !page || closed) throw new Error();
-          return { snapshot, page, frames, nodes, secrets };
+          return { facts: { snapshot, page, frames, nodes, secrets }, observation, rootNodeCount, rootContext };
         });
         if (closed) throw new Error();
         return result;
       } catch { throw new Error('internal'); }
+    }
+    return {
+    async collectText(snapshot: number): Promise<unknown> {
+      const { facts } = await collect(snapshot);
+      if (closed) throw new Error('internal');
+      return facts;
+    },
+    async collectFrame(snapshot: number) {
+      const { facts, observation: observed, rootNodeCount, rootContext } = await collect(snapshot);
+      if (closed) throw new Error('internal');
+      const filtered = filterTextSnapshot(facts);
+      if (!observed || !filtered.ok) throw new Error('internal');
+      let plan: { masks: Rect[]; labels: { x: number; y: number; number: number }[] } | null = null;
+      try {
+        // CDP exposes closed shadow roots without executing page-owned code.
+        const dom = await bounded(() => cdp.send('DOM.getDocument', { depth: -1, pierce: true }));
+        if (closed) throw new Error('internal');
+        const hasShadow = (value: unknown): boolean => {
+          if (Array.isArray(value)) return value.some(hasShadow);
+          if (!record(value)) return false;
+          return (Array.isArray(value.shadowRoots) && value.shadowRoots.some(root => !record(root) || root.shadowRootType !== 'user-agent')) || Object.entries(value).some(([key, child]) => key !== 'shadowRoots' && hasShadow(child));
+        };
+        if (!record(dom) || !record(dom.root) || hasShadow(dom) || observed.unsupported || observed.geometry.length !== rootNodeCount ||
+            !Number.isSafeInteger(observed.width) || !Number.isSafeInteger(observed.height) || observed.width < 1 || observed.height < 1) throw new Error();
+        const masks: Rect[] = [], labels: { x: number; y: number; number: number }[] = [];
+        const elements = new Map(filtered.snapshot.elements.map(element => [element.n, element]));
+        const add = (r: Rect) => {
+          if (![r.x, r.y, r.width, r.height].every(Number.isFinite)) throw new Error();
+          if (r.width <= 0 || r.height <= 0) return;
+          const x = Math.max(0, Math.floor(r.x - 4)), y = Math.max(0, Math.floor(r.y - 4));
+          const right = Math.min(observed.width, Math.ceil(r.x + r.width + 4));
+          const bottom = Math.min(observed.height, Math.ceil(r.y + r.height + 4));
+          if (right > x && bottom > y) masks.push({ x, y, width: right - x, height: bottom - y });
+        };
+        for (let i = 0; i < rootNodeCount; i++) {
+          const node = facts.nodes[i], geometry = observed.geometry[i], element = elements.get(node.n);
+          if (geometry.mask) add(geometry.rect);
+          // Comparing with the domain result also covers split secrets across nodes.
+          const normalized = node.text.normalize('NFKC').replace(/\p{White_Space}/gu, ' ').replace(/[\p{Cf}\p{Cc}]/gu, '').replace(/ +/g, ' ');
+          if (!element || element.text !== normalized) for (const run of geometry.runs) add(run);
+          const r = geometry.rect;
+          if (element && r.width > 0 && r.height > 0 && r.x < observed.width && r.y < observed.height && r.x + r.width > 0 && r.y + r.height > 0)
+            labels.push({ x: Math.max(0, Math.floor(r.x)), y: Math.max(0, Math.floor(r.y)), number: element.n });
+        }
+        plan = { masks, labels };
+      } catch { plan = null; }
+      if (closed) throw new Error('internal');
+      return { facts, plan, revision: observed.revision, animationIds: [`document:${rootContext}`, ...observed.animationIds], viewportStable: observed.viewportStable, maskAnimationActive: observed.maskAnimationActive };
     },
     async close(): Promise<void> {
       if (closed) return;
