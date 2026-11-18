@@ -101,3 +101,81 @@ test('ограничивает строки число элементов и р�
   assert.ok(Buffer.byteLength(JSON.stringify(size.snapshot), 'utf8') <= 256 * 1024);
   assert.equal(size.snapshot.truncated, true);
 });
+
+test('маскирует числовой секрет в потомках отдельно от соседних цифр и исключает поля и скрытые узлы', async () => {
+  const { filterTextSnapshot } = await import('../../../core/domain/snapshot-filter.ts');
+  const facts = base();
+  facts.secrets = [{ value: '654987', kind: 'code' }];
+  facts.nodes = [
+    node(1, '7'),
+    node(2, '', { role: 'section' }),
+    node(3, '654', { parent: 2 }),
+    node(4, '987', { parent: 2 }),
+    node(5, '4'),
+    node(6, 'field-only', { parent: 2, role: 'textbox', field: 'filled' }),
+    node(7, 'hidden-only', { parent: 2, visible: false }),
+  ];
+  const result = filterTextSnapshot(facts);
+  assert.equal(result.ok, true);
+  const elements = result.snapshot.elements;
+  const text = (n: number) => elements.find((element: { n: number }) => element.n === n).text;
+  assert.equal(text(1), '7');
+  assert.equal(text(5), '4');
+  assert.equal(text(6), '');
+  assert.equal(elements.find((element: { n: number }) => element.n === 6).field, 'filled');
+  assert.equal(elements.some((element: { n: number }) => element.n === 7), false);
+  assert.doesNotMatch(JSON.stringify(result.snapshot), /field-only|hidden-only/);
+  assert.equal(text(3), '[секрет]');
+  assert.equal(text(4), '[секрет]');
+});
+
+test('маскирует цифры самого предка и его потомков среди соседних цифр', async () => {
+  const { filterTextSnapshot } = await import('../../../core/domain/snapshot-filter.ts');
+  const facts = base();
+  facts.secrets = [{ value: '654987', kind: 'code' }];
+  facts.nodes = [node(1, '7'), node(2, '65'), node(3, '49', { parent: 2 }), node(4, '87', { parent: 2 }), node(5, '4')];
+  const result = filterTextSnapshot(facts);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.snapshot.elements.map((element: { text: string }) => element.text), ['7', '[секрет]', '[секрет]', '[секрет]', '4']);
+});
+
+test('отказывает при некорректных связях parent', async (t: any) => {
+  const { filterTextSnapshot } = await import('../../../core/domain/snapshot-filter.ts');
+  const cases = [
+    { name: 'несуществующий предок', nodes: [node(1, 'x', { parent: 99 })] },
+    { name: 'цикл', nodes: [node(1, 'x', { parent: 2 }), node(2, 'y', { parent: 1 })] },
+    { name: 'предок в другом фрейме', nodes: [node(1, 'x', { frame: 0 }), node(2, 'y', { frame: 9, parent: 1 })] },
+  ];
+  for (const item of cases) await t.test(item.name, () => {
+    const facts = base();
+    facts.frames.push({ index: 9, host: 'other.example', foreign: false, unavailable: false });
+    facts.nodes = item.nodes;
+    assert.deepEqual(filterTextSnapshot(facts), { ok: false, code: 'internal' });
+  });
+});
+
+test('ссылается на позиции фреймов в массиве при перемежающихся узлах', async () => {
+  const { filterTextSnapshot } = await import('../../../core/domain/snapshot-filter.ts');
+  const facts = base();
+  facts.frames = [
+    { index: 9, host: 'first.example', foreign: false, unavailable: false },
+    { index: 0, host: 'second.example', foreign: false, unavailable: false },
+  ];
+  facts.nodes = [node(1, 'a', { frame: 9 }), node(2, 'b', { frame: 0 }), node(3, 'c', { frame: 9 }), node(4, 'd', { frame: 0 })];
+  const result = filterTextSnapshot(facts);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.snapshot.frames.map((frame: { host: string }) => frame.host), ['first.example', 'second.example']);
+  assert.deepEqual(result.snapshot.elements.map((element: { n: number; frame: number }) => [element.n, element.frame]), [[1, 0], [2, 1], [3, 0], [4, 1]]);
+});
+
+test('маскирует все повторяющиеся и перекрывающиеся вхождения секретных строк', async (t: any) => {
+  const { filterTextSnapshot } = await import('../../../core/domain/snapshot-filter.ts');
+  for (const value of ['abcab', 'abcabcab']) await t.test(value, () => {
+    const facts = base();
+    facts.secrets = [{ value, kind: 'password' }];
+    facts.nodes = [node(1, value + value.slice(3) + ' ' + value + value.slice(3))];
+    const result = filterTextSnapshot(facts);
+    assert.equal(result.ok, true);
+    assert.equal(result.snapshot.elements[0].text, '[секрет] [секрет]', value);
+  });
+});
