@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { BrowserEvent } from '../../use-cases/preparation.ts';
+import type { SnapshotDeviationFlag } from '../browser/capture-snapshot.ts';
 
 type Reason = 'allowed' | 'unsupported' | 'not-declared' | 'value-not-allowed' | 'not-found' |
   'ambiguous' | 'hidden' | 'disabled' | 'covered' | 'stale' | 'foreign-frame' | 'foreign-host' |
@@ -13,6 +14,12 @@ type Verdict = Readonly<{
 }>;
 type Outcome = Readonly<{ verdictId: number; status: 'ok' | 'stale' | 'internal' | 'limit' }>;
 type Clock = () => number;
+type SnapshotDeviation = Readonly<{
+  sessionId: string; sourceId: string; accessId: string; snapshotNumber: number;
+  host: string; path: string; code: 'retake' | 'unstable' | 'limit' | 'error';
+  flags: readonly SnapshotDeviationFlag[]; retakes: number; elapsedMs: number;
+}>;
+const flagOrder: readonly SnapshotDeviationFlag[] = ['flow', 'rectangles', 'animations', 'observer', 'visualViewport'];
 
 export declare const createActionProtocol: typeof create;
 declare const exports: { createActionProtocol: typeof create };
@@ -77,6 +84,20 @@ function create(database: DatabaseSync, clock: Clock) {
         host TEXT NOT NULL CHECK (length(host) BETWEEN 1 AND 253),
         path TEXT NOT NULL CHECK (length(path) BETWEEN 1 AND 2048)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS action_snapshot_deviations (
+        id INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND 9007199254740991),
+        at_ms INTEGER NOT NULL CHECK (at_ms BETWEEN 0 AND 9007199254740991),
+        session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 128 AND session_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        source_id TEXT NOT NULL CHECK (length(source_id) BETWEEN 1 AND 128 AND source_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        access_id TEXT NOT NULL CHECK (length(access_id) BETWEEN 1 AND 128 AND access_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        snapshot_number INTEGER NOT NULL CHECK (snapshot_number BETWEEN 1 AND 9007199254740991),
+        host TEXT NOT NULL CHECK (length(host) BETWEEN 1 AND 253),
+        path TEXT NOT NULL CHECK (length(path) BETWEEN 1 AND 2048),
+        code TEXT NOT NULL CHECK (code IN ('retake', 'unstable', 'limit', 'error')),
+        flags TEXT NOT NULL CHECK (json_valid(flags) AND json_type(flags) = 'array'),
+        retakes INTEGER NOT NULL CHECK (retakes BETWEEN 0 AND 9007199254740991),
+        elapsed_ms INTEGER NOT NULL CHECK (elapsed_ms BETWEEN 0 AND 9007199254740991)
+      ) STRICT;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_update BEFORE UPDATE ON action_verdicts BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_delete BEFORE DELETE ON action_verdicts BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_replace BEFORE INSERT ON action_verdicts WHEN EXISTS (SELECT 1 FROM action_verdicts WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
@@ -86,6 +107,9 @@ function create(database: DatabaseSync, clock: Clock) {
       CREATE TRIGGER IF NOT EXISTS action_browser_events_no_update BEFORE UPDATE ON action_browser_events BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_browser_events_no_delete BEFORE DELETE ON action_browser_events BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_browser_events_no_replace BEFORE INSERT ON action_browser_events WHEN EXISTS (SELECT 1 FROM action_browser_events WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_snapshot_deviations_no_update BEFORE UPDATE ON action_snapshot_deviations BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_snapshot_deviations_no_delete BEFORE DELETE ON action_snapshot_deviations BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_snapshot_deviations_no_replace BEFORE INSERT ON action_snapshot_deviations WHEN EXISTS (SELECT 1 FROM action_snapshot_deviations WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
     `);
     database.exec('RELEASE action_protocol_schema');
   } catch (error) {
@@ -100,6 +124,9 @@ function create(database: DatabaseSync, clock: Clock) {
   const insertBrowserEvent = database.prepare(`INSERT INTO action_browser_events
     (at_ms, session_id, source_id, access_id, step_number, kind, method, host, path)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const insertSnapshotDeviation = database.prepare(`INSERT INTO action_snapshot_deviations
+    (at_ms, session_id, source_id, access_id, snapshot_number, host, path, code, flags, retakes, elapsed_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   function time(): number {
     if (database.isTransaction) throw new Error('active transaction');
     const value = clock();
@@ -138,6 +165,16 @@ function create(database: DatabaseSync, clock: Clock) {
       }
       insertBrowserEvent.run(time(), value.sessionId, value.sourceId, value.accessId,
         value.stepNumber, value.kind, value.method, value.host, value.path);
+    },
+    appendSnapshotDeviation(value: SnapshotDeviation): void {
+      if (!identifier(value.sessionId) || !identifier(value.sourceId) || !identifier(value.accessId) ||
+        !integer(value.snapshotNumber, 1) || typeof value.host !== 'string' || value.host.length < 1 || value.host.length > 253 ||
+        typeof value.path !== 'string' || value.path.length < 1 || value.path.length > 2048 ||
+        !['retake', 'unstable', 'limit', 'error'].includes(value.code) || !Array.isArray(value.flags) ||
+        value.flags.some((flag, index) => !flagOrder.includes(flag) || (index > 0 && flagOrder.indexOf(value.flags[index - 1]) >= flagOrder.indexOf(flag))) ||
+        !integer(value.retakes, 0) || !integer(value.elapsedMs, 0)) throw new Error('invalid snapshot deviation');
+      insertSnapshotDeviation.run(time(), value.sessionId, value.sourceId, value.accessId, value.snapshotNumber,
+        value.host, value.path, value.code, JSON.stringify(value.flags), value.retakes, value.elapsedMs);
     },
   };
 }

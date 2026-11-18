@@ -16,8 +16,10 @@ type Frame = Readonly<{
   maskAnimationActive: boolean;
 }>;
 type DeviationCode = 'retake' | 'unstable' | 'limit' | 'error';
+export type SnapshotDeviationFlag = 'flow' | 'rectangles' | 'animations' | 'observer' | 'visualViewport';
 type Deviation = Readonly<{
   code: DeviationCode;
+  flags: readonly SnapshotDeviationFlag[];
   snapshotNumber: number;
   host: string;
   path: string;
@@ -86,13 +88,14 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
   const wallStart = performance.now();
   const remaining = () => Math.min(deadlineMs - (ports.now() - start), deadlineMs - (performance.now() - wallStart));
   let retakes = 0;
+  let flags: readonly SnapshotDeviationFlag[] = [];
   let snapshot: Filtered | undefined;
   const record = async (code: DeviationCode): Promise<boolean> => {
     if (!snapshot) return false;
     try {
       const elapsed = ports.now() - start;
       if (!Number.isFinite(elapsed)) return false;
-      const entry: Deviation = { code, snapshotNumber: snapshot.snapshot, host: snapshot.page.host, path: snapshot.page.path,
+      const entry: Deviation = { code, flags: code === 'retake' || code === 'unstable' ? flags : [], snapshotNumber: snapshot.snapshot, host: snapshot.page.host, path: snapshot.page.path,
         retakes, elapsedMs: Math.max(0, Math.floor(elapsed)) };
       // Protocol recording gets its own finite bound even when capture time has expired.
       await bounded(() => ports.recordDeviation(entry), deadlineMs);
@@ -131,10 +134,15 @@ async function capture(ports: Ports, getSession: () => Session, deadlineMs: numb
       const checked = filterTextSnapshot(second.facts);
       if (!checked.ok) return { ok: false, code: 'internal' };
       if (!validFrame(second) || !validPlan(second.plan)) return await fail('error');
-      const stable = !baseline.maskAnimationActive && !second.maskAnimationActive && baseline.viewportStable && second.viewportStable && baseline.revision === second.revision &&
-        isDeepStrictEqual(baseline.facts, second.facts) && isDeepStrictEqual(baseline.plan, second.plan) &&
-        isDeepStrictEqual([...baseline.animationIds].sort(), [...second.animationIds].sort());
-      if (!stable) {
+      const differences: SnapshotDeviationFlag[] = [];
+      if (!isDeepStrictEqual(baseline.facts, second.facts)) differences.push('flow');
+      if (!isDeepStrictEqual(baseline.plan, second.plan)) differences.push('rectangles');
+      if (baseline.maskAnimationActive || second.maskAnimationActive ||
+        !isDeepStrictEqual([...baseline.animationIds].sort(), [...second.animationIds].sort())) differences.push('animations');
+      if (baseline.revision !== second.revision) differences.push('observer');
+      if (!baseline.viewportStable || !second.viewportStable) differences.push('visualViewport');
+      flags = differences;
+      if (flags.length !== 0) {
         retakes++;
         const recorded = await record('retake');
         if (!currentSession()) return revoked();

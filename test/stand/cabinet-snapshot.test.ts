@@ -301,16 +301,18 @@ test('переснимает нестабильный кадр и протоко
 
   await t.test('передаёт отличившиеся признаки массивом', async () => {
     const timer = clock();
-    let entry: any;
+    const entries: any[] = [];
     let calls = 0;
     const result = await captureCabinetSnapshot({
       collect: async () => ++calls === 1 ? frame(8) : changed,
       capturePng: async () => syntheticPng(), now: timer.now, sleep: timer.sleep,
-      recordDeviation: async (value: any) => { entry = value; },
+      recordDeviation: async (value: any) => { entries.push(value); },
     }, () => session, 1000);
     assert.equal(result.ok, true);
-    assert.ok(Array.isArray(entry.flags));
-    assert.deepEqual(entry.flags, expectedFlags);
+    assert.deepEqual(entries.map(entry => [entry.code, entry.flags]), [
+      ['retake', expectedFlags],
+      ['error', []],
+    ]);
   });
 
   await t.test('записывает отклонения и отклоняет недоступный протокол', async () => {
