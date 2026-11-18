@@ -80,6 +80,7 @@ function create(database: DatabaseSync, clock: Clock) {
         access_id TEXT NOT NULL CHECK (length(access_id) BETWEEN 1 AND 128 AND access_id NOT GLOB '*[^A-Za-z0-9_-]*'),
         step_number INTEGER NOT NULL CHECK (step_number BETWEEN 1 AND 9007199254740991),
         kind TEXT NOT NULL CHECK (kind IN ('main-frame-navigation', 'non-get-request')),
+        actor TEXT NOT NULL DEFAULT 'browser' CHECK (actor = 'browser'),
         method TEXT NOT NULL CHECK (method IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'other')),
         host TEXT NOT NULL CHECK (length(host) BETWEEN 1 AND 253),
         path TEXT NOT NULL CHECK (length(path) BETWEEN 1 AND 2048)
@@ -98,6 +99,14 @@ function create(database: DatabaseSync, clock: Clock) {
         retakes INTEGER NOT NULL CHECK (retakes BETWEEN 0 AND 9007199254740991),
         elapsed_ms INTEGER NOT NULL CHECK (elapsed_ms BETWEEN 0 AND 9007199254740991)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS channel_denials (
+        id INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND 9007199254740991),
+        at_ms INTEGER NOT NULL CHECK (at_ms BETWEEN 0 AND 9007199254740991),
+        code TEXT NOT NULL CHECK (code IN ('peerUid', 'format', 'handler'))
+      ) STRICT;
+      CREATE TRIGGER IF NOT EXISTS channel_denials_no_update BEFORE UPDATE ON channel_denials BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS channel_denials_no_delete BEFORE DELETE ON channel_denials BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS channel_denials_no_replace BEFORE INSERT ON channel_denials WHEN EXISTS (SELECT 1 FROM channel_denials WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_update BEFORE UPDATE ON action_verdicts BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_delete BEFORE DELETE ON action_verdicts BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_verdicts_no_replace BEFORE INSERT ON action_verdicts WHEN EXISTS (SELECT 1 FROM action_verdicts WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
@@ -111,6 +120,10 @@ function create(database: DatabaseSync, clock: Clock) {
       CREATE TRIGGER IF NOT EXISTS action_snapshot_deviations_no_delete BEFORE DELETE ON action_snapshot_deviations BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS action_snapshot_deviations_no_replace BEFORE INSERT ON action_snapshot_deviations WHEN EXISTS (SELECT 1 FROM action_snapshot_deviations WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
     `);
+    const columns = database.prepare('PRAGMA table_info(action_browser_events)').all();
+    if (!columns.some(column => column.name === 'actor')) {
+      database.exec("ALTER TABLE action_browser_events ADD COLUMN actor TEXT NOT NULL DEFAULT 'browser' CHECK (actor = 'browser')");
+    }
     database.exec('RELEASE action_protocol_schema');
   } catch (error) {
     database.exec('ROLLBACK TO action_protocol_schema');
@@ -139,6 +152,10 @@ function create(database: DatabaseSync, clock: Clock) {
     v.decision, v.reason, o.status AS outcome FROM action_verdicts v
     LEFT JOIN action_outcomes o ON o.verdict_id = v.id ORDER BY v.id`);
   return {
+    appendDenial(code: string): void {
+      if (!['peerUid', 'format', 'handler'].includes(code)) throw new Error('invalid denial');
+      database.prepare('INSERT INTO channel_denials (at_ms, code) VALUES (?, ?)').run(time(), code);
+    },
     list() {
       return listRows.all() as unknown as readonly { atMs: number; sourceId: string; accessId: string; actor: string; method: string; snapshotNumber: number; nodeNumber: number | null; decision: 'allowed' | 'blocked'; reason: string; outcome: string | null }[];
     },

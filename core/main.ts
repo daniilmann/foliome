@@ -10,7 +10,7 @@ type Collector = Awaited<ReturnType<typeof prepareDomCollector>>;
 type Browser = Pick<Collector, 'collectFrame' | 'observeTargets' | 'readObservedTarget' | 'loginObservations' | 'finishLoginObservation'> & {
   openSource(): Promise<void>; closeSource(): Promise<void>; capturePng(viewport?: import('./adapters/browser/capture-snapshot.ts').Viewport): Promise<Buffer>;
 };
-type Ports = { browser: Browser; protocol: ReturnType<typeof createActionProtocol>; store: ReturnType<typeof createTextSnapshotStore>; now(): number; sleep(ms: number): Promise<void>; executorRunning(): boolean };
+type Ports = { browser: Browser; protocol: ReturnType<typeof createActionProtocol>; store: ReturnType<typeof createTextSnapshotStore>; now(): number; sleep(ms: number): Promise<void>; executorRunning(): boolean; protocolUnavailable?(): void };
 type Scope = { sessionId: string; sourceId: string; accessId: string; instruction: string };
 type Session = { sessionId: string; ready: boolean; confirmed: boolean; number: number; busy: boolean; observation?: Awaited<ReturnType<Collector['observeTargets']>> & Pick<Scope, 'sessionId' | 'sourceId' | 'accessId'> };
 export declare const createPreparationRuntime: typeof create;
@@ -26,6 +26,24 @@ function create(ports: Ports, scope: Scope) {
   let lifecyclePending = false;
   let epoch = 0;
   const unavailable = () => ({ ok: false as const, code: 'session-unavailable' as const });
+  function revokeForProtocol(session: Session) {
+    if (current !== session) return;
+    try { ports.protocolUnavailable?.(); } catch { /* Revocation is mandatory even if notification fails. */ }
+    void closeSource().catch(() => {});
+  }
+  function bindBrowserEvents() {
+    const session = current;
+    return (event: Omit<import('./use-cases/preparation.ts').BrowserEvent, 'sessionId' | 'sourceId' | 'accessId' | 'stepNumber'>) => {
+      if (!session || current !== session) return false;
+      try {
+        ports.protocol.appendBrowserEvent({ ...event, sessionId: session.sessionId, sourceId: scope.sourceId, accessId: scope.accessId, stepNumber: session.number + 1 });
+        return true;
+      } catch {
+        revokeForProtocol(session);
+        return false;
+      }
+    };
+  }
   function closeSource(): Promise<void> {
     if (!current) return lifecycle;
     current = undefined;
@@ -82,7 +100,7 @@ function create(ports: Ports, scope: Scope) {
     try {
       const result = await capture(session, session.number + 1);
       if (!result.ok) {
-        if (result.code === 'protocol-unavailable' && current === session) void closeSource().catch(() => {});
+        if (result.code === 'protocol-unavailable') revokeForProtocol(session);
         return result;
       }
       await persist(session, result);
@@ -115,7 +133,7 @@ function create(ports: Ports, scope: Scope) {
           ports.protocol.appendVerdict({ ...scope, sessionId: session.sessionId, snapshotNumber: session.number, nodeNumber: null, method: 'other', actionClass: 'unknown', decision: 'blocked', reason: 'unsupported' });
           changed();
         } catch {
-          if (current === session) void closeSource().catch(() => {});
+          revokeForProtocol(session);
           return { ok: false as const, code: 'protocol-unavailable' as const };
         }
       },
@@ -131,7 +149,7 @@ function create(ports: Ports, scope: Scope) {
             getSession: () => active(session) ? { ...scope, sessionId: session.sessionId, sessionActive: true, loginStep: false, snapshotNumber: session.number } : undefined,
             collectTarget, captureSnapshot: n => capture(session, n),
             persistSnapshot: async result => { await persist(session, result); },
-            protocol: ports.protocol, onProtocolUnavailable: () => { void closeSource().catch(() => {}); },
+            protocol: ports.protocol, onProtocolUnavailable: () => { revokeForProtocol(session); },
           });
           const result = await reader.read({ method: 'readText', actionClass: 'read', ...args }, session.observation);
           changed();
@@ -142,7 +160,7 @@ function create(ports: Ports, scope: Scope) {
       },
     });
   }
-  return { open, closeSource, shutdown: closeSource, confirmLogin, observeSnapshot, createHandler, rows };
+  return { open, closeSource, shutdown: closeSource, confirmLogin, observeSnapshot, createHandler, rows, bindBrowserEvents };
 }
 exports.createPreparationRuntime = create;
 

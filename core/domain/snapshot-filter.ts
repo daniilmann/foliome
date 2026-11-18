@@ -181,7 +181,15 @@ function valid(input: unknown): input is Facts {
   return input.secrets.every(s => isRecord(s) && typeof s.value === 'string' && ['login', 'password', 'code'].includes(s.kind as string));
 }
 export declare const filterTextSnapshot: typeof filter;
-declare const exports: { filterTextSnapshot: typeof filter };
+export declare const filterEventAddress: typeof eventAddress;
+declare const exports: { filterTextSnapshot: typeof filter; filterEventAddress: typeof eventAddress };
+function eventAddress(raw: string, secrets: Secret[]): { host: string; path: string } {
+  const url = new URL(raw);
+  url.search = ''; url.hash = '';
+  const result = address(url.href, secrets);
+  if (!result.host || result.host.length > 253 || !result.path || result.path.length > 2048) throw new Error('internal');
+  return result;
+}
 function filter(input: unknown): Result {
   try {
     if (!valid(input)) return { ok: false, code: 'internal' };
@@ -262,3 +270,4 @@ function filter(input: unknown): Result {
 }
 
 exports.filterTextSnapshot = filter;
+exports.filterEventAddress = eventAddress;

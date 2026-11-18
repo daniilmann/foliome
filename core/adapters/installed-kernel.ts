@@ -9,6 +9,7 @@ const os = require('node:os') as typeof import('node:os');
 const path = require('node:path') as typeof import('node:path');
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 const { createActionProtocol } = require('./store/action-protocol.ts') as typeof import('./store/action-protocol.ts');
+const { createTechnicalLog } = require('./technical-log.ts') as typeof import('./technical-log.ts');
 const { createTextSnapshotStore } = require('./store/text-snapshot-store.ts') as typeof import('./store/text-snapshot-store.ts');
 const { createAdmittedChannel } = require('./channel/admission.ts') as typeof import('./channel/admission.ts');
 const { startExecutor } = require('./executor/start.ts') as typeof import('./executor/start.ts');
@@ -49,6 +50,8 @@ async function createInstalled(options: Options) {
   await mkdir(path.dirname(options.paths.database), { recursive: true, mode: 0o700 });
   await mkdir(path.dirname(options.paths.socket), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(options.paths.database);
+  const log = createTechnicalLog(options.paths.database + '.technical.log');
+  log('started');
   let ownerBrowser: Chrome | undefined, sourceBrowser: Chrome | undefined;
   let ownerContext: Context | undefined, sourceContext: Context | undefined;
   let owner: Page | undefined, sourcePage: Page | undefined, collector: Collector | undefined, cdp: Cdp | undefined;
@@ -58,6 +61,7 @@ async function createInstalled(options: Options) {
   let worker: { stop(): void | Promise<void> } | undefined;
   let channelClose: (() => Promise<void>) | undefined;
   let closePromise: Promise<void> | undefined;
+  let protocol: ReturnType<typeof createActionProtocol> | undefined;
   const sockets = new Set<Socket>();
   function stopWorker() {
     const old = worker;
@@ -65,7 +69,13 @@ async function createInstalled(options: Options) {
     if (old) { try { void Promise.resolve(old.stop()).catch(() => {}); } catch { /* Already stopped. */ } }
   }
   const server = createAdmittedChannel({ expectedUid: options.executorUid, maxLineBytes: 1024 * 1024,
-    ...(options.peerUid ? { peerUid: options.peerUid } : {}), onDenied: () => {},
+    ...(options.peerUid ? { peerUid: options.peerUid } : {}), onDenied: code => {
+      try { protocol?.appendDenial(code); log('channel-denied'); } catch {
+        log('protocol-unavailable');
+        running = false; stopWorker(); window?.setStatus('protocol-unavailable');
+        void runtime?.closeSource().catch(() => {});
+      }
+    },
     createHandler: () => runtime!.createHandler() });
   server.on('connection', (socket: Socket) => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
   async function closeSource() {
@@ -95,7 +105,7 @@ async function createInstalled(options: Options) {
     return closePromise;
   }
   try {
-    const protocol = createActionProtocol(db, Date.now);
+    protocol = createActionProtocol(db, Date.now);
     const store = createTextSnapshotStore(db, Date.now);
     const browser: Parameters<typeof createPreparationRuntime>[0]['browser'] = {
       async openSource() {
@@ -106,7 +116,8 @@ async function createInstalled(options: Options) {
           sourceContext = await sourceBrowser.newContext(); check();
           sourcePage = await sourceContext.newPage(); check();
           const page = sourcePage;
-          page.on('close', () => { running = false; generation++; stopWorker(); void runtime?.closeSource().catch(() => {}); });
+          const record = runtime!.bindBrowserEvents();
+          page.on('close', () => { if (generation !== token) return; running = false; generation++; stopWorker(); void runtime?.closeSource().catch(() => {}); });
           await sourceContext.route('**/*', async route => {
             try {
               const request = route.request() as ReturnType<typeof route.request> & { isNavigationRequest(): boolean };
@@ -118,6 +129,27 @@ async function createInstalled(options: Options) {
           check();
           cdp = await sourceContext.newCDPSession(page); check();
           collector = await prepare(cdp, { sourceHost: url.hostname }); check();
+          const localCollector = collector;
+          let navigationMethod = 'GET';
+          type EventPage = { on(event: string, listener: (value: never) => void): unknown };
+          const events = page as unknown as EventPage;
+          const write = (kind: 'main-frame-navigation' | 'non-get-request', method: string, raw: string) => {
+            if (closed || generation !== token || collector !== localCollector) return;
+            try {
+              const address = localCollector.eventAddress(raw);
+              const verb = (['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as const).find(value => value === method) ?? 'other';
+              if (record({ kind, method: verb, ...address })) log('browser-event');
+            } catch {
+              if (generation === token) { running = false; stopWorker(); window?.setStatus('protocol-unavailable'); void runtime?.closeSource().catch(() => {}); }
+            }
+          };
+          events.on('framenavigated', ((frame: { url(): string }) => {
+            if (frame === page.mainFrame() && frame.url() !== 'about:blank') write('main-frame-navigation', navigationMethod, frame.url());
+          }) as (value: never) => void);
+          events.on('request', ((request: { method(): string; url(): string; isNavigationRequest(): boolean; frame(): unknown }) => {
+            if (request.isNavigationRequest() && request.frame() === page.mainFrame()) navigationMethod = request.method();
+            if (request.method() !== 'GET') write('non-get-request', request.method(), request.url());
+          }) as (value: never) => void);
           await page.goto(url.href); check();
         } catch (error) { await closeSource(); throw error; }
       },
@@ -130,7 +162,7 @@ async function createInstalled(options: Options) {
       capturePng: viewport => captureViewportPng(cdp!, viewport),
     };
     const { createPreparationRuntime: createRuntime } = require('../main.ts') as typeof import('../main.ts');
-    runtime = createRuntime({ browser, protocol, store, now: Date.now, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), executorRunning: () => running && !closed }, options.source);
+    runtime = createRuntime({ browser, protocol, store, now: Date.now, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)), executorRunning: () => running && !closed, protocolUnavailable: () => { running = false; stopWorker(); window?.setStatus('protocol-unavailable'); log('protocol-unavailable'); } }, options.source);
     ownerBrowser = await options.launchChrome();
     ownerContext = await ownerBrowser.newContext();
     owner = await ownerContext.newPage();

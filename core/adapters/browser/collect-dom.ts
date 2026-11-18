@@ -1,4 +1,4 @@
-const { filterTextSnapshot } = require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
+const { filterTextSnapshot, filterEventAddress } = require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
 const { createHmac, randomBytes } = require('node:crypto') as typeof import('node:crypto');
 
 type Cdp = {
@@ -365,6 +365,10 @@ async function prepare(cdp: Cdp, config: { sourceHost: string; approvedHosts?: r
       return { candidates, elements };
     }
     return {
+    eventAddress(raw: string) {
+      if (closed || overflow) throw new Error('internal');
+      return filterEventAddress(raw, [...history.values()]);
+    },
     loginObservations() {
       if (closed) throw new Error('internal');
       return { manualInputSeen, hasKnownSecret: history.size > 0 || overflow };
