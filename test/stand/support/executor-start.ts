@@ -8,7 +8,7 @@ const { join } = require('node:path');
 
 // Installed composition under test: createInstalledKernel({ paths, ownerName,
 // executorUid, observeMacOS, runProcess, launchChrome, peerUid?, source }) returns
-// { openSource, ownerPage, sourcePage, close }. The owner's POST starts executor.
+// { ownerPage, sourcePage, close }. Owner actions open the source and start executor.
 const owner = 'https://foliome-owner.invalid';
 const sourceUrl = 'https://cabinet.invalid/overview';
 const secretMarker = 'synthetic-private-error';
@@ -31,6 +31,10 @@ async function stand(overrides: any, run: (fixture: any) => Promise<void>) {
   const calls: any[] = [];
   const chromeLaunches: any[] = [];
   const clients: any[] = [];
+  let finishProcess!: (code: number | null) => void;
+  const finished = new Promise<number | null>(resolve => { finishProcess = resolve; });
+  let stops = 0;
+  const processHandle = { started: true, finished, stop: async () => { stops++; finishProcess(null); } };
   const paths = { home: join(dir, 'home'), app: join(dir, 'app'), data: join(dir, 'data'), channel: join(dir, 'channel'), socket: join(dir, 'channel.sock'), database: join(dir, 'core.db'), sshConfig: join(dir, 'data', 'ssh_config') };
   const good = { permissions: { home: true, app: true, data: true, channel: true, socket: true }, adminMembers: ['root', 'synthetic-owner'], canary: 'refused' };
   const observation = { ...good, ...overrides.observation };
@@ -40,7 +44,7 @@ async function stand(overrides: any, run: (fixture: any) => Promise<void>) {
     kernel = await createInstalledKernel({
       paths, ownerName: 'synthetic-owner', executorUid,
       observeMacOS: async () => observation,
-      runProcess: async (...args: any[]) => { calls.push(args); if (overrides.spawnFails) throw new Error(secretMarker); return 0; },
+      runProcess: async (...args: any[]) => { calls.push(args); if (overrides.spawnFails) throw new Error(secretMarker); return overrides.processResult ?? processHandle; },
       launchChrome: async () => {
         chromeLaunches.push('launch');
         const browser = await chromium.launch({ channel: 'chrome', headless: true, chromiumSandbox: true, args: ['--disable-gpu'] });
@@ -95,7 +99,7 @@ async function stand(overrides: any, run: (fixture: any) => Promise<void>) {
     const db = new DatabaseSync(paths.database, { readOnly: true });
     try { assert.ok(db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all().length > 0, 'installed kernel must initialize SQLite'); }
     finally { db.close(); }
-    await run({ kernel, paths, calls, chromeLaunches, connect });
+    await run({ kernel, paths, calls, chromeLaunches, connect, finishProcess, stopCount: () => stops });
   } finally {
     for (const client of clients) client.destroy();
     await kernel?.close();
