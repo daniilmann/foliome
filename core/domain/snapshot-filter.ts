@@ -240,6 +240,58 @@ function maskedSlice(text: string, start: number, end: number, masks: Range[]): 
   }
   return result;
 }
+type FlowPart = { text: string; ancestors: Iterable<number> };
+
+function* flowAncestors(n: number, parents: ReadonlyMap<number, number>) {
+  for (let current: number | undefined = n; current !== undefined; current = parents.get(current))
+    yield current;
+}
+
+function maskFlow(parts: readonly FlowPart[], secrets: Secret[]) {
+  let text = '';
+  const slices = parts.map((part, index) => {
+    if (index > 0) text += boundary;
+    const start = text.length;
+    const normalized = normalize(part.text);
+    text += normalized;
+    return { start, end: text.length, normalized, ancestors: part.ancestors };
+  });
+  const masks = ranges(text, secrets);
+  const numericSecrets = new Set(
+    secrets
+      .map((secret) => normalize(secret.value))
+      .filter((value) => /^\p{Nd}+$/u.test(value) && [...value].length >= 4)
+      .map((value) => [...value].map(digit).join('')),
+  );
+  if (numericSecrets.size > 0) {
+    const descendants = new Map<number, { digits: string; slices: typeof slices }>();
+    for (const slice of slices) {
+      const digits = [...slice.normalized]
+        .filter((ch) => digitPattern.test(ch))
+        .map(digit)
+        .join('');
+      for (const ancestor of slice.ancestors) {
+        const entry = descendants.get(ancestor) ?? { digits: '', slices: [] };
+        entry.digits += digits;
+        entry.slices.push(slice);
+        descendants.set(ancestor, entry);
+      }
+    }
+    for (const entry of descendants.values())
+      if (numericSecrets.has(entry.digits))
+        for (const slice of entry.slices)
+          masks.push({ start: slice.start, end: slice.end, kind: 'secret' });
+  }
+  return slices.map(({ start, end, normalized }) => ({
+    normalized,
+    filtered: maskedSlice(text, start, end, masks),
+  }));
+}
+
+function paintMasks(parts: readonly FlowPart[], secrets: Secret[]): boolean[] {
+  return maskFlow(parts, secrets).map(({ normalized, filtered }) => normalized !== filtered);
+}
+
 function mask(value: string, secrets: Secret[]): string {
   const text = normalize(value);
   return maskedSlice(text, 0, text.length, ranges(text, secrets));
@@ -347,9 +399,11 @@ function valid(input: unknown): input is Facts {
 }
 export declare const filterTextSnapshot: typeof filter;
 export declare const filterEventAddress: typeof eventAddress;
+export declare const detectPaintMasks: typeof paintMasks;
 declare const exports: {
   filterTextSnapshot: typeof filter;
   filterEventAddress: typeof eventAddress;
+  detectPaintMasks: typeof paintMasks;
 };
 function eventAddress(raw: string, secrets: Secret[]): { host: string; path: string } {
   const url = new URL(raw);
@@ -379,66 +433,27 @@ function filter(input: unknown): Result {
     const frameMap = new Map(input.frames.map((f) => [f.index, f]));
     const framePositions = new Map(input.frames.map((f, i) => [f.index, i]));
     const visible = new Map<number, boolean>();
-    const documents = new Map<
-      number,
-      { text: string; slices: { node: NodeFact; start: number; end: number }[] }
-    >();
+    const documents = new Map<number, (FlowPart & { n: number })[]>();
+    const parents = new Map<number, number>();
     for (const node of input.nodes) {
       const frame = frameMap.get(node.frame)!;
       const shown =
         node.visible && (node.parent === undefined || visible.get(node.parent) === true);
       visible.set(node.n, shown);
       if (!shown || frame.foreign || frame.unavailable) continue;
-      let document = documents.get(node.frame);
-      if (!document) {
-        document = { text: '', slices: [] };
-        documents.set(node.frame, document);
-      }
-      if (document.slices.length) document.text += boundary;
-      const start = document.text.length;
-      if (!node.field && !fieldRoles.has(node.role.toLowerCase()))
-        document.text += normalize(node.text);
-      document.slices.push({ node, start, end: document.text.length });
+      if (node.parent !== undefined) parents.set(node.n, node.parent);
+      const document = documents.get(node.frame) ?? [];
+      document.push({
+        n: node.n,
+        text: node.field || fieldRoles.has(node.role.toLowerCase()) ? '' : node.text,
+        ancestors: flowAncestors(node.n, parents),
+      });
+      documents.set(node.frame, document);
     }
     const texts = new Map<number, string>();
     for (const document of documents.values()) {
-      const masks = ranges(document.text, secrets);
-      const numericSecrets = new Set(
-        secrets
-          .map((s) => normalize(s.value))
-          .filter((s) => /^\p{Nd}+$/u.test(s) && [...s].length >= 4)
-          .map((s) => [...s].map(digit).join('')),
-      );
-      const ancestry = new Map<number, NodeFact>();
-      const descendants = new Map<
-        number,
-        { digits: string; slices: { start: number; end: number }[] }
-      >();
-      for (const slice of document.slices) {
-        ancestry.set(slice.node.n, slice.node);
-        let current: NodeFact | undefined = slice.node;
-        const digits = [...document.text.slice(slice.start, slice.end)]
-          .filter((ch) => digitPattern.test(ch))
-          .map(digit)
-          .join('');
-        while (current) {
-          let entry = descendants.get(current.n);
-          if (!entry) {
-            entry = { digits: '', slices: [] };
-            descendants.set(current.n, entry);
-          }
-          entry.digits += digits;
-          entry.slices.push(slice);
-          current = current.parent === undefined ? undefined : ancestry.get(current.parent);
-        }
-      }
-      for (const entry of descendants.values())
-        if (numericSecrets.has(entry.digits)) {
-          for (const slice of entry.slices)
-            masks.push({ start: slice.start, end: slice.end, kind: 'secret' });
-        }
-      for (const slice of document.slices)
-        texts.set(slice.node.n, maskedSlice(document.text, slice.start, slice.end, masks));
+      const filtered = maskFlow(document, secrets);
+      document.forEach((part, i) => texts.set(part.n, filtered[i].filtered));
     }
     const limit = (value: string) => {
       if ([...value].length <= 500) return value;
@@ -500,3 +515,4 @@ function filter(input: unknown): Result {
 
 exports.filterTextSnapshot = filter;
 exports.filterEventAddress = eventAddress;
+exports.detectPaintMasks = paintMasks;

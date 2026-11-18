@@ -1,4 +1,4 @@
-const { filterTextSnapshot, filterEventAddress } =
+const { filterTextSnapshot, filterEventAddress, detectPaintMasks } =
   require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
 const { createHmac, randomBytes } = require('node:crypto') as typeof import('node:crypto');
 
@@ -60,6 +60,17 @@ type NodeFact = {
 };
 type Secret = { value: string; kind: 'login' | 'password' | 'code' };
 type Rect = { x: number; y: number; width: number; height: number };
+type PaintStyle = { shadow: string; filter: string; reflection: string; reflectionBox: boolean };
+type Pseudo = 'before' | 'after';
+type PaintRun = {
+  owner: number;
+  text: string;
+  bounds: Rect[];
+  pseudo?: Pseudo;
+  style?: PaintStyle;
+  backendNodeId?: number;
+};
+type Shadow = { index: number; backendNodeId: number; bounds: Rect[] | null };
 type Geometry = {
   rect: Rect;
   runs: Rect[];
@@ -68,6 +79,8 @@ type Geometry = {
   ancestors: number[];
   frameUrl: string | null;
   transformed: boolean;
+  style?: PaintStyle;
+  svg?: boolean;
 };
 type Viewport = { x: number; y: number; width: number; height: number };
 type Observation = {
@@ -82,6 +95,7 @@ type Observation = {
   maskAnimationActive: boolean;
   unsupported: boolean;
   unobservedEmbeds: boolean;
+  paint?: PaintRun[];
 };
 type DocumentFacts = {
   url: string;
@@ -105,6 +119,7 @@ type ParticipatingWorld = {
   identities: number[];
   observation: Observation;
   projection?: Region;
+  shadows?: Shadow[];
 };
 type Region = { x: number; y: number; clip: Rect };
 type Label = { x: number; y: number; number: number };
@@ -114,28 +129,82 @@ type WorldPlan = Plan & { maskAnimationActive: boolean };
 // This expression is owned by the adapter and runs only in its isolated world.
 const hasTransform = `style => style.transform !== 'none' || style.perspective !== 'none' ||
   style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' || style.offsetPath !== 'none'`;
-const expression = `(() => {
-  const nodes = [], parents = [], identities = [], classes = [], semantics = [], secrets = [], embeds = [], geometry = [];
+const expression = String.raw`(() => {
+  const nodes = [], parents = [], identities = [], classes = [], semantics = [], secrets = [], embeds = [], geometry = [], paint = [];
   const visitedEmbeds = new Set(), hasTransform = ${hasTransform};
   const state = globalThis.__foliomeObservation || (globalThis.__foliomeObservation = (() => {
     const state = { revision: 0, ids: new WeakMap(), next: 1, watched: new WeakSet() };
     state.observer = new MutationObserver(() => { state.revision++; });
     state.observer.observe(document, { subtree: true, attributes: true, childList: true, characterData: true });
-    for (const event of ['scroll', 'resize', 'pointerover', 'pointerout', 'focusin', 'transitionstart', 'animationstart'])
+    for (const event of ['scroll', 'resize', 'pointerover', 'pointerout', 'focusin', 'transitionstart', 'animationstart', 'selectionchange'])
       addEventListener(event, () => { state.revision++; }, true);
     if (visualViewport) for (const event of ['scroll', 'resize']) visualViewport.addEventListener(event, () => { state.revision++; });
     return state;
   })());
-  let unsupported = false;
+  if (state.observer.takeRecords().length) state.revision++;
+  let unsupported = !!CSS.highlights?.size;
+  const selection = getSelection();
+  const selectionPainted = selection && !selection.isCollapsed;
+  let paintSize = 0;
+  const pushPaint = (owner, text, bounds, extra) => {
+    paintSize += text.length;
+    if (paint.length >= 20000 || paintSize > 1024 * 1024 || bounds.length > 20001) {
+      unsupported = true;
+      return;
+    }
+    const previous = paint.at(-1);
+    if (!extra && previous && previous.owner === owner && !previous.pseudo) {
+      if (previous.bounds.length + bounds.length > 20001) { unsupported = true; return; }
+      previous.text += text;
+      for (const rect of bounds) previous.bounds.push(rect);
+    } else {
+      paint.push({ owner, text, bounds, ...extra });
+    }
+  };
   const rectValue = r => ({ x: r.x, y: r.y, width: r.width, height: r.height });
   const forbidden = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT']);
   const fieldRoles = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton', 'slider']);
   const safeAttrs = ['id', 'name', 'class', 'data-testid', 'type', 'autocomplete', 'placeholder', 'aria-label'];
-  const visit = (element, parent, ancestorsVisible) => {
+  const html = 'http://www.w3.org/1999/xhtml', svg = 'http://www.w3.org/2000/svg';
+  const paintStyle = (style, reflectionBox) => {
+    if (style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth) !== 0 ||
+        !['1', 'normal'].includes(style.zoom) || style.clipPath !== 'none' ||
+        style.clip !== 'auto' || style.maskImage !== 'none') unsupported = true;
+    return {
+      shadow: style.textShadow, filter: style.filter, reflection: style.webkitBoxReflect,
+      reflectionBox,
+    };
+  };
+  const clippedSvg = (element, style) => {
+    // Only the outer SVG viewport can prove clipping of the use-instance tree.
+    if (style.overflowX !== 'hidden' || style.overflowY !== 'hidden' ||
+        element.getClientRects().length !== 1 || !element.parentElement ||
+        element.parentElement.namespaceURI !== html) return false;
+    const tags = new Set(['defs', 'g', 'text', 'tspan', 'use', 'path', 'rect', 'circle', 'ellipse', 'line', 'polygon', 'polyline', 'title', 'desc']);
+    for (const child of element.querySelectorAll('*')) {
+      if (child.namespaceURI !== svg || !tags.has(child.localName)) return false;
+      if (child.localName !== 'use') continue;
+      if (!(child instanceof SVGUseElement)) return false;
+      const href = child.href.baseVal;
+      if (!href.startsWith('#') || href.length === 1) return false;
+      const local = new URL(location.href), reference = new URL(href, child.baseURI);
+      local.hash = ''; reference.hash = '';
+      if (reference.href !== local.href) return false;
+      const target = document.getElementById(href.slice(1));
+      if (!target || !element.contains(target) || target.namespaceURI !== svg ||
+          !['text', 'path', 'rect', 'circle', 'ellipse', 'line', 'polygon', 'polyline'].includes(target.localName) ||
+          child.href.animVal !== href) return false;
+    }
+    return true;
+  };
+  const visit = (element, parent, ancestorsVisible, insideSvg = false) => {
     if (nodes.length >= 10000) throw new Error();
-    const tag = element.tagName;
+    const tag = element.tagName.toUpperCase();
     if (forbidden.has(tag)) return;
     const style = getComputedStyle(element), rect = element.getBoundingClientRect();
+    const svgRoot = element.namespaceURI === svg && !insideSvg;
+    if (svgRoot && (element.localName !== 'svg' || !clippedSvg(element, style)) ||
+        element.namespaceURI !== html && element.namespaceURI !== svg) unsupported = true;
     const subtreeVisible = ancestorsVisible && style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) > 0 && !element.hasAttribute('hidden') && !element.hasAttribute('inert') && element.getAttribute('aria-hidden') !== 'true';
     const visible = subtreeVisible && rect.width > 0 && rect.height > 0;
     const frame = tag === 'IFRAME' || tag === 'FRAME';
@@ -143,12 +212,36 @@ const expression = `(() => {
     const frameUrl = frame && element.src ? element.src : null;
     if (frameUrl) embeds.push({ url: frameUrl, visible });
     if (embed) visitedEmbeds.add(element);
-    for (const pseudo of ['::before', '::after']) {
-      const content = getComputedStyle(element, pseudo).content;
-      if (content !== 'none' && content !== 'normal') unsupported = true;
+    if (!insideSvg && !svgRoot && !['IMG', 'CANVAS', 'VIDEO'].includes(tag) && !['none', 'normal'].includes(style.content))
+      unsupported = true;
+    if (!insideSvg && !svgRoot) {
+      if (style.display === 'list-item' &&
+          (!['none', 'normal'].includes(getComputedStyle(element, '::marker').content) ||
+           !['none', 'disc', 'circle', 'square', 'decimal', 'decimal-leading-zero',
+             'lower-alpha', 'upper-alpha', 'lower-roman', 'upper-roman'].includes(style.listStyleType)))
+        unsupported = true;
+      const specialText = selectionPainted ? ['::first-letter', '::first-line', '::selection']
+        : ['::first-letter', '::first-line'];
+      for (const kind of specialText) {
+        const special = getComputedStyle(element, kind);
+        const inheritedShadow = kind === '::selection' ? 'none' : style.textShadow;
+        if (special.textShadow !== 'none' && special.textShadow !== inheritedShadow ||
+            special.filter !== 'none' || special.webkitBoxReflect !== 'none') unsupported = true;
+        paintStyle(special, false);
+      }
     }
-    if (style.textShadow !== 'none' || style.filter !== 'none' || style.webkitBoxReflect !== 'none' && style.webkitBoxReflect !== '' ||
-        style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth || '0') > 0 || (style.zoom !== '1' && style.zoom !== 'normal') || tag === 'USE' || tag === 'SVG') unsupported = true;
+    const appearance = insideSvg ? undefined : paintStyle(style,
+      style.webkitBoxReflect === 'none' ||
+      (['block', 'inline-block', 'flow-root', 'flex', 'inline-flex', 'grid', 'inline-grid'].includes(style.display) &&
+        element.getClientRects().length === 1));
+    const observePseudo = (owner, kind) => {
+      if (insideSvg || svgRoot) return;
+      const pseudo = getComputedStyle(element, '::' + kind);
+      if (pseudo.content === 'none' || pseudo.content === 'normal') return;
+      if (hasTransform(pseudo) || pseudo.webkitBoxReflect !== 'none' ||
+          pseudo.display === 'list-item') unsupported = true;
+      pushPaint(owner, pseudo.content, [], { pseudo: kind, style: paintStyle(pseudo, false) });
+    };
     const role = (element.getAttribute('role') || tag.toLowerCase()).toLowerCase();
     const closedField = element.isContentEditable || element.hasAttribute('contenteditable') || role === 'slider';
     const type = tag === 'INPUT' ? element.type.toLowerCase() : '';
@@ -157,7 +250,7 @@ const expression = `(() => {
     const field = closedField || tag === 'INPUT' && !button && !choice || tag === 'SELECT' || tag === 'TEXTAREA' || fieldRoles.has(role);
     let text = button ? element.value : '';
     if (!field) for (const child of element.childNodes) if (child.nodeType === 3) text += child.nodeValue || '';
-    const fact = { visible, role, text };
+    const fact = { visible, role, text: visible ? text : '' };
     if (field) {
       const type = (element.getAttribute('type') || '').toLowerCase();
       const textual = tag === 'TEXTAREA' || tag === 'INPUT' && ['', 'text', 'password', 'email', 'tel', 'url', 'search'].includes(type);
@@ -167,20 +260,15 @@ const expression = `(() => {
     }
     const nodeState = [];
     if (element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true') nodeState.push('disabled');
-    if (element.getAttribute('aria-checked') === 'true' || element.checked === true) nodeState.push('checked');
+    if (element.getAttribute('aria-checked') === 'true' || tag === 'INPUT' && element.checked === true) nodeState.push('checked');
     if (nodeState.length) fact.state = nodeState.join(' ');
     if (tag === 'A' && element.hasAttribute('href')) fact.href = element.href;
     const attrs = {};
     for (const key of safeAttrs) if (element.hasAttribute(key)) attrs[key] = element.getAttribute(key);
     if (Object.keys(attrs).length) fact.attrs = attrs;
-    const runs = [];
-    if (!field) for (const child of element.childNodes) if (child.nodeType === 3 && child.nodeValue) {
-      const range = document.createRange(); range.selectNodeContents(child);
-      for (const r of range.getClientRects()) if (r.width > 0 && r.height > 0) runs.push(rectValue(r));
-    }
     if (!state.ids.has(element)) state.ids.set(element, state.next++);
     identities.push(state.ids.get(element));
-    const label = [text, element.getAttribute('aria-label') || '', element.getAttribute('title') || '', element.value && (tag === 'BUTTON' || tag === 'INPUT' && ['button', 'submit', 'reset'].includes(element.type)) ? element.value : ''].join(' ').toLowerCase();
+    const label = [text, element.getAttribute('aria-label') || '', element.getAttribute('title') || '', (tag === 'BUTTON' || button) ? element.value : ''].join(' ').toLowerCase();
     semantics.push(JSON.stringify([tag, label, element.getAttribute('type'), element.getAttribute('aria-expanded'), element.getAttribute('aria-haspopup'), element.getAttribute('aria-controls'), element.getAttribute('aria-pressed'), element.getAttribute('autocomplete')]));
     const payment = /(?:pay(?:ment)?|transfer|оплат|плат[её]ж|перевод)/iu.test(label);
     const change = /(?:save|delete|remove|change|сохран|удал|измен)/iu.test(label) || tag === 'INPUT' && ['submit', 'reset'].includes(element.type) || tag === 'BUTTON' && element.type === 'submit';
@@ -191,8 +279,32 @@ const expression = `(() => {
       if (!state.ids.has(current)) state.ids.set(current, state.next++);
       ancestors.push(state.ids.get(current));
     }
-    geometry.push({ rect: rectValue(rect), runs, button, ancestors, frameUrl, transformed: hasTransform(style), mask: field || embed });
-    if (!field) for (const child of element.children) visit(child, visible ? index : parent, subtreeVisible);
+    const runs = [];
+    geometry.push({ rect: rectValue(rect), runs, button, ancestors, frameUrl,
+      transformed: !insideSvg && hasTransform(style), mask: field || embed || svgRoot,
+      style: appearance, ...(svgRoot ? { svg: true } : {}) });
+    observePseudo(index, 'before');
+    if (button && !insideSvg && !svgRoot && text && rect.width > 0 && rect.height > 0)
+      pushPaint(index, text, [rectValue(rect)]);
+    for (const child of element.childNodes) {
+      if (child.nodeType === Node.ELEMENT_NODE) {
+        if (!field) visit(child, visible ? index : parent, subtreeVisible, insideSvg || svgRoot);
+        else if (tag !== 'SELECT' && !insideSvg) unsupported = true;
+      } else if (!insideSvg && !svgRoot && child.nodeType === Node.TEXT_NODE && child.nodeValue &&
+                 (!field || !['INPUT', 'SELECT', 'TEXTAREA'].includes(tag))) {
+        const range = document.createRange(); range.selectNodeContents(child);
+        const bounds = Array.from(range.getClientRects()).filter(r => r.width > 0 && r.height > 0).map(rectValue);
+        if (!bounds.length) continue;
+        if (field) {
+          // The field value is private. Its drawn overflow is protected without reading it into the flow.
+          for (const boundsRect of bounds) runs.push(boundsRect);
+        } else {
+          for (const boundsRect of bounds) runs.push(boundsRect);
+          pushPaint(index, child.nodeValue, bounds);
+        }
+      }
+    }
+    observePseudo(index, 'after');
   };
   if (!document.documentElement) throw new Error();
   visit(document.documentElement, null, true);
@@ -205,7 +317,7 @@ const expression = `(() => {
   const viewport = visualViewport;
   const viewportStable = !!viewport && devicePixelRatio === 1 && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.pageLeft === scrollX && viewport.pageTop === scrollY && viewport.width === innerWidth && viewport.height === innerHeight;
   const unobservedEmbeds = Array.from(document.querySelectorAll('iframe,frame,object,embed')).some(el => !visitedEmbeds.has(el));
-  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported, unobservedEmbeds } };
+  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported, unobservedEmbeds, paint } };
 })()`;
 
 const worldName = 'foliome-dom-collector';
@@ -241,35 +353,67 @@ const shadowGeometry = `function() {
     state.observer.observe(this, { subtree: true, attributes: true, childList: true, characterData: true });
     state.watched.add(this);
   }
-  if (this.host.getAnimations({ subtree: true }).some(a => a.playState === 'running' || a.playState === 'pending')) throw new Error();
-  const rects = [], add = r => {
-    if (rects.length >= 20001) throw new Error();
-    rects.push({ x: r.x, y: r.y, width: r.width, height: r.height });
-  };
-  add(this.host.getBoundingClientRect());
-  let count = 0;
-  const visit = node => {
-    if (++count > 10000) throw new Error();
-    if (node.nodeType === Node.TEXT_NODE) {
-      if (node.data) { const range = document.createRange(); range.selectNodeContents(node); for (const rect of range.getClientRects()) add(rect); }
-      return;
-    }
-    if (node.nodeType !== Node.ELEMENT_NODE) throw new Error();
-    const el = node, style = getComputedStyle(el);
-    if (!['DIV', 'SPAN', 'P', 'B', 'I', 'STRONG', 'EM', 'SMALL', 'BR'].includes(el.tagName) || el.shadowRoot ||
-        style.textShadow !== 'none' || style.boxShadow !== 'none' || style.filter !== 'none' ||
-        (style.webkitBoxReflect !== 'none' && style.webkitBoxReflect !== '') || style.transform !== 'none' || style.perspective !== 'none' ||
-        style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' || style.offsetPath !== 'none' ||
-        style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth || '0') > 0 ||
-        (style.zoom !== '1' && style.zoom !== 'normal') || style.clipPath !== 'none' || style.clip !== 'auto' ||
-        style.overflowX !== 'visible' || style.overflowY !== 'visible' || style.outlineStyle !== 'none') throw new Error();
-    for (const pseudo of ['::before', '::after']) { const content = getComputedStyle(el, pseudo).content; if (content !== 'none' && content !== 'normal') throw new Error(); }
-    add(el.getBoundingClientRect());
-    for (const child of el.childNodes) visit(child);
-  };
-  for (const child of this.childNodes) visit(child);
-  return { hostId: state.ids.get(this.host), rects };
+  const hostId = state.ids.get(this.host), mode = this.mode;
+  try {
+    if (this.host.getAnimations({ subtree: true }).some(a => a.playState === 'running' || a.playState === 'pending')) throw new Error();
+    const hasTransform = ${hasTransform};
+    const bounds = [], add = r => {
+      if (bounds.length >= 20001) throw new Error();
+      bounds.push({ x: r.x, y: r.y, width: r.width, height: r.height });
+    };
+    add(this.host.getBoundingClientRect());
+    let count = 0;
+    const visit = node => {
+      if (++count > 10000) throw new Error();
+      if (node.nodeType === Node.COMMENT_NODE) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        const range = document.createRange(); range.selectNodeContents(node);
+        for (const rect of range.getClientRects()) add(rect);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) throw new Error();
+      const el = node, style = getComputedStyle(el);
+      if (el.getAnimations().some(a => a.playState === 'running' || a.playState === 'pending') ||
+          el.namespaceURI !== 'http://www.w3.org/1999/xhtml' ||
+          !['DIV', 'SPAN', 'P', 'B', 'I', 'STRONG', 'EM', 'SMALL', 'BR'].includes(el.tagName) || el.shadowRoot ||
+          style.textShadow !== 'none' || style.boxShadow !== 'none' || style.filter !== 'none' ||
+          style.webkitBoxReflect !== 'none' || hasTransform(style) ||
+          style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth) !== 0 ||
+          !['1', 'normal'].includes(style.zoom) || style.clipPath !== 'none' || style.clip !== 'auto' ||
+          style.maskImage !== 'none' || style.overflowX !== 'visible' || style.overflowY !== 'visible' ||
+          style.outlineStyle !== 'none') throw new Error();
+      for (const pseudo of ['::before', '::after']) {
+        const content = getComputedStyle(el, pseudo).content;
+        if (content !== 'none' && content !== 'normal') throw new Error();
+      }
+      for (const pseudo of ['::first-letter', '::first-line', '::selection']) {
+        const special = getComputedStyle(el, pseudo);
+        if (special.textShadow !== 'none' || special.filter !== 'none' ||
+            special.webkitBoxReflect !== 'none' || special.textTransform !== 'none' ||
+            parseFloat(special.webkitTextStrokeWidth) !== 0) throw new Error();
+      }
+      add(el.getBoundingClientRect());
+      for (const child of el.childNodes) visit(child);
+    };
+    for (const child of this.childNodes) visit(child);
+    return { hostId, mode, bounds };
+  } catch {
+    return { hostId, mode, bounds: null };
+  }
 }`;
+const pseudoHostIdentity = `function() {
+  const state = globalThis.__foliomeObservation;
+  if (!(this instanceof Element) || this.ownerDocument !== document || !this.isConnected || !state)
+    throw new Error();
+  return { id: state.ids.get(this) ?? null };
+}`;
+const documentObservation = `(() => {
+  const state = globalThis.__foliomeObservation;
+  if (!state || !document.documentElement) throw new Error();
+  if (state.observer.takeRecords().length) state.revision++;
+  return { url: location.href, revision: state.revision,
+    viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight } };
+})()`;
 const bindingName = '__foliomeLoginObservation';
 // Only this adapter-owned script can call the binding in the named isolated world.
 function observationScript(sourceHost: string, approvedHosts: ReadonlySet<string>): string {
@@ -340,6 +484,161 @@ function intersection(a: Rect, b: Rect): Rect | undefined {
     height = Math.min(a.y + a.height, b.y + b.height) - y;
   if (width > 0 && height > 0) return { x, y, width, height };
 }
+type Offset = { x: number; y: number; blur: number };
+type Effects = {
+  shadows: Offset[];
+  filters: Offset[];
+  reflection?: { direction: string; gap: number };
+};
+
+function cssParts(css: string, separator: ' ' | ','): string[] {
+  if (css.length > 4096) throw new Error();
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < css.length; i++) {
+    const char = css[i];
+    if (char === '(') depth++;
+    if (char === ')') {
+      depth--;
+      if (depth < 0) throw new Error();
+    }
+    if (depth === 0 && char === separator) {
+      const part = css.slice(start, i).trim();
+      if (part) parts.push(part);
+      else if (separator === ',') throw new Error();
+      start = i + 1;
+    }
+  }
+  const last = css.slice(start).trim();
+  if (depth || !last) throw new Error();
+  parts.push(last);
+  return parts;
+}
+
+function cssPixels(css: string): number {
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)px$/.test(css)) throw new Error();
+  const value = Number(css.slice(0, -2));
+  if (!Number.isFinite(value) || Math.abs(value) > 65536) throw new Error();
+  return value;
+}
+
+function shadowOffset(css: string): Offset {
+  const parts = cssParts(css, ' ');
+  // Chromium serializes computed colors as functions, and normally puts the color first.
+  const color = /^(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([a-z0-9 .,/%+-]+\)$/i;
+  if (color.test(parts[0])) parts.shift();
+  else if (color.test(parts.at(-1) ?? '')) parts.pop();
+  if (parts.length < 2 || parts.length > 3) throw new Error();
+  const [x, y, blur = 0] = parts.map(cssPixels);
+  if (blur < 0) throw new Error();
+  return { x, y, blur };
+}
+
+function paintEffects(style?: PaintStyle): Effects {
+  if (!style) return { shadows: [], filters: [] };
+  const shadows = style.shadow === 'none' ? [] : cssParts(style.shadow, ',').map(shadowOffset);
+  const filters =
+    style.filter === 'none'
+      ? []
+      : cssParts(style.filter, ' ').map((filter) => {
+          if (!filter.startsWith('drop-shadow(') || !filter.endsWith(')')) throw new Error();
+          return shadowOffset(filter.slice(12, -1));
+        });
+  if (shadows.length > 16 || filters.length > 8) throw new Error();
+  if (style.reflection === 'none' || style.reflection === '') return { shadows, filters };
+  const [direction, gap, mask, ...extra] = cssParts(style.reflection, ' ');
+  if (
+    !style.reflectionBox ||
+    !['above', 'below', 'left', 'right'].includes(direction) ||
+    mask !== 'none' ||
+    extra.length
+  )
+    throw new Error();
+  return { shadows, filters, reflection: { direction, gap: cssPixels(gap) } };
+}
+
+function padded(bounds: Rect, padding: number): Rect {
+  return {
+    x: bounds.x - padding,
+    y: bounds.y - padding,
+    width: bounds.width + padding * 2,
+    height: bounds.height + padding * 2,
+  };
+}
+
+function shadowBounds(bounds: Rect, { x, y, blur }: Offset): Rect {
+  // Four blur radii overcover Chromium's finite Gaussian support. Round out before rasterization.
+  return padded({ ...bounds, x: bounds.x + x, y: bounds.y + y }, Math.ceil(4 * blur));
+}
+
+function reflectBounds(
+  bounds: Rect,
+  box: Rect,
+  { direction, gap }: NonNullable<Effects['reflection']>,
+): Rect {
+  if (direction === 'above' || direction === 'below') {
+    const axis = direction === 'above' ? 2 * box.y - gap : 2 * (box.y + box.height) + gap;
+    return { ...bounds, y: axis - bounds.y - bounds.height };
+  }
+  const axis = direction === 'left' ? 2 * box.x - gap : 2 * (box.x + box.width) + gap;
+  return { ...bounds, x: axis - bounds.x - bounds.width };
+}
+
+function withFilter(bounds: Rect[], filters: Offset[]): Rect[] {
+  for (const filter of filters) {
+    if (bounds.length > 256) throw new Error();
+    bounds = [...bounds, ...bounds.map((area) => shadowBounds(area, filter))];
+  }
+  return bounds;
+}
+
+function withComposition(bounds: Rect[], effects: Effects, box: Rect): Rect[] {
+  const { reflection, filters } = effects;
+  if (!reflection) return withFilter(bounds, filters);
+  if (box.width <= 0 || box.height <= 0 || bounds.length > 256) throw new Error();
+  const original = [...bounds, box];
+  const reflect = (area: Rect) => reflectBounds(area, box, reflection);
+  const filtered = withFilter([...original, ...original.map(reflect)], filters);
+  // Cover both orderings when the box is itself also filtered.
+  return filters.length ? [...filtered, ...withFilter(original, filters).map(reflect)] : filtered;
+}
+
+function pseudoText(content: string): string {
+  let text = '';
+  let i = 0;
+  while (i < content.length) {
+    while (/\s/.test(content[i] ?? '')) i++;
+    const quote = content[i++];
+    if (quote !== '"' && quote !== "'") throw new Error();
+    while (i < content.length && content[i] !== quote) {
+      const char = content[i++];
+      if (char !== '\\') {
+        if (char === '\n' || char === '\r' || char === '\f') throw new Error();
+        text += char;
+        continue;
+      }
+      if (i === content.length) throw new Error();
+      const hex = /^[\da-f]{1,6}/i.exec(content.slice(i, i + 6))?.[0];
+      if (hex) {
+        const code = parseInt(hex, 16);
+        text +=
+          code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)
+            ? '\ufffd'
+            : String.fromCodePoint(code);
+        i += hex.length;
+        if (/[ \t\n\r\f]/.test(content[i] ?? '')) i++;
+      } else {
+        const escaped = content[i++];
+        if (escaped === '\n' || escaped === '\r' || escaped === '\f') throw new Error();
+        text += escaped;
+      }
+    }
+    if (content[i++] !== quote) throw new Error();
+  }
+  return text;
+}
+
 function observedGeometry(world: ParticipatingWorld): boolean {
   const { observation, count, identities } = world;
   if (
@@ -401,6 +700,268 @@ async function inspectNode(
     await bounded(() => cdp.send('Runtime.releaseObject', { objectId }));
   }
 }
+async function verifyWorld(cdp: Cdp, world: ParticipatingWorld): Promise<void> {
+  const response = await bounded(() =>
+    cdp.send('Runtime.evaluate', {
+      expression: documentObservation,
+      contextId: world.context,
+      returnByValue: true,
+    }),
+  );
+  const value =
+    record(response) && !response.exceptionDetails && record(response.result)
+      ? response.result.value
+      : undefined;
+  if (
+    !record(value) ||
+    value.url !== world.url ||
+    value.revision !== world.observation.revision ||
+    !rect(value.viewport) ||
+    !sameRect(value.viewport, world.observation.viewport)
+  )
+    throw new Error();
+}
+
+async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: NodeFact[]) {
+  const dom = await bounded(() => cdp.send('DOM.getDocument', { depth: -1, pierce: true }));
+  if (!record(dom) || !record(dom.root)) throw new Error();
+  const byFrame = new Map(worlds.map((world) => [world.frameId, world]));
+  const roots: {
+    world: ParticipatingWorld;
+    backend: number;
+    mode: 'open' | 'closed';
+    nested: boolean;
+  }[] = [];
+  const seen = new Set<ParticipatingWorld>();
+  const visit = (
+    value: unknown,
+    world: ParticipatingWorld,
+    insideShadow?: (typeof roots)[number],
+  ) => {
+    if (!record(value)) throw new Error();
+    if (
+      value.nodeType === 9 &&
+      Array.isArray(value.children) &&
+      value.children.some((child: unknown) => record(child) && child.frameId === world.frameId)
+    )
+      seen.add(world);
+    for (const child of Array.isArray(value.children) ? value.children : [])
+      visit(child, world, insideShadow);
+    for (const shadow of Array.isArray(value.shadowRoots) ? value.shadowRoots : []) {
+      if (!record(shadow)) throw new Error();
+      const { backendNodeId: backend, shadowRootType: mode } = shadow;
+      if (mode === 'user-agent') continue;
+      if (insideShadow) {
+        insideShadow.nested = true;
+        continue;
+      }
+      if (!positiveId(backend) || (mode !== 'open' && mode !== 'closed') || roots.length >= 256)
+        throw new Error();
+      const root: (typeof roots)[number] = { world, backend, mode, nested: false };
+      roots.push(root);
+      visit(shadow, world, root);
+    }
+    if (!value.contentDocument || insideShadow) return;
+    const child = typeof value.frameId === 'string' && byFrame.get(value.frameId);
+    if (child && child.parentFrameId === world.frameId) visit(value.contentDocument, child);
+  };
+  visit(dom.root, worlds[0]);
+  for (const world of worlds)
+    if (world.observation.viewport && !seen.has(world)) world.observation.unsupported = true;
+  const touched = new Set<ParticipatingWorld>();
+  for (const { world, backend, mode, nested } of roots) {
+    try {
+      const value = await inspectNode(cdp, backend, world.context, shadowGeometry);
+      if (!positiveId(value.hostId) || value.mode !== mode) throw new Error();
+      const index = world.identities.indexOf(value.hostId);
+      if (index < 0 || world.identities.lastIndexOf(value.hostId) !== index) throw new Error();
+      if (mode === 'closed') {
+        const node = nodes[world.base + index];
+        node.state = node.state ? node.state + ' unavailable' : 'unavailable';
+      }
+      const bounds = nested ? null : value.bounds;
+      if (
+        bounds !== null &&
+        (!Array.isArray(bounds) || bounds.length > 20001 || !bounds.every(rect))
+      )
+        throw new Error();
+      world.shadows ??= [];
+      world.shadows.push({ index, backendNodeId: backend, bounds });
+      touched.add(world);
+    } catch {
+      world.observation.unsupported = true;
+    }
+  }
+  for (const world of touched) {
+    try {
+      await verifyWorld(cdp, world);
+    } catch {
+      world.observation.unsupported = true;
+    }
+  }
+}
+
+const pseudoStyles = [
+  'content',
+  'text-shadow',
+  'filter',
+  '-webkit-box-reflect',
+  'clip-path',
+  'clip',
+  'mask-image',
+];
+
+async function observePseudos(cdp: Cdp, worlds: ParticipatingWorld[]): Promise<void> {
+  const candidates = worlds.filter(
+    (world) => !world.observation.unsupported && world.observation.paint?.some((run) => run.pseudo),
+  );
+  if (!candidates.length) return;
+  try {
+    const snapshot = await bounded(() =>
+      cdp.send('DOMSnapshot.captureSnapshot', {
+        computedStyles: pseudoStyles,
+        includeDOMRects: true,
+      }),
+    );
+    if (!record(snapshot) || !Array.isArray(snapshot.documents) || !Array.isArray(snapshot.strings))
+      throw new Error();
+    const strings: unknown[] = snapshot.strings;
+    for (const world of candidates) {
+      try {
+        const documents = snapshot.documents.filter(
+          (doc: unknown) =>
+            record(doc) &&
+            typeof doc.frameId === 'number' &&
+            strings[doc.frameId] === world.frameId,
+        );
+        if (documents.length !== 1) throw new Error();
+        await measurePseudos(cdp, world, documents[0], strings);
+        await verifyWorld(cdp, world);
+      } catch {
+        world.observation.unsupported = true;
+      }
+    }
+  } catch {
+    for (const world of candidates) world.observation.unsupported = true;
+  }
+}
+
+async function measurePseudos(
+  cdp: Cdp,
+  world: ParticipatingWorld,
+  doc: unknown,
+  strings: readonly unknown[],
+): Promise<void> {
+  const { viewport, paint } = world.observation;
+  if (
+    !record(doc) ||
+    typeof doc.documentURL !== 'number' ||
+    strings[doc.documentURL] !== world.url ||
+    doc.scrollOffsetX !== viewport.x ||
+    doc.scrollOffsetY !== viewport.y ||
+    !record(doc.nodes) ||
+    !record(doc.layout) ||
+    !paint
+  )
+    throw new Error();
+  const { parentIndex, backendNodeId, pseudoType, nodeName } = doc.nodes;
+  const { nodeIndex, styles, text, bounds } = doc.layout;
+  if (
+    !Array.isArray(parentIndex) ||
+    !Array.isArray(backendNodeId) ||
+    !Array.isArray(nodeName) ||
+    parentIndex.length > 20000 ||
+    parentIndex.length !== backendNodeId.length ||
+    parentIndex.length !== nodeName.length ||
+    !record(pseudoType) ||
+    !Array.isArray(pseudoType.index) ||
+    !Array.isArray(pseudoType.value) ||
+    pseudoType.index.length !== pseudoType.value.length ||
+    pseudoType.index.length > 256 ||
+    !Array.isArray(nodeIndex) ||
+    !Array.isArray(styles) ||
+    !Array.isArray(text) ||
+    !Array.isArray(bounds) ||
+    nodeIndex.length > 40000 ||
+    nodeIndex.length !== bounds.length ||
+    nodeIndex.length !== styles.length ||
+    nodeIndex.length !== text.length
+  )
+    throw new Error();
+  const expected = new Map<string, PaintRun>();
+  for (const run of paint) {
+    if (!run.pseudo) continue;
+    const key = world.identities[run.owner] + ':' + run.pseudo;
+    if (expected.has(key)) throw new Error();
+    expected.set(key, run);
+  }
+  const matches = new Map<number, { run: PaintRun; computed: string[]; rendered: string[] }>();
+  const hostIds = new Map<number, number | null>();
+  for (let i = 0; i < pseudoType.index.length; i++) {
+    const kind = strings[pseudoType.value[i]];
+    if (kind !== 'before' && kind !== 'after') continue;
+    const index: number = pseudoType.index[i];
+    const backend = backendNodeId[parentIndex[index]];
+    const pseudoBackend = backendNodeId[index];
+    if (!positiveId(backend) || !positiveId(pseudoBackend)) throw new Error();
+    let id = hostIds.get(backend);
+    if (id === undefined) {
+      const value = await inspectNode(cdp, backend, world.context, pseudoHostIdentity);
+      if (value.id !== null && !positiveId(value.id)) throw new Error();
+      id = value.id;
+      hostIds.set(backend, id);
+    }
+    const key = id + ':' + kind;
+    const run = expected.get(key);
+    if (!run) continue;
+    expected.delete(key);
+    if (!run.style) throw new Error();
+    const { shadow, filter, reflection } = run.style;
+    const computed = [run.text, shadow, filter, reflection, 'none', 'auto', 'none'];
+    run.text = pseudoText(run.text);
+    run.backendNodeId = pseudoBackend;
+    matches.set(index, { run, computed, rendered: [] });
+  }
+  if (expected.size) throw new Error();
+  for (let i = 0; i < nodeIndex.length; i++) {
+    const index: number = nodeIndex[i];
+    const isText = strings[nodeName[index]] === '#text';
+    const match = matches.get(isText ? parentIndex[index] : index);
+    if (!match) continue;
+    const style = styles[i];
+    const box = bounds[i];
+    if (
+      !Array.isArray(style) ||
+      !match.computed.every((value, j) => strings[style[j]] === value) ||
+      !Array.isArray(box) ||
+      box.length !== 4 ||
+      !box.every(Number.isFinite) ||
+      box[2] < 0 ||
+      box[3] < 0
+    )
+      throw new Error();
+    const [x, y, width, height] = box;
+    if (width > 0 && height > 0)
+      match.run.bounds.push({ x: x - viewport.x, y: y - viewport.y, width, height });
+    if (text[i] !== -1) {
+      const rendered = strings[text[i]];
+      if (typeof rendered !== 'string') throw new Error();
+      if (!match.rendered.includes(rendered)) match.rendered.push(rendered);
+    }
+  }
+  for (const { run, rendered } of matches.values()) {
+    // Chromium may expose the anonymous text as a second layout row on the pseudo node.
+    const whitespace = (value: string) => value.replace(/\s+/g, ' ').trim();
+    if (
+      run.bounds.length &&
+      whitespace(run.text) &&
+      !rendered.some((value) => whitespace(value) === whitespace(run.text)) &&
+      whitespace(rendered.join('')) !== whitespace(run.text)
+    )
+      throw new Error();
+  }
+}
+
 async function frameOwner(cdp: Cdp, child: ParticipatingWorld, parent: ParticipatingWorld) {
   const owner = await bounded(() => cdp.send('DOM.getFrameOwner', { frameId: child.frameId }));
   if (!record(owner) || !positiveId(owner.backendNodeId)) throw new Error();
@@ -803,6 +1364,11 @@ async function prepare(
               });
             }
           }
+          try {
+            await observeShadows(cdp, participatingWorlds, nodes);
+          } catch {
+            if (observation) observation.unsupported = true;
+          }
           const verify = await send('Page.getFrameTree');
           if (
             !record(verify) ||
@@ -950,60 +1516,12 @@ async function prepare(
         if (!observed || !filtered.ok) throw new Error('internal');
         let plan: Plan | null = null;
         try {
-          // CDP exposes closed shadow roots without executing page-owned code.
-          const dom = await bounded(() => cdp.send('DOM.getDocument', { depth: -1, pierce: true }));
-          if (closed) throw new Error('internal');
-          const shadowRoots: number[] = [];
-          const findShadowHosts = (value: unknown): void => {
-            if (Array.isArray(value)) {
-              for (const child of value) findShadowHosts(child);
-              return;
-            }
-            if (!record(value)) return;
-            if (
-              Array.isArray(value.shadowRoots) &&
-              value.shadowRoots.some(
-                (root) => !record(root) || root.shadowRootType !== 'user-agent',
-              )
-            ) {
-              for (const root of value.shadowRoots) {
-                if (!record(root)) throw new Error();
-                if (root.shadowRootType === 'user-agent') continue;
-                if (!Number.isSafeInteger(root.backendNodeId)) throw new Error();
-                shadowRoots.push(root.backendNodeId as number);
-                findShadowHosts(root);
-              }
-            }
-            for (const key of ['children', 'contentDocument'])
-              if (value[key]) findShadowHosts(value[key]);
-          };
-          if (!record(dom) || !record(dom.root)) throw new Error();
-          findShadowHosts(dom.root);
-          if (shadowRoots.length > 256) throw new Error();
+          await observePseudos(cdp, participatingWorlds);
           const [root] = participatingWorlds;
           if (!root || !observedGeometry(root)) throw new Error();
           const elements = new Map(
             filtered.snapshot.elements.map((element) => [element.n, element]),
           );
-          const shadows: { index: number; rects: Rect[] }[] = [];
-          for (const backendNodeId of shadowRoots) {
-            const { hostId, rects } = await inspectNode(
-              cdp,
-              backendNodeId,
-              rootContext,
-              shadowGeometry,
-            );
-            if (
-              !positiveId(hostId) ||
-              !Array.isArray(rects) ||
-              rects.length > 20001 ||
-              !rects.every(rect)
-            )
-              throw new Error();
-            const index = root.identities.indexOf(hostId);
-            if (index < 0) throw new Error();
-            shadows.push({ index, rects });
-          }
           const children = new Map<string, ParticipatingWorld[]>();
           for (const world of participatingWorlds) {
             if (world.parentFrameId === null) continue;
@@ -1018,6 +1536,7 @@ async function prepare(
             const { observation, base, identities } = world;
             const masks: Rect[] = [],
               labels: Label[] = [];
+            const maskKeys = new Set<string>();
             const translate = (r: Rect, padding: number) => ({
               x: region.x + r.x - padding,
               y: region.y + r.y - padding,
@@ -1031,19 +1550,59 @@ async function prepare(
               if (!clipped) return;
               const x = Math.floor(clipped.x),
                 y = Math.floor(clipped.y);
-              masks.push({
-                x,
-                y,
-                width: Math.ceil(clipped.x + clipped.width) - x,
-                height: Math.ceil(clipped.y + clipped.height) - y,
-              });
+              const width = Math.ceil(clipped.x + clipped.width) - x;
+              const height = Math.ceil(clipped.y + clipped.height) - y;
+              const key = [x, y, width, height].join(':');
+              if (maskKeys.has(key)) return;
+              if (masks.length >= 100000) throw new Error();
+              maskKeys.add(key);
+              masks.push({ x, y, width, height });
             };
             const protectedNodes = new Set<number>();
-            if (world === root)
-              for (const shadow of shadows) {
-                protectedNodes.add(shadow.index);
-                for (const bounds of shadow.rects) add(bounds);
+            if (!observedGeometry(world)) throw new Error();
+            const effects = observation.geometry.map((geometry) => paintEffects(geometry.style));
+            const byId = new Map(identities.map((id, index) => [id, index]));
+            const hasComposition = ({ filters, reflection }: Effects) =>
+              filters.length || reflection;
+            const paintAncestors = (index: number) =>
+              (observation.geometry[index].ancestors ?? []).map((id) => {
+                const ancestor = byId.get(id);
+                if (ancestor === undefined) throw new Error();
+                return ancestor;
+              });
+            const protect = (index: number, original: Rect[], padding = 4, pseudo?: Effects) => {
+              const ancestors = paintAncestors(index);
+              const own = pseudo ?? effects[index];
+              for (const box of original) {
+                if (!rect(box)) throw new Error();
+                if (box.width <= 0 || box.height <= 0) continue;
+                let bounds = [box, ...own.shadows.map((shadow) => shadowBounds(box, shadow))];
+                const extendsPaint =
+                  bounds.length > 1 ||
+                  Boolean(pseudo && hasComposition(pseudo)) ||
+                  ancestors.some((ancestor) => hasComposition(effects[ancestor]));
+                if (
+                  extendsPaint &&
+                  ancestors.some((ancestor) => observation.geometry[ancestor].transformed)
+                )
+                  throw new Error();
+                if (pseudo) bounds = withFilter(bounds, pseudo.filters);
+                for (const ancestor of ancestors) {
+                  if (bounds.length > 512) throw new Error();
+                  bounds = withComposition(
+                    bounds,
+                    effects[ancestor],
+                    observation.geometry[ancestor].rect,
+                  );
+                }
+                for (const area of bounds) add(area, extendsPaint ? 4 : padding);
               }
+              protectedNodes.add(index);
+            };
+            for (const shadow of world.shadows ?? []) {
+              if (shadow.bounds === null) throw new Error();
+              protect(shadow.index, shadow.bounds);
+            }
 
             const transformIds = new Set<number>();
             for (const [index, geometry] of observation.geometry.entries())
@@ -1075,6 +1634,8 @@ async function prepare(
                 for (const id of transforms) coveredTransforms.add(id);
                 continue;
               }
+              if (paintAncestors(owner.index).some((index) => hasComposition(effects[index])))
+                continue;
               try {
                 const projected = await childRegion(cdp, child, owner, region);
                 if (projected) {
@@ -1086,6 +1647,27 @@ async function prepare(
               }
             }
             if (transformIds.size !== coveredTransforms.size) throw new Error();
+
+            const paint = observation.paint;
+            if (paint) {
+              const spans = paint.map((run) => {
+                const geometry = observation.geometry[run.owner];
+                if (
+                  !geometry ||
+                  !Array.isArray(run.bounds) ||
+                  !run.bounds.every(rect) ||
+                  typeof run.text !== 'string' ||
+                  (run.pseudo && !positiveId(run.backendNodeId))
+                )
+                  throw new Error();
+                return { text: run.text, ancestors: geometry.ancestors };
+              });
+              const masked = detectPaintMasks(spans, facts.secrets);
+              for (const [index, run] of paint.entries()) {
+                const pseudo = run.pseudo ? paintEffects(run.style) : undefined;
+                if (masked[index] && run.bounds.length) protect(run.owner, run.bounds, 4, pseudo);
+              }
+            }
 
             for (const [i, geometry] of observation.geometry.entries()) {
               const node = facts.nodes[base + i],
@@ -1104,24 +1686,20 @@ async function prepare(
                   const exactBounds =
                     transformedOwner ||
                     (node.role === 'input' && node.field && observation.viewport);
-                  add(r, exactBounds ? 0 : 4);
+                  protect(i, [r], exactBounds ? 0 : 4);
+                  if (node.field && geometry.runs.length) protect(i, geometry.runs);
                 }
                 protectedNodes.add(i);
               }
-              // Comparing with the domain result also covers split secrets across nodes.
+              // Preserve masks established by the visible flow as well as the drawn flow.
               const normalized = node.text
                 .normalize('NFKC')
                 .replace(/\p{White_Space}/gu, ' ')
                 .replace(/[\p{Cf}\p{Cc}]/gu, '')
                 .replace(/ +/g, ' ');
-              if (!element || element.text !== normalized) {
-                if (geometry.button) {
-                  add(r);
-                  protectedNodes.add(i);
-                } else if (geometry.runs.length) {
-                  for (const run of geometry.runs) add(run);
-                  protectedNodes.add(i);
-                }
+              if (element ? element.text !== normalized : !paint) {
+                if (geometry.button) protect(i, [r]);
+                else if (geometry.runs.length) protect(i, geometry.runs);
               }
               const clipped = intersection(translate(r, 0), region.clip);
               if (element && clipped) {
