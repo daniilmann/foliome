@@ -89,15 +89,24 @@ def startup_evidence(path, marker, offset=0, prior_world=None):
                     turn["state"] = world
             elif kind == "turn_context" and payload.get("turn_id") == turn.get("id"):
                 turn["context"] = payload
-            elif kind == "response_item" and payload.get("type") == "additional_tools":
-                turn["tools"] = payload.get("tools")
-            elif kind == "response_item" and payload.get("role") == "user":
-                if any(isinstance(item, dict) and isinstance(item.get("text"), str)
-                       and item["text"].splitlines()[:1] == [marker]
-                       for item in payload.get("content") or ()):
-                    turn["matched"] = True
-            if turn.get("id") and turn.get("matched") and "state" in turn and "context" in turn:
-                return session, turn
+            elif kind == "response_item":
+                item_type = payload.get("type")
+                if item_type == "additional_tools":
+                    tools = payload.get("tools")
+                    if isinstance(tools, list):
+                        turn.setdefault("tools", []).extend(tools)
+                    else:
+                        turn["tool_inventory_invalid"] = True
+                elif payload.get("role") == "user":
+                    if any(isinstance(item, dict) and isinstance(item.get("text"), str)
+                           and item["text"].splitlines()[:1] == [marker]
+                           for item in payload.get("content") or ()):
+                        turn["matched"] = True
+                elif turn.get("id") and turn.get("matched") and (
+                    payload.get("role") == "assistant" or item_type in ("reasoning", "function_call", "custom_tool_call")
+                ):
+                    # Startup tool declarations apply to the model's first output in this turn.
+                    return session, turn
     return None
 
 
@@ -106,15 +115,20 @@ def verify_evidence(session, turn, settings, cwd, resume_id):
     if (not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id)
             or (resume_id and session_id != resume_id)):
         raise StartupRejected("журнал относится к другой сессии")
-    context = turn["context"]
+    context = turn.get("context") or {}
     if context.get("cwd") != str(cwd):
         raise StartupRejected("сессия запущена из другого каталога")
     if any(context.get(key) != settings[key] for key in ("model", "effort")):
         raise StartupRejected("модель или effort текущей сессии расходятся с ростером")
-    state = turn["state"]
+    state = turn.get("state")
+    top_level = state.get("top_level_tools") if isinstance(state, dict) else None
+    tools = turn.get("tools")
     if (not isinstance(state, dict) or state.get("apps_instructions") is not False
-            or not isinstance(state.get("top_level_tools"), dict)
-            or "mcp__codex_apps" in json.dumps([state.get("top_level_tools"), turn.get("tools")])):
+            or not isinstance(top_level, dict) or not top_level
+            or turn.get("tool_inventory_invalid") or not isinstance(tools, list)
+            or any(not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not tool["name"]
+                   for tool in tools)
+            or "mcp__codex_apps" in json.dumps([top_level, tools])):
         raise StartupRejected("журнал текущей сессии не подтверждает отключение коннекторов")
     return session_id
 
@@ -153,7 +167,7 @@ def save_result(path, result):
 
 def verify_startup(process, marker, prior_paths, resumed, offset, prior_world, settings, cwd, session_id):
     deadline = time.monotonic() + STARTUP_TIMEOUT
-    while process.poll() is None and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
         paths = {Path(path): 0 for path in role.rollouts() - prior_paths}
         if resumed is not None:
             paths[resumed] = offset
@@ -170,9 +184,9 @@ def verify_startup(process, marker, prior_paths, resumed, offset, prior_world, s
         if matches:
             path, session, turn = matches[0]
             return path, verify_evidence(session, turn, settings, cwd, session_id)
+        if process.poll() is not None:
+            break
         time.sleep(0.25)
-    if process.returncode == 0:
-        return None
     raise StartupRejected("проверяемая запись запуска Codex не появилась")
 
 
@@ -201,11 +215,10 @@ def launch(settings, cwd, journal, session_id=None, resumed=None):
     child = subprocess.Popen(command(settings, cwd, journal.parent, prompt, session_id),
                              env={**os.environ, **role.OPENSPEC_ENV})
     try:
-        verified = verify_startup(child, marker, prior_paths, resumed, offset, prior_world, settings, cwd, session_id)
-        if verified is not None:
-            rollout, actual_id = verified
-            save_result(result_path, {**result, **settings, "session_id": actual_id,
-                                      "rollout": str(rollout), "verified": True, "connectors": False})
+        rollout, actual_id = verify_startup(child, marker, prior_paths, resumed, offset, prior_world,
+                                            settings, cwd, session_id)
+        save_result(result_path, {**result, **settings, "session_id": actual_id,
+                                  "rollout": str(rollout), "verified": True, "connectors": False})
     except (StartupRejected, OSError, KeyboardInterrupt) as exc:
         if child.poll() is None:
             child.terminate()

@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import orchestrator
@@ -33,6 +33,7 @@ class OrchestratorTests(unittest.TestCase):
             }},
             {"type": "response_item", "payload": {"type": "message", "role": "user",
                                                    "content": [{"type": "input_text", "text": marker + "\nbrief"}]}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": []}},
         ]
 
     def write(self, rows, mode="w"):
@@ -57,7 +58,40 @@ class OrchestratorTests(unittest.TestCase):
 
     def test_missing_inventory_does_not_prove_apps_are_disabled(self):
         self.write([self.metadata(), *self.turn("current", "marker", full=False)])
+        with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
+            self.evaluate("marker")
+
+    def test_missing_or_malformed_additional_tools_rejects_start(self):
+        for inventory in (None, {"functions": {}}, [{"type": "tool"}]):
+            with self.subTest(inventory=inventory):
+                turn = self.turn("current", "marker")
+                if inventory is None:
+                    del turn[1]
+                else:
+                    turn[1]["payload"]["tools"] = inventory
+                self.write([self.metadata(), *turn])
+                with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
+                    self.evaluate("marker")
+
+    def test_additional_tools_after_the_marker_are_checked_before_first_output(self):
+        turn = self.turn("current", "marker")
+        self.write([self.metadata(), *turn[:-1]])
         self.assertIsNone(orchestrator.startup_evidence(self.trace, "marker"))
+        self.write([
+            {"type": "response_item", "payload": {"type": "additional_tools", "role": "developer",
+                                                    "tools": [{"name": "mcp__codex_apps__example"}]}},
+            turn[-1],
+        ], mode="a")
+        with self.assertRaisesRegex(orchestrator.StartupRejected, "коннекторов"):
+            self.evaluate("marker")
+
+    def test_clean_exit_before_evidence_is_a_rejected_launch(self):
+        process = Mock()
+        process.poll.return_value = 0
+        with patch.object(orchestrator.role, "rollouts", return_value=set()), \
+                self.assertRaisesRegex(orchestrator.StartupRejected, "запись запуска"):
+            orchestrator.verify_startup(process, "marker", set(), None, 0, None,
+                                        self.settings, self.cwd, None)
 
     def test_foreign_and_noninteractively_launched_sessions_are_rejected(self):
         self.write([self.metadata("exec"), *self.turn("current", "marker")])
