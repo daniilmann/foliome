@@ -1,6 +1,6 @@
 const { randomUUID } = require('node:crypto') as typeof import('node:crypto');
 import type { prepareDomCollector } from './adapters/browser/collect-dom.ts';
-import type { createActionProtocol } from './adapters/store/action-protocol.ts';
+import type { createActionProtocol, LogProtocolEvent } from './adapters/store/action-protocol.ts';
 import type { createTextSnapshotStore } from './adapters/store/text-snapshot-store.ts';
 const { captureCabinetSnapshot } =
   require('./adapters/browser/capture-snapshot.ts') as typeof import('./adapters/browser/capture-snapshot.ts');
@@ -18,7 +18,7 @@ type Browser = Pick<
   | 'loginObservations'
   | 'finishLoginObservation'
 > & {
-  openSource(): Promise<void>;
+  openSource(sessionId: string): Promise<void>;
   closeSource(): Promise<void>;
   capturePng(viewport?: import('./adapters/browser/capture-snapshot.ts').Viewport): Promise<Buffer>;
 };
@@ -81,6 +81,18 @@ function create(ports: Ports, scope: Scope) {
     }
     void closeSource().catch(() => {});
   }
+  function recordLogUnavailable(sessionId: string, code: LogProtocolEvent['code']): boolean {
+    const session = current;
+    if (session?.sessionId !== sessionId) return true;
+    try {
+      ports.protocol.appendLogEvent({ sessionId, code });
+      changed();
+      return true;
+    } catch {
+      revokeForProtocol(session);
+      return false;
+    }
+  }
   function bindBrowserEvents() {
     const session = current;
     return (
@@ -132,7 +144,7 @@ function create(ports: Ports, scope: Scope) {
     try {
       const opening = lifecycle.then(async () => {
         if (current !== session || failed) throw new Error('session-unavailable');
-        await ports.browser.openSource();
+        await ports.browser.openSource(sessionId);
       });
       lifecycle = opening.catch(() => {});
       await opening;
@@ -362,6 +374,8 @@ function create(ports: Ports, scope: Scope) {
     observeSnapshot,
     createHandler,
     rows,
+    logEvents: () => ports.protocol.listLogEvents(),
+    recordLogUnavailable,
     bindBrowserEvents,
   };
 }

@@ -1,3 +1,5 @@
+import type { LogProtocolRow } from '../store/action-protocol.ts';
+
 type ProtocolRow = Readonly<{
   atMs: number;
   sourceId: string;
@@ -57,7 +59,7 @@ function escapeText(value: string | number): string {
   });
 }
 
-function render(rows: readonly ProtocolRow[]): string {
+function render(rows: readonly ProtocolRow[], logEvents: readonly LogProtocolRow[] = []): string {
   const headings = [
     'Время UTC',
     'Источник',
@@ -73,9 +75,11 @@ function render(rows: readonly ProtocolRow[]): string {
     'Итог',
   ];
   const header = headings.map((heading) => `<th scope="col">${heading}</th>`).join('');
+  const cells = (values: (string | number)[]) =>
+    `<tr>${values.map((value) => `<td>${escapeText(value)}</td>`).join('')}</tr>`;
   const body = rows
-    .map((row) => {
-      const values = [
+    .map((row) =>
+      cells([
         new Date(row.atMs).toISOString(),
         row.sourceId,
         row.accessId,
@@ -88,11 +92,28 @@ function render(rows: readonly ProtocolRow[]): string {
         Object.hasOwn(reasons, row.reason) ? reasons[row.reason] : '',
         row.reason,
         row.outcome ?? '',
-      ];
-      return `<tr>${values.map((value) => `<td>${escapeText(value)}</td>`).join('')}</tr>`;
-    })
+      ]),
+    )
     .join('');
-  return `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+  const diagnostics = logEvents
+    .map((event) =>
+      cells([
+        new Date(event.atMs).toISOString(),
+        '',
+        '',
+        'kernel',
+        '',
+        '',
+        '',
+        '',
+        '',
+        'Технический журнал недоступен',
+        event.code,
+        '',
+      ]),
+    )
+    .join('');
+  return `<table><thead><tr>${header}</tr></thead><tbody>${body}${diagnostics}</tbody></table>`;
 }
 
 exports.renderProtocol = render;

@@ -38,6 +38,8 @@ type Verdict = Readonly<{
 }>;
 type Outcome = Readonly<{ verdictId: number; status: 'ok' | 'stale' | 'internal' | 'limit' }>;
 type Clock = () => number;
+export type LogProtocolEvent = Readonly<{ sessionId: string; code: 'log-unavailable' }>;
+export type LogProtocolRow = LogProtocolEvent & Readonly<{ atMs: number }>;
 type SnapshotDeviation = Readonly<{
   sessionId: string;
   sourceId: string;
@@ -159,6 +161,15 @@ function create(database: DatabaseSync, clock: Clock) {
         at_ms INTEGER NOT NULL CHECK (at_ms BETWEEN 0 AND 9007199254740991),
         code TEXT NOT NULL CHECK (code IN ('peerUid', 'format', 'handler'))
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS action_log_events (
+        id INTEGER PRIMARY KEY CHECK (id BETWEEN 1 AND 9007199254740991),
+        at_ms INTEGER NOT NULL CHECK (at_ms BETWEEN 0 AND 9007199254740991),
+        session_id TEXT NOT NULL CHECK (length(session_id) BETWEEN 1 AND 128 AND session_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        code TEXT NOT NULL CHECK (code = 'log-unavailable')
+      ) STRICT;
+      CREATE TRIGGER IF NOT EXISTS action_log_events_no_update BEFORE UPDATE ON action_log_events BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_log_events_no_delete BEFORE DELETE ON action_log_events BEGIN SELECT RAISE(ABORT, 'append only'); END;
+      CREATE TRIGGER IF NOT EXISTS action_log_events_no_replace BEFORE INSERT ON action_log_events WHEN EXISTS (SELECT 1 FROM action_log_events WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS channel_denials_no_update BEFORE UPDATE ON channel_denials BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS channel_denials_no_delete BEFORE DELETE ON channel_denials BEGIN SELECT RAISE(ABORT, 'append only'); END;
       CREATE TRIGGER IF NOT EXISTS channel_denials_no_replace BEFORE INSERT ON channel_denials WHEN EXISTS (SELECT 1 FROM channel_denials WHERE id = NEW.id) BEGIN SELECT RAISE(ABORT, 'append only'); END;
@@ -199,6 +210,12 @@ function create(database: DatabaseSync, clock: Clock) {
   const insertSnapshotDeviation = database.prepare(`INSERT INTO action_snapshot_deviations
     (at_ms, session_id, source_id, access_id, snapshot_number, host, path, code, flags, retakes, elapsed_ms)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const insertLogEvent = database.prepare(
+    'INSERT INTO action_log_events (at_ms, session_id, code) VALUES (?, ?, ?)',
+  );
+  const listLogEvents = database.prepare(
+    'SELECT at_ms AS atMs, session_id AS sessionId, code FROM action_log_events ORDER BY id',
+  );
   function time(): number {
     if (database.isTransaction) throw new Error('active transaction');
     const value = clock();
@@ -212,6 +229,14 @@ function create(database: DatabaseSync, clock: Clock) {
     v.decision, v.reason, o.status AS outcome FROM action_verdicts v
     LEFT JOIN action_outcomes o ON o.verdict_id = v.id ORDER BY v.id`);
   return {
+    appendLogEvent(value: LogProtocolEvent): void {
+      if (!identifier(value.sessionId) || value.code !== 'log-unavailable')
+        throw new Error('invalid log event');
+      insertLogEvent.run(time(), value.sessionId, value.code);
+    },
+    listLogEvents(): readonly LogProtocolRow[] {
+      return listLogEvents.all() as unknown as readonly LogProtocolRow[];
+    },
     appendDenial(code: string): void {
       if (!['peerUid', 'format', 'handler'].includes(code)) throw new Error('invalid denial');
       database.prepare('INSERT INTO channel_denials (at_ms, code) VALUES (?, ?)').run(time(), code);

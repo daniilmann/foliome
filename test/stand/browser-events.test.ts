@@ -1,7 +1,9 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { createConnection } = require('node:net');
 const { DatabaseSync } = require('node:sqlite');
-const { mkdir, rm } = require('node:fs/promises');
+const { mkdir, writeFile } = require('node:fs/promises');
+const { join } = require('node:path');
 const { executorStand, ownerOrigin, waitUntil } = require('./support/executor-start.ts');
 
 const marker = 'synthetic-private-error';
@@ -48,9 +50,13 @@ test(
   { timeout: 60_000 },
   async () => {
     await executorStand({}, async ({ kernel, paths, calls, connect }: any) => {
-      const logPath = paths.database + '.technical.log';
-      await rm(logPath, { force: true });
-      await mkdir(logPath, { mode: 0o700 });
+      await mkdir(paths.data, { mode: 0o700 });
+      await writeFile(join(paths.data, 'logs'), '', { mode: 0o600 });
+      const owner = kernel.ownerPage();
+      await owner.goto(`${ownerOrigin}/`);
+      await owner.getByRole('link', { name: 'Технический журнал', exact: true }).click();
+      await owner.getByLabel('Уровень журнала').selectOption('debug');
+      await owner.getByRole('button', { name: 'Установить уровень' }).click();
       await openAndConfirm(kernel, calls);
       const db = new DatabaseSync(paths.database, { readOnly: true });
       try {
@@ -93,6 +99,23 @@ test(
         }
         assert.ok(!JSON.stringify(rows).includes('synthetic-body-marker'));
         assert.equal(db.prepare('SELECT count(*) AS n FROM action_verdicts').get().n, 0);
+        await waitUntil(
+          async () => (await owner.locator('table').innerText()).includes('log-unavailable'),
+          'technical log failure was not rendered in the protocol',
+        );
+        assert.deepEqual(
+          db
+            .prepare('SELECT session_id, code FROM action_log_events ORDER BY id')
+            .all()
+            .map((row: object) => ({ ...row })),
+          [{ session_id: 'synthetic-session', code: 'log-unavailable' }],
+        );
+        await new Promise<void>((resolve, reject) => {
+          const denied = createConnection(paths.socket, () => denied.write('invalid-json\n'));
+          denied.once('error', reject);
+          denied.once('close', resolve);
+        });
+        assert.equal(db.prepare('SELECT code FROM channel_denials').get().code, 'format');
         const client = await connect();
         await active(client);
       } finally {

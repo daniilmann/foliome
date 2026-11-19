@@ -82,8 +82,6 @@ async function createInstalled(options: Options) {
   await mkdir(path.dirname(options.paths.database), { recursive: true, mode: 0o700 });
   await mkdir(path.dirname(options.paths.socket), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(options.paths.database);
-  const log = createTechnicalLog(options.paths.database + '.technical.log');
-  log('started');
   let ownerBrowser: Chrome | undefined, sourceBrowser: Chrome | undefined;
   let ownerContext: Context | undefined, sourceContext: Context | undefined;
   let owner: Page | undefined,
@@ -99,6 +97,24 @@ async function createInstalled(options: Options) {
   let channelClose: (() => Promise<void>) | undefined;
   let closePromise: Promise<void> | undefined;
   let protocol: ReturnType<typeof createActionProtocol> | undefined;
+  let firstSession = true;
+  let startupLogUnavailable = false;
+  const log = createTechnicalLog({
+    directory: path.join(options.paths.data, 'logs'),
+    now: () => new Date(),
+    onUnavailable(code, sessionId) {
+      if (closed) return;
+      if (firstSession) startupLogUnavailable = true;
+      else runtime?.recordLogUnavailable(sessionId, code);
+    },
+  });
+  function startLogSession(sessionId: string) {
+    // Protocol validation remains authoritative for identifiers from installation configuration.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return;
+    log.beginSession(sessionId);
+    log.write({ level: 'info', code: 'started' });
+  }
+  startLogSession(options.source.sessionId);
   const sockets = new Set<Socket>();
   function stopWorker() {
     const old = worker;
@@ -111,6 +127,12 @@ async function createInstalled(options: Options) {
       }
     }
   }
+  function protocolUnavailable() {
+    running = false;
+    stopWorker();
+    log.write({ level: 'error', code: 'protocol-unavailable' });
+    window?.setStatus('protocol-unavailable');
+  }
   const server = createAdmittedChannel({
     expectedUid: options.executorUid,
     maxLineBytes: 1024 * 1024,
@@ -118,14 +140,12 @@ async function createInstalled(options: Options) {
     onDenied: (code) => {
       try {
         protocol?.appendDenial(code);
-        log('channel-denied');
       } catch {
-        log('protocol-unavailable');
-        running = false;
-        stopWorker();
-        window?.setStatus('protocol-unavailable');
+        protocolUnavailable();
         void runtime?.closeSource().catch(() => {});
+        return;
       }
+      log.write({ level: 'warn', code: 'channel-denied' });
     },
     createHandler: () => runtime!.createHandler(),
   });
@@ -135,6 +155,7 @@ async function createInstalled(options: Options) {
   });
   async function closeSource() {
     generation++;
+    log.endSession();
     running = false;
     stopWorker();
     window?.cancel();
@@ -196,8 +217,18 @@ async function createInstalled(options: Options) {
     protocol = createActionProtocol(db, Date.now);
     const store = createTextSnapshotStore(db, Date.now);
     const browser: Parameters<typeof createPreparationRuntime>[0]['browser'] = {
-      async openSource() {
+      async openSource(sessionId) {
         const token = generation;
+        const startedAt = performance.now();
+        if (firstSession) {
+          firstSession = false;
+          const unavailable = startupLogUnavailable;
+          startupLogUnavailable = false;
+          if (unavailable && !runtime!.recordLogUnavailable(sessionId, 'log-unavailable'))
+            throw new Error('protocol-unavailable');
+        } else {
+          startLogSession(sessionId);
+        }
         const check = () => {
           if (closed || generation !== token) throw new Error('session-unavailable');
         };
@@ -254,21 +285,28 @@ async function createInstalled(options: Options) {
             raw: string,
           ) => {
             if (closed || generation !== token || collector !== localCollector) return;
+            let recorded: boolean;
             try {
               const address = localCollector.eventAddress(raw);
               const verb =
                 (['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as const).find(
                   (value) => value === method,
                 ) ?? 'other';
-              if (record({ kind, method: verb, ...address })) log('browser-event');
+              recorded = record({ kind, method: verb, ...address });
             } catch {
               if (generation === token) {
-                running = false;
-                stopWorker();
-                window?.setStatus('protocol-unavailable');
+                protocolUnavailable();
                 void runtime?.closeSource().catch(() => {});
               }
+              return;
             }
+            if (recorded)
+              log.write({
+                level: 'debug',
+                code: 'browser-event',
+                kind,
+                elapsedMs: Math.floor(performance.now() - startedAt),
+              });
           };
           events.on('framenavigated', ((frame: { url(): string }) => {
             if (frame !== page.mainFrame() || frame.url() === 'about:blank') return;
@@ -316,12 +354,7 @@ async function createInstalled(options: Options) {
         now: Date.now,
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         executorRunning: () => running && !closed,
-        protocolUnavailable: () => {
-          running = false;
-          stopWorker();
-          window?.setStatus('protocol-unavailable');
-          log('protocol-unavailable');
-        },
+        protocolUnavailable,
       },
       options.source,
     );
@@ -343,6 +376,8 @@ async function createInstalled(options: Options) {
       context: ownerContext,
       page: owner,
       rows: runtime.rows,
+      logEvents: runtime.logEvents,
+      onLogLevel: log.setLevel,
       onOpen: () => openSource(false),
       onLoginComplete(sessionId) {
         if (closed || !runtime!.confirmLogin(sessionId)) return false;

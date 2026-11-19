@@ -1,6 +1,11 @@
+import type { LogProtocolRow } from '../store/action-protocol.ts';
+import type { TechnicalLogLevel } from '../technical-log.ts';
+
 const { createOwnerLoginConfirmation } =
   require('./owner-login-confirmation.ts') as typeof import('./owner-login-confirmation.ts');
 const { renderProtocol } = require('./protocol-view.ts') as typeof import('./protocol-view.ts');
+const { technicalLogLevels } =
+  require('../technical-log.ts') as typeof import('../technical-log.ts');
 
 type Row = Parameters<typeof renderProtocol>[0][number];
 type Pending = Readonly<{ sessionId: string; nonce: string }>;
@@ -8,6 +13,7 @@ type Request = {
   url(): string;
   method(): string;
   frame(): object;
+  isNavigationRequest(): boolean;
   allHeaders(): Promise<Record<string, string>>;
   postDataBuffer(): Buffer | null;
 };
@@ -38,6 +44,8 @@ type Options = Readonly<{
   rows: (() => readonly Row[]) & { subscribe?: (listener: () => void) => () => void };
   onLoginComplete: (sessionId: string) => boolean;
   onOpen?: () => Promise<void>;
+  logEvents?: () => readonly LogProtocolRow[];
+  onLogLevel?: (level: TechnicalLogLevel) => void;
 }>;
 
 export declare const attachOwnerWindow: typeof attach;
@@ -46,6 +54,7 @@ declare const exports: { attachOwnerWindow: typeof attach };
 const origin = 'https://foliome-owner.invalid';
 const endpoint = '/preparation/login-complete';
 const openEndpoint = '/preparation/open';
+const logLevelEndpoint = '/diagnostics/log-level';
 const headers = {
   'content-type': 'text/html; charset=utf-8',
   'content-security-policy':
@@ -53,6 +62,15 @@ const headers = {
   'cache-control': 'no-store',
   'x-content-type-options': 'nosniff',
 };
+
+function isOwnerForm(requestHeaders: Record<string, string>): boolean {
+  return (
+    requestHeaders.origin === origin &&
+    /^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?\s*$/i.test(
+      requestHeaders['content-type'] ?? '',
+    )
+  );
+}
 
 function escapeAttribute(value: string): string {
   return value.replace(
@@ -89,7 +107,15 @@ function parseBody(buffer: Buffer | null): Pending | null {
   return sessionId && nonce ? { sessionId, nonce } : null;
 }
 
-async function attach({ context, page, rows, onLoginComplete, onOpen }: Options) {
+async function attach({
+  context,
+  page,
+  rows,
+  onLoginComplete,
+  onOpen,
+  logEvents,
+  onLogLevel,
+}: Options) {
   const frame = page.mainFrame();
   const confirmation = createOwnerLoginConfirmation({
     ownerFrame: frame,
@@ -107,25 +133,38 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
   let engaged = false;
   let opening = false;
   let posting = false;
+  let showingDiagnostics = false;
+  let logLevel: TechnicalLogLevel = 'error';
 
   function render(): string {
-    const table = renderProtocol(rows());
+    const table = renderProtocol(rows(), logEvents?.());
     const form =
       pending === null
         ? onOpen && !engaged && !opening
           ? `<form method="post" action="${openEndpoint}"><button type="submit">Открыть подготовку</button></form>`
           : ''
         : `<form method="post" action="${endpoint}"><input type="hidden" name="sessionId" value="${escapeAttribute(pending.sessionId)}"><input type="hidden" name="nonce" value="${escapeAttribute(pending.nonce)}"><button type="submit">Вход завершён, продолжить</button></form>`;
-    return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}<p>${escapeAttribute(status)}</p></body></html>`;
+    const diagnostics = onLogLevel ? `<a href="${logLevelEndpoint}">Технический журнал</a>` : '';
+    return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}<p>${escapeAttribute(status)}</p>${diagnostics}</body></html>`;
+  }
+
+  function renderDiagnostics(): string {
+    const levels = technicalLogLevels
+      .map(
+        (level) =>
+          `<option value="${level}"${level === logLevel ? ' selected' : ''}>${level}</option>`,
+      )
+      .join('');
+    return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Технический журнал</title></head><body><form method="post" action="${logLevelEndpoint}"><label>Уровень журнала <select name="level">${levels}</select></label><button type="submit">Установить уровень</button></form><a href="/">Вернуться к протоколу</a></body></html>`;
   }
 
   function refresh(): void {
-    if (closed) return;
+    if (closed || showingDiagnostics) return;
     dirty = true;
     if (updating || posting) return;
     updating = true;
     void (async () => {
-      while (dirty && !closed) {
+      while (dirty && !closed && !showingDiagnostics) {
         dirty = false;
         try {
           await page.goto(`${origin}/`);
@@ -190,9 +229,41 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
       const url = request.url();
       if (closed || request.frame() !== frame) throw new Error('refused');
       if (request.method() === 'GET' && url === `${origin}/`) {
+        showingDiagnostics = false;
         const body = render();
         if (closed) throw new Error('refused');
         await route.fulfill({ status: 200, headers, body });
+        return;
+      }
+      if (
+        request.method() === 'GET' &&
+        url === `${origin}${logLevelEndpoint}` &&
+        onLogLevel &&
+        request.isNavigationRequest()
+      ) {
+        showingDiagnostics = true;
+        await route.fulfill({ status: 200, headers, body: renderDiagnostics() });
+        return;
+      }
+      if (
+        request.method() === 'POST' &&
+        url === `${origin}${logLevelEndpoint}` &&
+        onLogLevel &&
+        request.isNavigationRequest()
+      ) {
+        const requestHeaders = await request.allHeaders();
+        if (closed || !isOwnerForm(requestHeaders)) throw new Error('refused');
+        const buffer = request.postDataBuffer();
+        if (!buffer || buffer.length > 'level=debug'.length) throw new Error('refused');
+        const body = buffer.toString('utf8');
+        const selected = technicalLogLevels.find((level) => body === `level=${level}`);
+        if (!selected) throw new Error('refused');
+        posting = true;
+        onLogLevel(selected);
+        logLevel = selected;
+        showingDiagnostics = false;
+        dirty = false;
+        await route.fulfill({ status: 200, headers, body: render() });
         return;
       }
       if (
@@ -203,14 +274,7 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
         !opening
       ) {
         const requestHeaders = await request.allHeaders();
-        if (
-          closed ||
-          requestHeaders.origin !== origin ||
-          !/^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?\s*$/i.test(
-            requestHeaders['content-type'] ?? '',
-          ) ||
-          (request.postDataBuffer()?.length ?? 0) !== 0
-        )
+        if (closed || !isOwnerForm(requestHeaders) || (request.postDataBuffer()?.length ?? 0) !== 0)
           throw new Error('refused');
         opening = true;
         posting = true;
@@ -229,14 +293,7 @@ async function attach({ context, page, rows, onLoginComplete, onOpen }: Options)
       }
       if (request.method() === 'POST' && url === `${origin}${endpoint}`) {
         const requestHeaders = await request.allHeaders();
-        if (
-          closed ||
-          requestHeaders.origin !== origin ||
-          !/^application\/x-www-form-urlencoded(?:\s*;\s*charset\s*=\s*utf-8)?\s*$/i.test(
-            requestHeaders['content-type'] ?? '',
-          )
-        )
-          throw new Error('refused');
+        if (closed || !isOwnerForm(requestHeaders)) throw new Error('refused');
         const body = parseBody(request.postDataBuffer());
         if (
           body === null ||
