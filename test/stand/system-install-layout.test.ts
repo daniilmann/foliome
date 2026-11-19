@@ -33,7 +33,7 @@ function input(root: string) {
   const ownerHome = path.join(root, 'owner');
   const agentHome = path.join(root, 'agent');
   const application = path.join(ownerHome, 'Library/Application Support/Foliome');
-  const system = path.join(root, 'system');
+  const system = path.join(root, 'system root');
   return {
     owner: { uid: 501, home: ownerHome },
     agent: { uid: 778, name: 'synthetic-executor', home: agentHome },
@@ -56,12 +56,14 @@ function input(root: string) {
     release: {
       source: path.join(root, 'release'),
       manifest: path.join(root, 'release/manifest.json'),
+      codex: path.join(root, 'release', 'artifacts', 'codex'),
+      sha: 'a'.repeat(40),
     },
   };
 }
 function makePlan(value: ReturnType<typeof input>) {
   return (
-    require('../../core/system-install-layout.ts') as {
+    require('../../base/system-install-layout.js') as {
       planSystemInstall(value: unknown): { ok: true; plan: Plan } | { ok: false; code: string };
     }
   ).planSystemInstall(value);
@@ -160,7 +162,7 @@ test('SSH использует локальный фиксированный ali
       .find((line: string) => line.includes(f.trusted.keys.launch));
     assert.ok(launchLine);
     if (!launchLine) throw Error('launch key absent');
-    assert.ok(launchLine.includes(`command="${f.trusted.targets.wrapper}"`));
+    assert.ok(launchLine.includes(`command="exec '${f.trusted.targets.wrapper}'"`));
     assert.ok(!launchLine.includes(f.trusted.keys.dev));
     const sshd = file(plan, f.trusted.targets.sshdConfig);
     assert.equal(sshd.uid, 0);
@@ -229,7 +231,10 @@ test('план задаёт один якорь PF, разовую задачу 
     assert.match(wrapper.content, /--disable\s+apps\b/);
     assert.doesNotMatch(wrapper.content, /\$[0-9]|\$\{|\$\(|`|\bsource\b|(^|\s)\.\s/m);
     assert.ok(wrapper.content.includes(f.trusted.targets.client));
-    assert.ok(wrapper.content.includes(f.trusted.targets.socket));
+    const client = file(plan, f.trusted.targets.client);
+    assert.equal(client.uid, 0);
+    assert.ok(client.content.includes(f.trusted.targets.socket));
+    assert.match(client.content, /\/usr\/bin\/nc\s+-U\b/);
     const script = path.join(f.root, 'wrapper');
     await fs.writeFile(script, wrapper.content, { mode: 0o600 });
     await exec('/bin/sh', ['-n', script]);
@@ -250,8 +255,9 @@ test('подпись и манифест проверяются до копир�
     const manifest = plan.steps.findIndex((step) => step.kind === 'verify-manifest');
     const copy = plan.steps.findIndex((step) => step.kind === 'copy');
     assert.ok(signature >= 0 && manifest >= 0 && copy > signature && copy > manifest);
-    assert.ok(plan.steps[signature].args.includes(f.trusted.release.source));
+    assert.ok(plan.steps[signature].args.includes(f.trusted.release.codex));
     assert.ok(plan.steps[manifest].args.includes(f.trusted.release.manifest));
+    assert.ok(plan.steps[manifest].args.includes(f.trusted.release.sha));
     for (const step of plan.steps) {
       assert.ok(!['sudo', 'su', 'launchctl', 'ssh'].includes(path.basename(step.executable)));
       assert.ok(!step.args.includes(f.trusted.agent.home));
@@ -279,6 +285,7 @@ test('ошибочный доверенный ввод отклоняется б
       { ...t, targets: { ...t.targets, sshConfig: path.join(f.root, marker) } },
       { ...t, targets: { ...t.targets, socket: `${t.targets.channel}/../${marker}` } },
       { ...t, targets: { ...t.targets, agentKeys: t.targets.devKeys } },
+      { ...t, release: { ...t.release, sha: marker } },
     ];
     for (const bad of invalid) {
       const result = makePlan(bad);
