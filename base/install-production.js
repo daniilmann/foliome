@@ -8,7 +8,13 @@ const { exclusive } = require('./activation-state.js');
 const { installationJournal, syncDirectory } = require('./install-transaction.js');
 const { planInstalledSystemInstall } = require('./system-install-layout.js');
 const { stageReleaseFromOrigin } = require('./release-pipeline.js');
-const { readProductionWorkflowId } = require('./release-origin.js');
+const {
+  encodeInstallationRelease,
+  initialProofSha256,
+  keySetSha256,
+  readInstallationRelease,
+  releasePolicy,
+} = require('./installation-release.js');
 const { verifiedRuntime } = require('./publisher-verification.js');
 const { materializeForInstaller } = require('./release-materialization.js');
 const {
@@ -19,7 +25,6 @@ const {
   etcAlias,
   executorInstaller,
   fileMode,
-  guidPattern,
   hostFile,
   lintProfiles,
   loadPf,
@@ -50,12 +55,12 @@ const node = path.join(base, 'node');
 const sshDirectory = path.dirname(sshProfile);
 const packages = ['node', 'codex', 'playwrightCore'];
 const directoryFor = (home) => path.join(home, 'Library/Application Support/Foliome');
-const sha256 = /^[a-f0-9]{64}$/;
-const version = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
 const maxArtifact = 256 * 1024 * 1024;
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const trustedNames = [
   'activation-state.js',
+  'first-install.js',
+  'installation-release.js',
   'install-owner.js',
   'install-platform.js',
   'install-production.js',
@@ -74,65 +79,33 @@ const trustedNames = [
 const trustedSource = new Map(trustedNames.map((file) => ['base/' + file, path.join(base, file)]));
 trustedSource.set('base/bootstrap-root.pl', path.join(root, 'bootstrap-root.pl'));
 trustedSource.set('core/domain/release.ts', path.join(base, 'release-policy.ts'));
+trustedSource.set('core/domain/installed-config.ts', path.join(base, 'installed-config.ts'));
 
 async function trustedFile(file, mode) {
   if (!fileMode(await fs.lstat(file), 0, mode, 0)) throw Error('boundary-base');
   await requireAcl(file, []);
 }
 
-async function observe(sha, current, scratch, owner) {
+async function observe(sha, current, scratch, owner, initialInstall) {
   const selectedVersion = current?.sha === sha ? '0.0.0' : (current?.version ?? '0.0.0');
   const evidence = await stageReleaseFromOrigin(
     { commit: sha },
     {
-      mode: 'admin',
+      mode: current ? 'admin' : 'initial',
+      approvedInitialSha: current ? undefined : sha,
       stagingRoot: scratch,
       scratchRoot: scratch,
-      policy: {
-        repository: 'daniilmann/foliome',
-        workflowId: await readProductionWorkflowId(),
-        codexArchiveUrlPrefix: 'https://github.com/openai/codex/releases/download/',
-        installedVersion: selectedVersion,
-        allowedRootFiles: [
-          '.claudeignore',
-          '.env.template',
-          '.gitignore',
-          '.prettierrc.json',
-          'AGENTS.md',
-          'LICENSE',
-          'README.md',
-          'eslint.config.mjs',
-          'package-lock.json',
-          'package.json',
-          'tsconfig.json',
-        ],
-        allowedDirectories: [
-          '.claude',
-          '.github',
-          'agents',
-          'assets',
-          'base',
-          'config-templates',
-          'connectors',
-          'core',
-          'dashboard',
-          'docs',
-          'readers',
-          'release',
-          'scripts',
-          'setup',
-          'sync-engine',
-          'test',
-        ],
-        pinnedCheckBlobs: {
-          '.github/workflows/release.yml': '1c88ee70706f314409be9174f7329c6386747be6',
-          'package.json': '767768b8c435abe772e2dcaf7c6c134a0ea82eb9',
-          'package-lock.json': '0b8fb1cfefde5f46d4fc087ef360148a00d28af3',
-        },
-      },
+      policy: releasePolicy(selectedVersion, current),
     },
   );
   if (!evidence.ok || evidence.sha !== sha) throw Error('release-verification');
+  if (
+    current?.initialSha === sha &&
+    (evidence.checks !== 'pinned' ||
+      evidence.workflow.runId !== current.initialWorkflow.runId ||
+      evidence.workflow.attempt !== current.initialWorkflow.attempt)
+  )
+    throw Error('release-verification');
 
   const prefix = 'Library/Application Support/Foliome/data/install-staging/' + sha + '/';
   const get = (relative, mode, limit) =>
@@ -154,7 +127,7 @@ async function observe(sha, current, scratch, owner) {
   }
   for (const { path: relative, sha256: expected, mode } of evidence.tree) {
     const privateMode = mode === '100755' ? 0o700 : 0o600;
-    const bytes = await get(relative, privateMode, 8 * 1024 * 1024);
+    const bytes = await get(relative, initialInstall ? 0o600 : privateMode, 8 * 1024 * 1024);
     if (hash(bytes) !== expected) throw Error('release-stage');
     const target = path.join(accepted, relative);
     await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
@@ -190,25 +163,17 @@ async function observe(sha, current, scratch, owner) {
 }
 
 async function approvedState() {
-  const entry = await stat(authority);
-  if (!entry) return null;
-  await trustedFile(authority, 0o644);
-  if (entry.size > 131072) throw Error('boundary-state');
-  const current = JSON.parse(await fs.readFile(authority, 'utf8'));
-  if (
-    !shaPattern.test(current.sha) ||
-    !shaPattern.test(current.initialSha) ||
-    !version.test(current.version) ||
-    !Number.isSafeInteger(current.ownerUid) ||
-    !Number.isSafeInteger(current.executorUid) ||
-    (current.executorGuid !== undefined &&
-      (typeof current.executorGuid !== 'string' || !guidPattern.test(current.executorGuid))) ||
-    !sha256.test(current.pfDigest) ||
-    typeof current.pfRules !== 'string' ||
-    current.pfRules.length > 65536
-  )
-    throw Error('boundary-state');
-  return current;
+  if (!(await stat(authority))) return null;
+  return readInstallationRelease();
+}
+
+async function requireInitialApproval(sha) {
+  const target = path.join(root, '.initial-approval');
+  await trustedFile(target, 0o600);
+  if ((await fs.lstat(target)).size !== 106) throw Error('boundary-state');
+  const approved = /^([a-f0-9]{40}) ([a-f0-9]{64})\n$/.exec(await fs.readFile(target, 'utf8'));
+  if (!approved || approved[1] !== sha) throw Error('boundary-state');
+  return approved[2];
 }
 
 async function systemDirectory(tx, { path: target, uid, gid, mode, acl }) {
@@ -380,36 +345,34 @@ async function checkInstalled(plan, host, agent) {
   return checkLiveBoundary(host, agent);
 }
 
-async function apply(sha, scratch, journal, accounts) {
+async function apply(sha, initialInstall, scratch, journal, accounts) {
   const owner = await localOwner();
   const current = await approvedState();
   if (!current && (await stat(path.join(root, 'installation.json')))) throw Error('boundary-state');
   if (current && current.ownerUid !== owner.uid) throw Error('boundary-account');
+  if (
+    (!current && !initialInstall) ||
+    (initialInstall && current && (current.sha !== sha || current.initialSha !== sha))
+  )
+    throw Error('boundary-state');
+  const initialProof = initialInstall ? await requireInitialApproval(sha) : null;
   async function verifiedExecutor(expected) {
     const agent = await localExecutor(owner);
-    if (agent.uid !== expected.uid || (expected.guid !== undefined && agent.guid !== expected.guid))
-      throw Error('boundary-account');
+    if (agent.uid !== expected.uid || agent.guid !== expected.guid) throw Error('boundary-account');
     return agent;
   }
   const existing =
-    current &&
-    (await verifiedExecutor({
-      uid: current.executorUid,
-      guid: current.executorGuid,
-    }));
-  if (existing) {
-    if (current.executorGuid === undefined) {
-      // Older authority files carried only a UID. The root-owned key ACL
-      // still identifies the original account by its directory UUID.
-      const keys = '/private/etc/ssh/authorized_keys/executor';
-      await authorize(keys);
-      if (!fileMode(await stat(keys), 0, 0o600, 0)) throw Error('boundary-account');
-      await requireAcl(keys, ['user:executor allow read']);
-    }
-    await accounts.finish(current, existing);
-  }
+    current && (await verifiedExecutor({ uid: current.executorUid, guid: current.executorGuid }));
+  if (existing) await accounts.finish(current, existing);
 
-  const selected = await observe(sha, current, scratch, owner);
+  const selected = await observe(sha, current, scratch, owner, initialInstall);
+  const keyDigest = keySetSha256(selected.keys);
+  if (
+    (initialProof &&
+      initialProofSha256(sha, keyDigest, selected.stage.workflow) !== initialProof) ||
+    (current && keyDigest !== current.keySetSha256)
+  )
+    throw Error('release-stage');
   const runtime = {};
   for (const name of ['node', 'codex']) {
     const archive = await fs.readFile(
@@ -500,6 +463,9 @@ async function apply(sha, scratch, journal, accounts) {
     const accepted = {
       sha,
       initialSha: current?.initialSha ?? sha,
+      initialWorkflow: current?.initialWorkflow ?? selected.stage.workflow,
+      pinnedCheckBlobs: current?.pinnedCheckBlobs ?? selected.stage.pinnedCheckBlobs,
+      keySetSha256: keyDigest,
       version: selected.manifest.version,
       ownerUid: owner.uid,
       executorUid: agent.uid,
@@ -507,7 +473,11 @@ async function apply(sha, scratch, journal, accounts) {
       pfRules: live.rules,
       pfDigest: hash(pf.content),
     };
-    await systemFile(tx, { path: authority, mode: 0o644, content: JSON.stringify(accepted) });
+    await systemFile(tx, {
+      path: authority,
+      mode: 0o644,
+      content: encodeInstallationRelease(accepted),
+    });
     await tx.commit();
   } finally {
     try {
@@ -520,7 +490,7 @@ async function apply(sha, scratch, journal, accounts) {
   if (!current || current.initialSha === sha) await asUser(owner, 'activate', sha);
 }
 
-async function installApprovedSystem(sha) {
+async function installApprovedSystem(sha, initialInstall) {
   if (
     process.platform !== 'darwin' ||
     process.arch !== 'arm64' ||
@@ -559,7 +529,7 @@ async function installApprovedSystem(sha) {
     }
     const scratch = await fs.mkdtemp(path.join(admin, 'work-'));
     try {
-      await apply(sha, scratch, journal, executorInstaller(admin));
+      await apply(sha, initialInstall, scratch, journal, executorInstaller(admin));
     } finally {
       await fs.rm(scratch, { recursive: true, force: true });
     }

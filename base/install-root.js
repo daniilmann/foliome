@@ -215,7 +215,7 @@ async function installedMain() {
   const base = path.join(system, 'base');
   const entry = path.join(base, 'install-root.js');
   const node = path.join(base, 'node');
-  const [sha] = process.argv.slice(2);
+  const [sha, mode] = process.argv.slice(2);
   if (
     process.platform !== 'darwin' ||
     process.arch !== 'arm64' ||
@@ -223,7 +223,7 @@ async function installedMain() {
     process.geteuid() !== 0 ||
     process.getgid() !== 0 ||
     process.getegid() !== 0 ||
-    process.argv.length !== 3 ||
+    (process.argv.length !== 3 && (process.argv.length !== 4 || mode !== '--initial')) ||
     !/^[a-f0-9]{40}$/.test(sha) ||
     Object.keys(process.env).length !== 0 ||
     process.execArgv.join(' ') !== '--disable-sigusr1' ||
@@ -254,6 +254,9 @@ async function installedMain() {
   for (const dir of [system, base]) await trusted(dir, 0o755, true);
   for (const name of [
     'activation-state.js',
+    'first-install.js',
+    'installation-release.js',
+    'installed-config.ts',
     'install-owner.js',
     'install-platform.js',
     'install-production.js',
@@ -272,7 +275,7 @@ async function installedMain() {
     await trusted(path.join(base, name), 0o644, false);
   for (const file of [node, path.join(base, 'launch')]) await trusted(file, 0o755, false);
   await trusted(path.join(system, 'bootstrap-root.pl'), 0o644, false);
-  await require('./install-production.js').installApprovedSystem(sha);
+  await require('./install-production.js').installApprovedSystem(sha, mode === '--initial');
 }
 
 if (require.main === module) {

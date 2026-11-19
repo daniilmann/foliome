@@ -2,7 +2,72 @@
 
 This fork develops a trusted local application for controlled reading of a source in Chrome. Its kernel mediates preparation sessions, filters page snapshots, controls permitted reads, and records decisions. An owner interface and an isolated executor channel are included. The current implementation is an early local candidate, not a complete financial synchronization product.
 
-The repository includes installation and update components and synthetic tests. A complete verified installer and update path, a separate authorized macOS installation, and a real remote Codex login have not yet been demonstrated. Bank integrations, scheduled collection, transaction accounting, and the legacy dashboard are not part of the trusted application. The retained legacy source is not the trusted execution path; its standalone dashboard dependency manifests are not included.
+The first-install command below prepares the local application, the system boundary, and a Codex sign-in for the local executor. An authorized end-to-end installation and sign-in on a separate Mac still require verification. Bank integrations, scheduled collection, transaction accounting, and the legacy dashboard are not part of the trusted application. The retained legacy source is not the trusted execution path; its standalone dashboard dependency manifests are not included.
+
+## First install on macOS
+
+Run this from the owner's administrator account in the Mac's local Terminal on Apple silicon. Use the reviewed command and the full 40-character Git commit SHA independently supplied by the release operator for the approved first release. Use that exact SHA on every retry. The release must have its version tag on that SHA and a successful release workflow for the tag. Stock Git must be available, Google Chrome must be installed, and the ChatGPT account or workspace must allow [Codex device-code sign-in](https://learn.chatgpt.com/docs/auth?surface=cli#login-on-headless-devices).
+
+Prepare `~/foliome-first-install.json` in the owner's private home with mode `0600`. Replace all illustrative values with the approved public key for the local `dev` account and the source settings supplied for this installation. An HTTPS synthetic fixture can supply the source. Keep passwords, tokens, and private SSH keys out of this file. The installed boundary supplies the executor UID.
+
+```json
+{
+  "developerPublicKey": "ssh-ed25519 APPROVED_DEVELOPER_PUBLIC_KEY",
+  "source": {
+    "url": "https://fixture.example.invalid/start",
+    "sessionId": "fixture-session",
+    "sourceId": "fixture-source",
+    "accessId": "fixture-access",
+    "instruction": "Read the synthetic fixture."
+  }
+}
+```
+
+Replace `APPROVED_INITIAL_SHA` in the command below. Enter the administrator password at the Terminal prompt. Then open the official device sign-in link shown by Codex and complete sign-in in the browser. The command opens Foliome when sign-in succeeds.
+
+```sh
+/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C HOME=/dev/null \
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+  GIT_ALLOW_PROTOCOL=https /bin/sh -se -- 'APPROVED_INITIAL_SHA' "$HOME/foliome-first-install.json" <<'FOLIOME'
+sha=$1
+input=$2
+case "$sha" in *[!0-9a-f]*|'') echo 'Use the approved 40-character SHA.' >&2; exit 1 ;; esac
+[ "${#sha}" -eq 40 ] || { echo 'Use the approved 40-character SHA.' >&2; exit 1; }
+umask 077
+cd /
+work=$(/usr/bin/mktemp -d /private/tmp/foliome-first.XXXXXXXX)
+trap '/bin/rm -rf -- "$work"' 0
+trap 'exit 1' HUP INT TERM
+git_object_store() {
+  /usr/bin/git --no-optional-locks --no-replace-objects -C "$work" \
+    -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.https.allow=always \
+    -c credential.helper= -c http.followRedirects=false -c http.sslVerify=true -c http.proxy= \
+    -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=15 -c fetch.fsckObjects=true "$@"
+}
+git_object_store init --quiet --bare --template= --object-format=sha1
+git_object_store fetch --quiet --no-tags --depth=1 --no-recurse-submodules \
+  --no-auto-maintenance --no-write-fetch-head -- https://github.com/daniilmann/foliome.git "$sha"
+git_object_store cat-file commit "$sha" > "$work/commit"
+[ "$(git_object_store hash-object -t commit --stdin < "$work/commit")" = "$sha" ]
+git_object_store fsck --strict --no-reflogs --no-dangling "$sha"
+git_object_store ls-tree --full-tree -r -z "$sha" -- base/bootstrap-root.pl > "$work/entry"
+blob=$(/usr/bin/perl -0777 -ne 'if (/\A100644 blob ([a-f0-9]{40})\tbase\/bootstrap-root\.pl\0\z/) { print $1 } else { exit 1 }' "$work/entry")
+[ "${#blob}" -eq 40 ]
+git_object_store cat-file blob "$blob" > "$work/bootstrap-root.pl"
+[ "$(git_object_store hash-object -t blob --stdin < "$work/bootstrap-root.pl")" = "$blob" ]
+/usr/bin/env -i /usr/bin/perl "$work/bootstrap-root.pl" --owner "$sha" "$input" "$work"
+FOLIOME
+```
+
+The installer checks the approved Git objects before loading the installer and obtains a signed Node binary without npm. It prepares the owner stage, installs the exact approved dispatcher through one administrator authorization, and independently checks the release again under root. The first release's workflow and CI file hashes are recorded under root ownership.
+
+If inputs or verification fail, check the approved SHA, the private file's format and permissions, and the release status. For a cancelled password prompt, interruption, or failed sign-in, rerun the same command with the same SHA and keys. If an installed dispatcher or existing keys differ, stop and report the error code to the release operator. A valid existing source configuration is preserved. If device sign-in is blocked, have the account or workspace enable it before retrying.
+
+Launch Foliome again from Terminal with the installed owner launcher.
+
+```sh
+"/Library/Application Support/Foliome/base/launch"
+```
 
 Development uses Node.js 26.13.1 and the locked dependencies: `npm ci --ignore-scripts`, followed by `npm run typecheck`, `npm run lint`, `npm run format:check`, `npm test`, `npm run test:stand`, and `npm run test:attacks`. The stand uses system Google Chrome and synthetic pages on macOS.
 

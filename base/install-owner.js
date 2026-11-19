@@ -12,6 +12,7 @@ const { DatabaseSync } = require('node:sqlite');
 const { exclusive, marker } = require('./activation-state.js');
 const { verifyInventory } = require('./launcher.js');
 const { installationJournal, stat, syncDirectory } = require('./install-transaction.js');
+const { readInstallationRelease } = require('./installation-release.js');
 
 const root = '/Library/Application Support/Foliome';
 const shaPattern = /^[a-f0-9]{40}$/;
@@ -197,18 +198,7 @@ async function requireInitialAuthority(sha) {
     }).trim() !== '0'
   )
     throw Error('owner-authority');
-  const authority = path.join(root, 'installation-release.json');
-  const s = await fs.lstat(authority);
-  if (
-    !s.isFile() ||
-    s.uid !== 0 ||
-    s.gid !== 0 ||
-    s.nlink !== 1 ||
-    (s.mode & 0o7777) !== 0o644 ||
-    s.size > 131072
-  )
-    throw Error('owner-authority');
-  const approved = JSON.parse(await fs.readFile(authority, 'utf8'));
+  const approved = await readInstallationRelease();
   if (approved.sha !== sha || approved.initialSha !== sha || approved.ownerUid !== uid)
     throw Error('owner-authority');
 }

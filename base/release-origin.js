@@ -6,6 +6,9 @@
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const shaPattern = /^[a-f0-9]{40}$/;
 const repositoryPattern = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+const productionRepository = 'daniilmann/foliome';
+const workflowFile = 'release.yml';
+const workflowPath = '.github/workflows/' + workflowFile;
 const requiredJobs = [
   'typescript',
   'eslint',
@@ -110,12 +113,13 @@ function completeList(value, field) {
 
 async function readReleaseOrigin(input) {
   try {
-    const { policy, version, sha, now, verifyBase } = input;
+    const { policy, version, sha, now, verifyBase, initial = false } = input;
     if (
       !policy ||
       !isReleaseRepository(policy.repository) ||
-      !Number.isSafeInteger(policy.workflowId) ||
-      policy.workflowId < 1 ||
+      (initial
+        ? policy.repository !== productionRepository || policy.workflowId !== undefined
+        : !Number.isSafeInteger(policy.workflowId) || policy.workflowId < 1) ||
       !versionPattern.test(version) ||
       !shaPattern.test(sha) ||
       typeof verifyBase !== 'function'
@@ -155,10 +159,11 @@ async function readReleaseOrigin(input) {
     const codexUrl = `https://github.com/openai/codex/releases/download/rust-v${codexVersion}/codex-aarch64-apple-darwin.tar.gz`;
     if (manifest.codex.url !== codexUrl) throw Error();
     canonicalUrl(codexUrl, 'github.com');
+    const workflow = initial ? workflowFile : policy.workflowId;
     const runs = completeList(
       await json(
         transport,
-        `${api}/actions/workflows/${policy.workflowId}/runs?event=push&head_sha=${sha}&per_page=100&page=1`,
+        `${api}/actions/workflows/${workflow}/runs?event=push&head_sha=${sha}&per_page=100&page=1`,
       ),
       'workflow_runs',
     );
@@ -170,7 +175,13 @@ async function readReleaseOrigin(input) {
       run.id < 1 ||
       !Number.isSafeInteger(run.run_attempt) ||
       run.run_attempt < 1 ||
-      run.workflow_id !== policy.workflowId ||
+      !Number.isSafeInteger(run.workflow_id) ||
+      run.workflow_id < 1 ||
+      (!initial && run.workflow_id !== policy.workflowId) ||
+      (policy.repository === productionRepository &&
+        run.path !== workflowPath &&
+        run.path !== `${workflowPath}@refs/tags/${tag}` &&
+        run.path !== `${workflowPath}@${tag}`) ||
       run.event !== 'push' ||
       run.status !== 'completed' ||
       run.conclusion !== 'success' ||
@@ -264,20 +275,6 @@ async function readReleaseArchive(url, limit) {
   return response.body;
 }
 
-async function readProductionWorkflowId() {
-  const workflow = await json(
-    fetchBounded,
-    'https://api.github.com/repos/daniilmann/foliome/actions/workflows/release.yml',
-  );
-  if (
-    workflow?.path !== '.github/workflows/release.yml' ||
-    !Number.isSafeInteger(workflow.id) ||
-    workflow.id <= 0
-  )
-    throw Error('workflow');
-  return workflow.id;
-}
-
 function playwrightArchiveUrl(version) {
   if (typeof version !== 'string' || !/^1\.64\.(0|[1-9]\d*)$/.test(version)) throw Error();
   return `https://registry.npmjs.org/playwright-core/-/playwright-core-${version}.tgz`;
@@ -299,7 +296,7 @@ async function readReleaseArchives(nodeVersion, playwrightVersion, observedTarba
 module.exports = {
   readReleaseOrigin,
   readReleaseArchives,
-  readProductionWorkflowId,
+  productionRepository,
   isReleaseRepository,
   playwrightArchiveUrl,
 };

@@ -15,7 +15,7 @@ const {
   createProductionPublisherVerifier,
   registryReleaseSignature,
 } = require('./publisher-verification.js');
-const { validateReleaseCandidate } = require(
+const { isReleaseCheckPath, validateReleaseCandidate } = require(
   __dirname === '/Library/Application Support/Foliome/base'
     ? './release-policy.ts'
     : '../core/domain/release.ts',
@@ -207,6 +207,8 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
   let checks;
   let version;
   let archive;
+  let workflow;
+  let pinnedCheckBlobs;
   const result = await observeRelease(input, async (tree) => {
     const entries = new Map(tree.map((entry) => [entry.path, entry]));
     const manifestBytes = entries.get('release/manifest.json').bytes;
@@ -233,6 +235,7 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
       sha: input.commit,
       now: input.now,
       transport: input.transport,
+      initial: input.initial,
       verifyBase: (observed) => {
         if (!observed.manifestBytes.equals(manifestBytes)) return false;
         observations = observed;
@@ -240,6 +243,21 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
       },
     });
     if (!origin.ok) throw Error();
+    workflow = {
+      id: observations.run.workflow_id,
+      runId: observations.run.id,
+      attempt: observations.run.run_attempt,
+    };
+    const policy = { ...input.policy };
+    if (input.initial) {
+      pinnedCheckBlobs = Object.fromEntries(
+        tree
+          .filter(({ path }) => isReleaseCheckPath(path))
+          .map(({ path, blobSha }) => [path, blobSha]),
+      );
+      policy.workflowId = workflow.id;
+      policy.pinnedCheckBlobs = pinnedCheckBlobs;
+    }
     const runtimeDependencies = packageEvidence(entries, committed, observations.registry);
     const { artifacts, verifyPublisher } = await provideArtifacts(observations);
     if (
@@ -265,7 +283,7 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
               signatures,
             },
           },
-          input.policy,
+          policy,
         );
         if (!decision.ok) return false;
         await beforeStage();
@@ -276,7 +294,7 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
     };
   });
   if (!result.ok) return refused();
-  return { ...result, sha: input.commit, version, checks, archive };
+  return { ...result, sha: input.commit, version, checks, archive, workflow, pinnedCheckBlobs };
 }
 
 // Local test port. The repository and issuer ports are supplied by the fixture.
@@ -400,7 +418,13 @@ async function stageReleaseFromOrigin(selection, installed) {
     )
       return refused();
     if (mode === 'initial') {
-      if (version !== undefined) return refused();
+      if (
+        version !== undefined ||
+        installed.approvedInitialSha !== commit ||
+        policy.workflowId !== undefined ||
+        policy.pinnedCheckBlobs !== undefined
+      )
+        return refused();
       policy.installedVersion = '0.0.0';
     } else if (
       mode === 'update' &&
@@ -418,7 +442,15 @@ async function stageReleaseFromOrigin(selection, installed) {
     const repository = path.join(scratch, 'git');
     await fetchReleaseCommit(repository, policy.repository, commit);
     return await compose(
-      { repository, commit, stagingRoot, policy, version, now: new Date().toISOString() },
+      {
+        repository,
+        commit,
+        stagingRoot,
+        policy,
+        version,
+        initial: mode === 'initial',
+        now: new Date().toISOString(),
+      },
       (tree, manifest) => mode !== 'update' || matchingBoundary(tree, manifest, boundary),
       (observed) => publisherArtifacts(observed, scratch),
       removeScratch,

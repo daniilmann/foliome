@@ -15,6 +15,8 @@ const { constants } = require('node:fs') as typeof import('node:fs');
 const path = require('node:path') as typeof import('node:path');
 const os = require('node:os') as typeof import('node:os');
 const { pathToFileURL } = require('node:url') as typeof import('node:url');
+const { parseInstalledConfig } =
+  require('./domain/installed-config.ts') as typeof import('./domain/installed-config.ts');
 const shaPattern = /^[a-f0-9]{40}$/;
 const maxDatabase = 1024 * 1024 * 1024;
 
@@ -43,14 +45,6 @@ function cleanEnvironment(env: NodeJS.ProcessEnv): boolean {
     ['HOME', 'PATH', 'TMPDIR', '__CF_USER_TEXT_ENCODING'].includes(key),
   );
 }
-function exact(value: unknown, keys: string[]): value is Record<string, unknown> {
-  return (
-    !!value &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    Object.keys(value).sort().join(',') === [...keys].sort().join(',')
-  );
-}
 async function readConfig(
   file: string,
 ): Promise<{ source: KernelOptions['source']; executorUid: number }> {
@@ -73,29 +67,7 @@ async function readConfig(
       length += bytesRead;
     }
     if (length > 65536) throw Error();
-    const value: unknown = JSON.parse(bytes.subarray(0, length).toString('utf8'));
-    if (
-      !exact(value, ['source', 'executorUid']) ||
-      !Number.isSafeInteger(value.executorUid) ||
-      (value.executorUid as number) <= 0 ||
-      !exact(value.source, ['url', 'sessionId', 'sourceId', 'accessId', 'instruction'])
-    )
-      throw Error();
-    const source = value.source;
-    if (
-      Object.values(source).some(
-        (v) =>
-          typeof v !== 'string' ||
-          v.length === 0 ||
-          v.length > 4096 ||
-          /[\u0000-\u001f\u007f]/.test(v),
-      )
-    )
-      throw Error();
-    const url = new URL(source.url as string);
-    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.hash)
-      throw Error();
-    return { source: source as KernelOptions['source'], executorUid: value.executorUid as number };
+    return parseInstalledConfig(JSON.parse(bytes.subarray(0, length).toString('utf8')));
   } finally {
     await handle.close();
   }

@@ -59,7 +59,16 @@ export declare function validateReleaseCandidate(
 ): ReleaseCandidateResult;
 
 // The package loads .ts files as CommonJS and Node strips the type declaration above.
-declare const exports: { validateReleaseCandidate: typeof validateReleaseCandidate };
+export declare const isReleaseCheckPath: typeof isCheckPath;
+export declare const readReleaseCheckPins: typeof checkPins;
+
+declare const exports: {
+  validateReleaseCandidate: typeof validateReleaseCandidate;
+  isReleaseCheckPath: typeof isCheckPath;
+  readReleaseCheckPins: typeof checkPins;
+};
+exports.isReleaseCheckPath = isCheckPath;
+exports.readReleaseCheckPins = checkPins;
 exports.validateReleaseCandidate = function validateReleaseCandidate(candidate, trustedPolicy) {
   const policy = readPolicy(trustedPolicy);
   if (!policy) return { ok: false, code: 'policy' };
@@ -161,21 +170,12 @@ function readPolicy(value: unknown): ReleasePolicy | undefined {
   const rootNames = new Set<string>();
   const allowedRootFiles = readRootNames(policy.allowedRootFiles, rootNames);
   const allowedDirectories = readRootNames(policy.allowedDirectories, rootNames);
-  const pins = readRecord(policy.pinnedCheckBlobs);
+  const pins = checkPins(
+    policy.pinnedCheckBlobs,
+    policy.allowedRootFiles,
+    policy.allowedDirectories,
+  );
   if (!allowedRootFiles || !allowedDirectories || !pins) return;
-
-  const seenPaths = new Map<string, TreePath>();
-  const pinnedCheckBlobs = new Map<string, string>();
-  for (const [path, sha] of Object.entries(pins)) {
-    if (
-      !matches(sha, gitShaPattern) ||
-      !registerPath(path, allowedRootFiles, allowedDirectories, seenPaths)
-    ) {
-      return;
-    }
-    pinnedCheckBlobs.set(path, sha);
-  }
-  if (!requiredCheckPaths.every((path) => pinnedCheckBlobs.has(path))) return;
 
   return {
     installedVersion,
@@ -184,7 +184,7 @@ function readPolicy(value: unknown): ReleasePolicy | undefined {
     codexArchiveUrlPrefix,
     allowedRootFiles,
     allowedDirectories,
-    pinnedCheckBlobs,
+    pinnedCheckBlobs: new Map(Object.entries(pins)),
   };
 }
 
@@ -376,6 +376,30 @@ function isCheckPath(path: string): boolean {
     /^tsconfig[^/]*\.json$/.test(name) ||
     ['eslint.config.', 'prettier.config.', '.prettierrc'].some((prefix) => name.startsWith(prefix))
   );
+}
+
+function checkPins(
+  value: unknown,
+  rootFiles: unknown,
+  directories: unknown,
+): Record<string, string> | undefined {
+  const rootNames = new Set<string>();
+  const roots = readRootNames(rootFiles, rootNames);
+  const dirs = readRootNames(directories, rootNames);
+  const pins = readRecord(value);
+  if (!roots || !dirs || !pins) return;
+  const paths = new Map<string, TreePath>();
+  const result: Record<string, string> = Object.create(null);
+  for (const [path, sha] of Object.entries(pins)) {
+    if (
+      !isCheckPath(path) ||
+      !matches(sha, gitShaPattern) ||
+      !registerPath(path, roots, dirs, paths)
+    )
+      return;
+    result[path] = sha;
+  }
+  if (requiredCheckPaths.every((path) => Object.hasOwn(result, path))) return result;
 }
 
 function isArchivePrefix(value: unknown): value is string {
