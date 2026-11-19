@@ -288,7 +288,7 @@ function create(database: DatabaseSync, clock: Clock) {
         value.reason,
       );
       const id = Number(result.lastInsertRowid);
-      if (!integer(id, 1)) throw new Error('invalid verdict id');
+      if (result.changes !== 1 || !integer(id, 1)) throw new Error('verdict append failed');
       return id;
     },
     appendOutcome(value: Outcome): void {

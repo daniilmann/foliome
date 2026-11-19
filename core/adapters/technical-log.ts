@@ -8,7 +8,7 @@ const levels = Object.freeze(['error', 'warn', 'info', 'debug'] as const);
 export type TechnicalLogLevel = (typeof levels)[number];
 type BrowserKind = 'main-frame-navigation' | 'non-get-request';
 type Event =
-  | Readonly<{ level: 'error'; code: 'protocol-unavailable' }>
+  | Readonly<{ level: 'error'; code: 'protocol-unavailable' | 'action-denial-limit' }>
   | Readonly<{ level: 'warn'; code: 'channel-denied' }>
   | Readonly<{ level: 'info'; code: 'started' }>
   | Readonly<{
@@ -75,7 +75,8 @@ function checked(value: Event): Event {
     )
       return invalid();
   }
-  if (level === 'error' && code === 'protocol-unavailable') return { level, code };
+  if (level === 'error' && (code === 'protocol-unavailable' || code === 'action-denial-limit'))
+    return { level, code };
   if (level === 'warn' && code === 'channel-denied') return { level, code };
   if (level === 'info' && code === 'started') return { level, code };
   if (browser) {

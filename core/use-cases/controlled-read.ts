@@ -1,5 +1,5 @@
-import type { ActionCandidate, ActionVerdict } from '../domain/action-verdict.ts';
-const { decideActionVerdict } =
+import type { ActionCandidate, ActionVerdict, DenialBudget } from '../domain/action-verdict.ts';
+const { decideReadPolicy } =
   require('../domain/action-verdict.ts') as typeof import('../domain/action-verdict.ts');
 
 type Session = Readonly<{
@@ -45,7 +45,9 @@ type Ports = {
   };
   captureSnapshot(snapshot: number): Promise<SnapshotResult>;
   persistSnapshot(result: Extract<SnapshotResult, { ok: true }>): Promise<unknown>;
-  onProtocolUnavailable(sessionId: string): void;
+  onProtocolUnavailable(sessionId: string): void | Promise<void>;
+  denialBudget?: { record(sessionId: string, kind: DenialBudget): boolean };
+  revokeSession?(sessionId: string): void | Promise<void>;
   protocol: {
     appendVerdict(value: {
       sessionId: string;
@@ -59,6 +61,7 @@ type Ports = {
       reason:
         | Exclude<Extract<ActionVerdict, { ok: false }>['code'], 'session-unavailable'>
         | 'allowed'
+        | 'limit'
         | 'internal';
     }): number | Promise<number>;
     appendOutcome(value: {
@@ -111,10 +114,10 @@ function create(ports: Ports) {
         return { ok: false as const, code: 'session-unavailable' as const };
       const snapshotNumber = session.snapshotNumber;
       const requestedNode = own(command, 'nodeNumber');
-      let verdict: ActionVerdict =
+      let verdict: ReturnType<typeof decideReadPolicy> =
         beforeSnapshot.snapshotNumber !== snapshotNumber
           ? { ok: false, code: 'stale' }
-          : decideActionVerdict(command, {
+          : decideReadPolicy(command, {
               sessionActive: true,
               loginStep: session.loginStep,
               snapshotNumber,
@@ -123,17 +126,21 @@ function create(ports: Ports) {
                 sameNode: true,
               })),
             });
-      if (verdict.ok) {
-        const { nodeNumber } = verdict;
+      // A budgeted denial must still identify the same control in the live observation.
+      if (verdict.ok || 'budget' in verdict) {
+        const prior = verdict;
         const previous = beforeSnapshot.candidates.filter(
-          (candidate) => candidate.nodeNumber === nodeNumber,
+          (candidate) => candidate.nodeNumber === requestedNode,
         );
         const observed = await ports.collectTarget(snapshotNumber);
         if (!active()) return { ok: false as const, code: 'session-revoked' as const };
         verdict =
-          ports.getSession()?.snapshotNumber !== snapshotNumber
+          ports.getSession()?.snapshotNumber !== snapshotNumber ||
+          (observed.sessionId !== undefined && observed.sessionId !== session.sessionId) ||
+          (observed.sourceId !== undefined && observed.sourceId !== session.sourceId) ||
+          (observed.accessId !== undefined && observed.accessId !== session.accessId)
             ? { ok: false, code: 'stale' }
-            : decideActionVerdict(command, {
+            : decideReadPolicy(command, {
                 sessionActive: true,
                 loginStep: session.loginStep,
                 snapshotNumber: observed.snapshotNumber,
@@ -141,13 +148,25 @@ function create(ports: Ports) {
                   ...candidate,
                   sameNode:
                     previous.length === 1 &&
+                    typeof previous[0].identity === 'string' &&
+                    typeof previous[0].descriptor === 'string' &&
                     previous[0].identity === candidate.identity &&
                     previous[0].descriptor === candidate.descriptor,
                 })),
               });
+        if (
+          'budget' in verdict &&
+          (!('budget' in prior) || verdict.code !== prior.code || verdict.budget !== prior.budget)
+        )
+          verdict = { ok: false, code: 'stale' };
+        if ('budget' in prior && verdict.ok) verdict = { ok: false, code: 'stale' };
       }
-      const unavailable = () => {
-        if (active()) ports.onProtocolUnavailable(session.sessionId);
+      const unavailable = async () => {
+        try {
+          if (active()) await ports.onProtocolUnavailable(session.sessionId);
+        } catch {
+          // The revocation port withdraws the session before releasing resources.
+        }
         return { ok: false as const, code: 'protocol-unavailable' as const };
       };
       const protocolFailure = (value: unknown) =>
@@ -159,28 +178,47 @@ function create(ports: Ports) {
         : verdict.code === 'session-unavailable'
           ? 'internal'
           : verdict.code;
+      const entry = {
+        sessionId: session.sessionId,
+        sourceId: session.sourceId,
+        accessId: session.accessId,
+        snapshotNumber,
+        nodeNumber: positive(requestedNode) ? requestedNode : null,
+        method: own(command, 'method') === 'readText' ? ('readText' as const) : ('other' as const),
+        actionClass:
+          own(command, 'actionClass') === 'read' ? ('read' as const) : ('unknown' as const),
+      };
+      async function appendVerdict(
+        decision: 'allowed' | 'blocked',
+        reason: Parameters<Ports['protocol']['appendVerdict']>[0]['reason'],
+      ) {
+        const pending = ports.protocol.appendVerdict({ ...entry, decision, reason });
+        if (protocolFailure(pending)) throw new Error('protocol-unavailable');
+        const id = await pending;
+        if (!positive(id)) throw new Error('protocol-unavailable');
+        return id;
+      }
       let verdictId: number;
       try {
-        const pending = ports.protocol.appendVerdict({
-          sessionId: session.sessionId,
-          sourceId: session.sourceId,
-          accessId: session.accessId,
-          snapshotNumber,
-          nodeNumber: positive(requestedNode) ? requestedNode : null,
-          method: own(command, 'method') === 'readText' ? 'readText' : 'other',
-          actionClass: own(command, 'actionClass') === 'read' ? 'read' : 'unknown',
-          decision: verdict.ok ? 'allowed' : 'blocked',
-          reason,
-        });
-        if (protocolFailure(pending)) return unavailable();
-        const value = await pending;
-        if (protocolFailure(value)) return unavailable();
-        if (!positive(value)) return unavailable();
-        verdictId = value;
+        verdictId = await appendVerdict(verdict.ok ? 'allowed' : 'blocked', reason);
       } catch {
-        return unavailable();
+        return await unavailable();
       }
       if (!active()) return { ok: false as const, code: 'session-revoked' as const };
+      if ('budget' in verdict) {
+        if (ports.getSession()?.snapshotNumber !== snapshotNumber)
+          return { ok: false as const, code: 'stale' as const };
+        if (!ports.denialBudget || !ports.revokeSession) return await unavailable();
+        try {
+          if (ports.denialBudget.record(session.sessionId, verdict.budget)) {
+            await appendVerdict('blocked', 'limit');
+            await ports.revokeSession(session.sessionId);
+            return { ok: false as const, code: verdict.code };
+          }
+        } catch {
+          return await unavailable();
+        }
+      }
       let text: string | undefined;
       if (verdict.ok) {
         let status: 'ok' | 'stale' | 'internal' = 'internal';
@@ -213,11 +251,11 @@ function create(ports: Ports) {
         if (!active()) return { ok: false as const, code: 'session-revoked' as const };
         try {
           const pending = ports.protocol.appendOutcome({ verdictId, status });
-          if (protocolFailure(pending)) return unavailable();
+          if (protocolFailure(pending)) return await unavailable();
           const value = await pending;
-          if (protocolFailure(value)) return unavailable();
+          if (protocolFailure(value)) return await unavailable();
         } catch {
-          return unavailable();
+          return await unavailable();
         }
         if (!active()) return { ok: false as const, code: 'session-revoked' as const };
         if (status !== 'ok' || text === undefined)
@@ -228,26 +266,26 @@ function create(ports: Ports) {
       let snapshot: SnapshotResult;
       try {
         const pending = ports.captureSnapshot(snapshotNumber + 1);
-        if (protocolFailure(pending)) return unavailable();
+        if (protocolFailure(pending)) return await unavailable();
         snapshot = await pending;
       } catch (error) {
-        if (protocolFailure(error)) return unavailable();
+        if (protocolFailure(error)) return await unavailable();
         return { ok: false as const, code: 'internal' as const };
       }
       if (!active()) return { ok: false as const, code: 'session-revoked' as const };
       if (!snapshot.ok) {
-        if (snapshot.code === 'protocol-unavailable') return unavailable();
+        if (snapshot.code === 'protocol-unavailable') return await unavailable();
         return { ok: false as const, code: snapshot.code };
       }
       if (snapshot.snapshot.snapshot !== snapshotNumber + 1)
         return { ok: false as const, code: 'internal' as const };
       try {
         const persisted = ports.persistSnapshot(snapshot);
-        if (protocolFailure(persisted)) return unavailable();
+        if (protocolFailure(persisted)) return await unavailable();
         const persistedResult = await persisted;
-        if (protocolFailure(persistedResult)) return unavailable();
+        if (protocolFailure(persistedResult)) return await unavailable();
       } catch (error) {
-        if (protocolFailure(error)) return unavailable();
+        if (protocolFailure(error)) return await unavailable();
         return { ok: false as const, code: 'internal' as const };
       }
       if (!active()) return { ok: false as const, code: 'session-revoked' as const };

@@ -1,3 +1,20 @@
+type Prohibited = 'blocked-payment' | 'blocked-change';
+export type DenialBudget = 'hard' | 'label';
+export type ActionFacts = Readonly<{
+  label: string;
+  inputKind: string;
+  autocomplete: string;
+  currentPath: string;
+  href: string;
+  formAction: string;
+  confirmationForm: boolean;
+  formFieldKinds: readonly string[];
+  tag?: string;
+  controlType?: string;
+  role?: string;
+  alternateLabels?: readonly string[];
+}>;
+
 export type ActionCandidate = Readonly<{
   nodeNumber: number;
   sameNode: boolean;
@@ -5,7 +22,8 @@ export type ActionCandidate = Readonly<{
   enabled: boolean;
   sourceFrame: boolean;
   secretField: boolean;
-  prohibited: 'blocked-payment' | 'blocked-change' | null;
+  prohibited: Prohibited | null;
+  facts?: ActionFacts;
 }>;
 
 /** Facts are supplied by the kernel, not by the command sender. */
@@ -36,7 +54,141 @@ export type ActionVerdict =
     };
 
 export declare const decideActionVerdict: typeof decide;
-declare const exports: { decideActionVerdict: typeof decide };
+export declare const decideReadPolicy: typeof decideWithBudget;
+export declare const classifyProhibitedFacts: typeof classify;
+declare const exports: {
+  decideActionVerdict: typeof decide;
+  decideReadPolicy: typeof decideWithBudget;
+  classifyProhibitedFacts: typeof classify;
+};
+
+type Classification = { prohibited: Prohibited | null; budget: DenialBudget | null };
+type ReadPolicy = ActionVerdict | { ok: false; code: Prohibited; budget: DenialBudget };
+const paymentFields = new Set(['amount', 'recipient', 'transfer details']);
+const cardAutocomplete = new Set([
+  'cc-name',
+  'cc-given-name',
+  'cc-additional-name',
+  'cc-family-name',
+  'cc-number',
+  'cc-exp',
+  'cc-exp-month',
+  'cc-exp-year',
+  'cc-csc',
+  'cc-type',
+]);
+const paymentLabels = new Set([
+  'pay',
+  'payment',
+  'transfer',
+  'оплатить',
+  'платёж',
+  'платеж',
+  'перевод',
+  'перевести',
+]);
+const changeLabels = new Set(['delete', 'remove', 'settings', 'удалить', 'настройки']);
+const readLabels = new Set([
+  'save as pdf',
+  'change period',
+  'сохранить как pdf',
+  'изменить период',
+]);
+
+function normalized(value: unknown): string {
+  return typeof value === 'string' ? value.trim().replace(/\s+/gu, ' ').toLowerCase() : '';
+}
+
+function path(value: unknown): string {
+  if (typeof value !== 'string' || !value || value.length > 2048) return '';
+  try {
+    const url = new URL(value, 'https://example.invalid');
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.pathname.toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+function classify(
+  facts: unknown,
+  loginStep = ownValue(facts, 'loginStep') === true,
+): Classification {
+  const alternateLabels = ownValue(facts, 'alternateLabels');
+  const labels = [
+    ownValue(facts, 'label'),
+    ...(Array.isArray(alternateLabels) ? alternateLabels : []),
+  ].map(normalized);
+  const inputKind = normalized(ownValue(facts, 'inputKind'));
+  const autocomplete = normalized(ownValue(facts, 'autocomplete')).split(' ');
+  const fields = ownValue(facts, 'formFieldKinds');
+  const fieldKinds = Array.isArray(fields) ? fields : [];
+  const formAction = path(ownValue(facts, 'formAction'));
+  const paymentPath = [
+    path(ownValue(facts, 'currentPath')),
+    path(ownValue(facts, 'href')),
+    formAction,
+  ].includes('/payment');
+  const confirmationForm =
+    ownValue(facts, 'confirmationForm') === true ||
+    fieldKinds.some((kind) => paymentFields.has(kind));
+  const credential =
+    inputKind === 'password' ||
+    autocomplete.some(
+      (kind) => kind === 'current-password' || kind === 'new-password' || kind === 'one-time-code',
+    );
+  if (
+    paymentPath ||
+    paymentFields.has(inputKind) ||
+    autocomplete.some((kind) => cardAutocomplete.has(kind)) ||
+    (credential && (!loginStep || confirmationForm))
+  )
+    return { prohibited: 'blocked-payment', budget: 'hard' };
+
+  if (labels.some((label) => paymentLabels.has(label)))
+    return { prohibited: 'blocked-payment', budget: 'label' };
+  if (labels.some((label) => changeLabels.has(label)))
+    return { prohibited: 'blocked-change', budget: 'label' };
+  const safeFields =
+    Array.isArray(fields) && fieldKinds.every((kind) => kind === 'date' || kind === 'choice');
+  const safeLabel = safeFields && labels.some((label) => readLabels.has(label));
+  const conditionalLabels = safeLabel ? labels.filter((label) => !readLabels.has(label)) : labels;
+
+  if (
+    conditionalLabels.some((label) =>
+      /(?:pay(?:ment)?|transfer|оплат|плат[её]ж|перевод)/iu.test(label),
+    )
+  )
+    return { prohibited: 'blocked-payment', budget: null };
+  const tag = ownValue(facts, 'tag');
+  const type = ownValue(facts, 'controlType');
+  if (
+    conditionalLabels.some((label) =>
+      /(?:save|delete|remove|change|apply|сохран|удал|измен|примен)/iu.test(label),
+    ) ||
+    (!safeLabel &&
+      ((type === 'submit' && (tag === 'input' || tag === 'button')) ||
+        (type === 'reset' && tag === 'input')))
+  )
+    return { prohibited: 'blocked-change', budget: null };
+  return { prohibited: null, budget: null };
+}
+
+function validFacts(facts: unknown): boolean {
+  const list = (values: unknown, count: number, size: number) =>
+    Array.isArray(values) &&
+    values.length <= count &&
+    values.every((value) => typeof value === 'string' && value.length <= size);
+  const alternateLabels = ownValue(facts, 'alternateLabels');
+  return (
+    ['label', 'inputKind', 'autocomplete', 'currentPath', 'href', 'formAction'].every((key) => {
+      const value = ownValue(facts, key);
+      return typeof value === 'string' && value.length <= 2048;
+    }) &&
+    typeof ownValue(facts, 'confirmationForm') === 'boolean' &&
+    list(ownValue(facts, 'formFieldKinds'), 32, 64) &&
+    (alternateLabels === undefined || list(alternateLabels, 6, 256))
+  );
+}
 
 function ownValue(record: unknown, key: PropertyKey): unknown {
   if (typeof record !== 'object' || record === null) return undefined;
@@ -55,6 +207,11 @@ function hasOnlyDataKeys(record: unknown, allowed: readonly string[]): boolean {
 }
 
 function decide(command: unknown, context: ActionContext): ActionVerdict {
+  const verdict = decideWithBudget(command, context);
+  return 'budget' in verdict ? { ok: false, code: verdict.code } : verdict;
+}
+
+function decideWithBudget(command: unknown, context: ActionContext): ReadPolicy {
   try {
     if (
       !hasOnlyDataKeys(command, [
@@ -108,11 +265,18 @@ function decide(command: unknown, context: ActionContext): ActionVerdict {
     if (ownValue(candidate, 'sourceFrame') !== true) return { ok: false, code: 'foreign-frame' };
     if (ownValue(candidate, 'visible') !== true) return { ok: false, code: 'hidden' };
     if (ownValue(candidate, 'enabled') !== true) return { ok: false, code: 'disabled' };
+    const actionClass = ownValue(command, 'actionClass');
+    const facts = ownValue(candidate, 'facts');
+    if (actionClass === 'read' && facts !== undefined) {
+      if (!validFacts(facts)) return { ok: false, code: 'unclassified' };
+      const { prohibited, budget } = classify(facts, ownValue(context, 'loginStep') === true);
+      if (prohibited) return { ok: false, code: prohibited, ...(budget ? { budget } : {}) };
+    }
     if (ownValue(candidate, 'secretField') !== false) return { ok: false, code: 'secret-field' };
     const prohibited = ownValue(candidate, 'prohibited');
     if (prohibited === 'blocked-payment' || prohibited === 'blocked-change')
       return { ok: false, code: prohibited };
-    if (prohibited !== null || ownValue(command, 'actionClass') !== 'read') {
+    if (prohibited !== null || actionClass !== 'read') {
       return { ok: false, code: 'unclassified' };
     }
     return { ok: true, snapshotNumber, nodeNumber, deep };
@@ -122,3 +286,5 @@ function decide(command: unknown, context: ActionContext): ActionVerdict {
 }
 
 exports.decideActionVerdict = decide;
+exports.decideReadPolicy = decideWithBudget;
+exports.classifyProhibitedFacts = classify;

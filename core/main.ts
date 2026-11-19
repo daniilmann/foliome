@@ -2,6 +2,7 @@ const { randomUUID } = require('node:crypto') as typeof import('node:crypto');
 import type { prepareDomCollector } from './adapters/browser/collect-dom.ts';
 import type { createActionProtocol, LogProtocolEvent } from './adapters/store/action-protocol.ts';
 import type { createTextSnapshotStore } from './adapters/store/text-snapshot-store.ts';
+import type { DenialBudget } from './domain/action-verdict.ts';
 const { captureCabinetSnapshot } =
   require('./adapters/browser/capture-snapshot.ts') as typeof import('./adapters/browser/capture-snapshot.ts');
 const { createPreparationMcp } =
@@ -30,6 +31,7 @@ type Ports = {
   sleep(ms: number): Promise<void>;
   executorRunning(): boolean;
   protocolUnavailable?(): void;
+  actionDenialLimit?(): void;
 };
 type Scope = { sessionId: string; sourceId: string; accessId: string; instruction: string };
 type Session = {
@@ -38,6 +40,7 @@ type Session = {
   confirmed: boolean;
   number: number;
   busy: boolean;
+  denials?: Record<DenialBudget, number>;
   observation?: Awaited<ReturnType<Collector['observeTargets']>> &
     Pick<Scope, 'sessionId' | 'sourceId' | 'accessId'>;
 };
@@ -72,14 +75,18 @@ function create(ports: Ports, scope: Scope) {
   let lifecyclePending = false;
   let epoch = 0;
   const unavailable = () => ({ ok: false as const, code: 'session-unavailable' as const });
-  function revokeForProtocol(session: Session) {
+  function revoke(session: Session, notify?: () => void) {
     if (current !== session) return;
+    const closing = closeSource();
     try {
-      ports.protocolUnavailable?.();
+      notify?.();
     } catch {
       /* Revocation is mandatory even if notification fails. */
     }
-    void closeSource().catch(() => {});
+    return closing.catch(() => {});
+  }
+  function revokeForProtocol(session: Session) {
+    return revoke(session, ports.protocolUnavailable);
   }
   function recordLogUnavailable(sessionId: string, code: LogProtocolEvent['code']): boolean {
     const session = current;
@@ -119,6 +126,8 @@ function create(ports: Ports, scope: Scope) {
   }
   function closeSource(): Promise<void> {
     if (!current) return lifecycle;
+    delete current.denials;
+    delete current.observation;
     current = undefined;
     lifecyclePending = true;
     lifecycle = lifecycle
@@ -139,7 +148,14 @@ function create(ports: Ports, scope: Scope) {
     if (!Number.isSafeInteger(epoch + 1)) throw new Error('session-unavailable');
     epoch++;
     const sessionId = epoch === 1 ? scope.sessionId : randomUUID();
-    const session: Session = { sessionId, ready: false, confirmed: false, number: 0, busy: false };
+    const session: Session = {
+      sessionId,
+      ready: false,
+      confirmed: false,
+      number: 0,
+      busy: false,
+      denials: { hard: 0, label: 0 },
+    };
     current = session;
     try {
       const opening = lifecycle.then(async () => {
@@ -332,7 +348,7 @@ function create(ports: Ports, scope: Scope) {
                     ...scope,
                     sessionId: session.sessionId,
                     sessionActive: true,
-                    loginStep: false,
+                    loginStep: !session.confirmed,
                     snapshotNumber: session.number,
                   }
                 : undefined,
@@ -342,8 +358,17 @@ function create(ports: Ports, scope: Scope) {
               await persist(session, result);
             },
             protocol: ports.protocol,
-            onProtocolUnavailable: () => {
-              revokeForProtocol(session);
+            onProtocolUnavailable: () => revokeForProtocol(session),
+            denialBudget: {
+              record(id, kind) {
+                if (id !== session.sessionId || !active(session) || !session.denials)
+                  throw new Error('session-unavailable');
+                const maximum = kind === 'hard' ? 3 : 10;
+                return ++session.denials[kind] === maximum;
+              },
+            },
+            revokeSession: (id) => {
+              if (id === session.sessionId) return revoke(session, ports.actionDenialLimit);
             },
           });
           const result = await reader.read(

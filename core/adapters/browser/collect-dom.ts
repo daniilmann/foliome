@@ -1,3 +1,5 @@
+import type { ActionFacts } from '../../domain/action-verdict.ts';
+
 const { filterTextSnapshot, filterEventAddress, detectPaintMasks } =
   require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
 const { createHmac, randomBytes } = require('node:crypto') as typeof import('node:crypto');
@@ -106,7 +108,8 @@ type DocumentFacts = {
   nodes: Omit<NodeFact, 'n' | 'frame' | 'parent'>[];
   parents: (number | null)[];
   identities: number[];
-  classes: ('blocked-payment' | 'blocked-change' | null)[];
+  classes?: ('blocked-payment' | 'blocked-change' | null)[];
+  actionFacts?: ActionFacts[];
   semantics: string[];
   secrets: Secret[];
   embeds: { url: string; visible: boolean }[];
@@ -132,8 +135,8 @@ type WorldPlan = Plan & { maskAnimationActive: boolean };
 // This expression is owned by the adapter and runs only in its isolated world.
 const hasTransform = `style => style.transform !== 'none' || style.perspective !== 'none' ||
   style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' || style.offsetPath !== 'none'`;
-const expression = String.raw`(() => {
-  const nodes = [], parents = [], identities = [], classes = [], semantics = [], secrets = [], embeds = [], geometry = [], paint = [];
+const expression = String.raw`((collectActionFacts) => {
+  const nodes = [], parents = [], identities = [], actionFacts = [], semantics = [], secrets = [], embeds = [], geometry = [], paint = [];
   const visitedElements = new WeakMap(), labelReferences = [];
   const visitedEmbeds = new Set(), hasTransform = ${hasTransform};
   const state = globalThis.__foliomeObservation || (globalThis.__foliomeObservation = (() => {
@@ -169,8 +172,136 @@ const expression = String.raw`(() => {
   const rectValue = r => ({ x: r.x, y: r.y, width: r.width, height: r.height });
   const forbidden = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT']);
   const fieldRoles = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton', 'slider']);
+  const choiceRoles = new Set(['checkbox', 'radio', 'switch', 'listbox', 'combobox']);
   const safeAttrs = ['id', 'name', 'class', 'data-testid', 'type', 'autocomplete', 'placeholder'];
   const html = 'http://www.w3.org/1999/xhtml', svg = 'http://www.w3.org/2000/svg';
+  const normal = (value, limit = 256) => {
+    if (!value) return '';
+    const text = value.slice(0, limit).trim().replace(/\s+/gu, ' ').toLowerCase();
+    return value.length > limit ? text.slice(0, limit - 1) + '…' : text;
+  };
+  const path = (value, base) => {
+    try {
+      const url = new URL(value, base);
+      return (url.protocol === 'https:' || url.protocol === 'http:') && url.pathname.length <= 2048 ? url.pathname : '';
+    } catch { return ''; }
+  };
+  // The private facts follow the same node order as the observed identities.
+  const currentPath = collectActionFacts ? path(location.href) : '';
+  const actionControl = 'a[href],area[href],button,input[type=button],input[type=submit],input[type=reset],[role=button],[role=link]';
+  const observedLabels = new WeakMap(), forms = new WeakMap();
+  const ariaReferenceText = new WeakMap();
+  const textLabel = root => {
+    const previous = observedLabels.get(root);
+    if (previous !== undefined) return previous;
+    const privateField = node => forbidden.has(node.tagName) || ['INPUT', 'SELECT', 'TEXTAREA'].includes(node.tagName) ||
+      node.isContentEditable || fieldRoles.has(normal(node.getAttribute('role'), 64));
+    if (privateField(root)) return '';
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, node => {
+      if (node.nodeType === Node.TEXT_NODE) return NodeFilter.FILTER_ACCEPT;
+      return privateField(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+    });
+    let text = '', visited = 0;
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (++visited > 128) { text += '…'; break; }
+      if (node.nodeType === Node.TEXT_NODE) {
+        const available = 256 - text.length;
+        const chunk = node.nodeValue || '';
+        text += chunk.slice(0, available);
+        if (chunk.length > available) { text = text.slice(0, 255) + '…'; break; }
+      }
+    }
+    text = normal(text);
+    observedLabels.set(root, text);
+    return text;
+  };
+  const referencedLabel = element => {
+    const previous = ariaReferenceText.get(element);
+    if (previous !== undefined) return previous;
+    const raw = element.getAttribute('aria-labelledby');
+    if (!raw || raw.length > 1024) return '';
+    const ids = raw.trim().split(/\s+/u);
+    if (ids.length > 8) return '';
+    const root = element.getRootNode();
+    const text = normal(ids.map(id => {
+      const reference = root.getElementById?.(id);
+      return reference && (reference === element || !reference.contains(element)) ? textLabel(reference) : '';
+    }).join(' '));
+    ariaReferenceText.set(element, text);
+    return text;
+  };
+  const paymentKind = value => {
+    const kind = normal(value, 64).replace(/[-_]+/g, ' ');
+    if (kind === 'amount' || kind === 'сумма') return 'amount';
+    if (kind === 'recipient' || kind === 'получатель') return 'recipient';
+    if (kind === 'transfer details' || kind === 'реквизиты перевода') return 'transfer details';
+    return '';
+  };
+  const fieldKind = (element, role, type) => {
+    if (type === 'password') return 'password';
+    for (const key of ['type', 'name', 'id', 'aria-label']) {
+      const kind = paymentKind(element.getAttribute(key));
+      if (kind) return kind;
+    }
+    const referenceKind = paymentKind(referencedLabel(element));
+    if (referenceKind) return referenceKind;
+    const labels = element.labels;
+    if (labels) for (let i = 0; i < Math.min(4, labels.length); i++) {
+      const kind = paymentKind(textLabel(labels[i]));
+      if (kind) return kind;
+    }
+    if (element.tagName === 'INPUT') {
+      if (['date', 'datetime-local', 'month', 'week', 'time'].includes(type)) return 'date';
+      return ['checkbox', 'radio'].includes(type) ? 'choice' : 'unknown';
+    }
+    if (element.tagName === 'SELECT' || element.tagName !== 'TEXTAREA' && !element.isContentEditable && choiceRoles.has(role)) return 'choice';
+    return 'unknown';
+  };
+  const formState = form => {
+    let info = forms.get(form);
+    if (info) return info;
+    info = { fields: new Set(), confirmation: ['id', 'name'].some(key =>
+      ['confirm', 'confirmation'].includes(normal(form.getAttribute(key), 64))) };
+    forms.set(form, info);
+    const controls = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'elements').get.call(form);
+    if (controls.length > 256) info.fields.add('unknown');
+    for (let i = 0; i < Math.min(controls.length, 256); i++) {
+      const control = controls[i];
+      const tag = control.tagName;
+      if (['BUTTON', 'FIELDSET', 'OUTPUT'].includes(tag) || tag === 'INPUT' && ['button', 'submit', 'reset', 'image'].includes(control.type)) continue;
+      info.fields.add(fieldKind(control, normal(control.getAttribute('role'), 64), control.type));
+    }
+    return info;
+  };
+  const observeAction = (element, role, type, field, semanticText) => {
+    const tag = element.localName.toLowerCase();
+    const control = element.closest(actionControl);
+    const link = element.closest('a[href],area[href]');
+    const owner = control || element;
+    const form = element instanceof HTMLFormElement ? element : 'form' in owner ? owner.form : owner.closest('form');
+    const info = form instanceof HTMLFormElement ? formState(form) : null;
+    const isField = field || choiceRoles.has(role) || ['checkbox', 'radio'].includes(type);
+    const inputKind = isField ? fieldKind(element, role, type) : '';
+    if (info && isField && !['input', 'select', 'textarea'].includes(tag)) info.fields.add(inputKind);
+    const submitter = (control?.localName === 'button' || control?.localName === 'input') && control.type === 'submit' ? control :
+      tag === 'input' && type === 'image' ? element : null;
+    const formAction = !info ? '' : submitter?.hasAttribute('formaction') ? path(submitter.formAction) :
+      path(Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, 'action').get.call(form));
+    const displayLabel = !control ? semanticText : control.localName === 'input' ? control.getAttribute('value') : textLabel(control);
+    const labels = new Set([
+      normal(displayLabel), normal(element.getAttribute('aria-label')), normal(element.getAttribute('title')),
+      referencedLabel(element), control ? normal(control.getAttribute('aria-label')) : '',
+      control ? referencedLabel(control) : '', control ? normal(control.getAttribute('title')) : '',
+    ]);
+    labels.delete('');
+    const [label = '', ...alternateLabels] = labels;
+    const autocomplete = normal(element.getAttribute('autocomplete')).split(' ')
+      .filter(token => /^(?:cc-[a-z-]{1,24}|current-password|new-password|one-time-code)$/.test(token)).join(' ');
+    actionFacts.push({ tag: normal(tag, 64), role: normal(role, 64), controlType: normal(type, 64), label, alternateLabels,
+      inputKind, autocomplete, currentPath, href: link ? path(link.getAttribute('href'), link.baseURI) : '',
+      formAction,
+      confirmationForm: info?.confirmation ?? false, formFields: info?.fields });
+  };
   const scrollingElement = document.scrollingElement;
   const scrollStyle = getComputedStyle(scrollingElement || document.documentElement);
   const normalDocumentOrigin = scrollStyle.direction === 'ltr' && scrollStyle.writingMode === 'horizontal-tb';
@@ -339,11 +470,9 @@ const expression = String.raw`(() => {
     if (Object.keys(attrs).length) fact.attrs = attrs;
     if (!state.ids.has(element)) state.ids.set(element, state.next++);
     identities.push(state.ids.get(element));
-    const label = [semanticText, ariaLabel || '', element.getAttribute('title') || '', (tag === 'BUTTON' || button) ? element.value : ''].join(' ').toLowerCase();
+    const label = [semanticText, ariaLabel || '', element.getAttribute('title') || ''].join(' ').toLowerCase();
     semantics.push(JSON.stringify([tag, label, element.getAttribute('type'), element.getAttribute('aria-expanded'), element.getAttribute('aria-haspopup'), element.getAttribute('aria-controls'), element.getAttribute('aria-pressed'), element.getAttribute('autocomplete')]));
-    const payment = /(?:pay(?:ment)?|transfer|оплат|плат[её]ж|перевод)/iu.test(label);
-    const change = /(?:save|delete|remove|change|сохран|удал|измен)/iu.test(label) || tag === 'INPUT' && ['submit', 'reset'].includes(element.type) || tag === 'BUTTON' && element.type === 'submit';
-    classes.push(payment ? 'blocked-payment' : change ? 'blocked-change' : null);
+    if (collectActionFacts) observeAction(element, role, tag === 'BUTTON' ? element.type : type, field, semanticText);
     const index = nodes.length; nodes.push(fact); parents.push(parent);
     visitedElements.set(element, index);
     const referenceIds = !field && visible ? element.getAttribute('aria-labelledby') : null;
@@ -391,8 +520,10 @@ const expression = String.raw`(() => {
   const viewport = visualViewport;
   const viewportStable = !!viewport && devicePixelRatio === 1 && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.pageLeft === scrollX && viewport.pageTop === scrollY && viewport.width === innerWidth && viewport.height === innerHeight;
   const unobservedEmbeds = Array.from(document.querySelectorAll('iframe,frame,object,embed')).some(el => !visitedEmbeds.has(el));
-  return { url: location.href, title: document.title, nodes, parents, identities, classes, semantics, secrets, embeds, observation: { viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported, unobservedEmbeds, paint } };
-})()`;
+  return { url: location.href, title: document.title, nodes, parents, identities,
+    actionFacts: actionFacts.map(({ formFields, ...facts }) => ({ ...facts, formFieldKinds: formFields ? [...formFields].sort() : [] })),
+    semantics, secrets, embeds, observation: { viewport: { x: scrollX, y: scrollY, width: innerWidth, height: innerHeight }, geometry, width: innerWidth, height: innerHeight, revision: state.revision, animationIds, animationTargets, viewportStable, maskAnimationActive: false, unsupported, unobservedEmbeds, paint } };
+})`;
 
 const worldName = 'foliome-dom-collector';
 // Invoked on the frame owner resolved by CDP in the parent's isolated world.
@@ -1325,7 +1456,8 @@ async function prepare(
           let rootNodeCount = 0;
           let rootContext = 0;
           let rootIdentities: number[] = [],
-            rootClasses: DocumentFacts['classes'] = [];
+            rootClasses: DocumentFacts['classes'],
+            rootActionFacts: DocumentFacts['actionFacts'];
           let rootSemantics: string[] = [];
           const embeds: { url: string; visible: boolean }[] = [];
           const participatingWorlds: ParticipatingWorld[] = [];
@@ -1354,7 +1486,7 @@ async function prepare(
                 if (!record(world) || !Number.isSafeInteger(world.executionContextId))
                   throw new Error();
                 const evaluation = await send('Runtime.evaluate', {
-                  expression,
+                  expression: `${expression}(${index === 0})`,
                   contextId: world.executionContextId,
                   returnByValue: true,
                 });
@@ -1389,6 +1521,7 @@ async function prepare(
                   rootContext = world.executionContextId as number;
                   rootIdentities = data.identities;
                   rootClasses = data.classes;
+                  rootActionFacts = data.actionFacts;
                   rootSemantics = data.semantics;
                 }
                 if (!data.observation || !Number.isSafeInteger(data.observation.revision))
@@ -1485,6 +1618,7 @@ async function prepare(
             rootContext,
             rootIdentities,
             rootClasses,
+            rootActionFacts,
             rootSemantics,
             participatingWorlds,
           };
@@ -1498,8 +1632,15 @@ async function prepare(
       }
     }
     function projectTargets(result: Awaited<ReturnType<typeof collect>>) {
-      const { facts, rootNodeCount, rootContext, rootIdentities, rootClasses, rootSemantics } =
-        result;
+      const {
+        facts,
+        rootNodeCount,
+        rootContext,
+        rootIdentities,
+        rootClasses,
+        rootActionFacts,
+        rootSemantics,
+      } = result;
       const filtered = filterTextSnapshot(facts);
       if (
         !filtered.ok ||
@@ -1507,11 +1648,16 @@ async function prepare(
         !Array.isArray(rootIdentities) ||
         rootIdentities.length !== rootNodeCount ||
         !rootIdentities.every((id) => Number.isSafeInteger(id) && id > 0) ||
-        !Array.isArray(rootClasses) ||
-        rootClasses.length !== rootNodeCount ||
-        !rootClasses.every(
-          (value) => value === null || value === 'blocked-payment' || value === 'blocked-change',
-        ) ||
+        (rootActionFacts !== undefined
+          ? !Array.isArray(rootActionFacts) ||
+            rootActionFacts.length !== rootNodeCount ||
+            !rootActionFacts.every(record)
+          : !Array.isArray(rootClasses) ||
+            rootClasses.length !== rootNodeCount ||
+            !rootClasses.every(
+              (value) =>
+                value === null || value === 'blocked-payment' || value === 'blocked-change',
+            )) ||
         !Array.isArray(rootSemantics) ||
         rootSemantics.length !== rootNodeCount ||
         !rootSemantics.every((value) => typeof value === 'string')
@@ -1525,6 +1671,7 @@ async function prepare(
             frames: facts.frames,
             nodes: facts.nodes,
             classes: rootClasses,
+            actionFacts: rootActionFacts,
             semantics: rootSemantics,
           }),
         )
@@ -1539,7 +1686,8 @@ async function prepare(
           enabled: !node.state?.split(' ').includes('disabled'),
           sourceFrame: node.frame === 0,
           secretField: !!node.field,
-          prohibited: rootClasses[index],
+          prohibited: rootClasses?.[index] ?? null,
+          ...(rootActionFacts ? { facts: rootActionFacts[index] } : {}),
           text: element?.text ?? '',
         };
       });

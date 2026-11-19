@@ -355,6 +355,10 @@ async function createInstalled(options: Options) {
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         executorRunning: () => running && !closed,
         protocolUnavailable,
+        actionDenialLimit() {
+          log.write({ level: 'error', code: 'action-denial-limit' });
+          window?.setStatus('limit');
+        },
       },
       options.source,
     );
