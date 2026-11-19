@@ -17,7 +17,9 @@ const {
   checkLiveBoundary,
   dirMode,
   etcAlias,
+  executorInstaller,
   fileMode,
+  guidPattern,
   hostFile,
   lintProfiles,
   loadPf,
@@ -199,6 +201,8 @@ async function approvedState() {
     !version.test(current.version) ||
     !Number.isSafeInteger(current.ownerUid) ||
     !Number.isSafeInteger(current.executorUid) ||
+    (current.executorGuid !== undefined &&
+      (typeof current.executorGuid !== 'string' || !guidPattern.test(current.executorGuid))) ||
     !sha256.test(current.pfDigest) ||
     typeof current.pfRules !== 'string' ||
     current.pfRules.length > 65536
@@ -376,20 +380,36 @@ async function checkInstalled(plan, host, agent) {
   return checkLiveBoundary(host, agent);
 }
 
-async function apply(sha, scratch, journal) {
+async function apply(sha, scratch, journal, accounts) {
   const owner = await localOwner();
   const current = await approvedState();
+  if (!current && (await stat(path.join(root, 'installation.json')))) throw Error('boundary-state');
   if (current && current.ownerUid !== owner.uid) throw Error('boundary-account');
-  const selected = await observe(sha, current, scratch, owner);
-  const agent = await localExecutor(owner);
-  if (current && current.executorUid !== agent.uid) throw Error('boundary-account');
-  const { plan, settings, host, newHostKey, pf, task } = await planFor(
-    selected,
-    owner,
-    agent,
-    scratch,
-  );
+  async function verifiedExecutor(expected) {
+    const agent = await localExecutor(owner);
+    if (agent.uid !== expected.uid || (expected.guid !== undefined && agent.guid !== expected.guid))
+      throw Error('boundary-account');
+    return agent;
+  }
+  const existing =
+    current &&
+    (await verifiedExecutor({
+      uid: current.executorUid,
+      guid: current.executorGuid,
+    }));
+  if (existing) {
+    if (current.executorGuid === undefined) {
+      // Older authority files carried only a UID. The root-owned key ACL
+      // still identifies the original account by its directory UUID.
+      const keys = '/private/etc/ssh/authorized_keys/executor';
+      await authorize(keys);
+      if (!fileMode(await stat(keys), 0, 0o600, 0)) throw Error('boundary-account');
+      await requireAcl(keys, ['user:executor allow read']);
+    }
+    await accounts.finish(current, existing);
+  }
 
+  const selected = await observe(sha, current, scratch, owner);
   const runtime = {};
   for (const name of ['node', 'codex']) {
     const archive = await fs.readFile(
@@ -408,7 +428,6 @@ async function apply(sha, scratch, journal) {
     releasesRoot: materializedRoot,
   });
   if (!materialized.ok) throw Error('release-materialization');
-  const payload = await ownerPayload(materialized, settings);
   const lastPf = await pfSnapshot();
   const lastSsh = await sshSnapshot();
   if (
@@ -419,6 +438,14 @@ async function apply(sha, scratch, journal) {
       hash(await fs.readFile(pfFile)) !== current.pfDigest)
   )
     throw Error('boundary-pf');
+  const agent = existing ?? (await accounts.prepare(selected.stage.sha, owner));
+  const { plan, settings, host, newHostKey, pf, task } = await planFor(
+    selected,
+    owner,
+    agent,
+    scratch,
+  );
+  const payload = await ownerPayload(materialized, settings);
   await fs.writeFile(path.join(scratch, 'pf'), pf.content, { flag: 'wx', mode: 0o600 });
   await fs.writeFile(path.join(scratch, 'plist'), task.content, { flag: 'wx', mode: 0o600 });
   await run('/sbin/pfctl', ['-n', '-a', 'com.apple/foliome', '-f', path.join(scratch, 'pf')]);
@@ -468,6 +495,7 @@ async function apply(sha, scratch, journal) {
     const initial = !current || current.initialSha === sha;
     await asUser(owner, initial ? 'prepare-initial' : 'prepare', sha, payload);
     if ((await localOwner()).uid !== owner.uid) throw Error('boundary-account');
+    await verifiedExecutor(agent);
     if (replaceBase) await replaceTrustedBase(tx, selected, runtime.node);
     const accepted = {
       sha,
@@ -475,6 +503,7 @@ async function apply(sha, scratch, journal) {
       version: selected.manifest.version,
       ownerUid: owner.uid,
       executorUid: agent.uid,
+      executorGuid: agent.guid,
       pfRules: live.rules,
       pfDigest: hash(pf.content),
     };
@@ -487,6 +516,7 @@ async function apply(sha, scratch, journal) {
       throw Error('restore-failed');
     }
   }
+  await accounts.finish({ initialSha: current?.initialSha ?? sha, ownerUid: owner.uid }, agent);
   if (!current || current.initialSha === sha) await asUser(owner, 'activate', sha);
 }
 
@@ -529,7 +559,7 @@ async function installApprovedSystem(sha) {
     }
     const scratch = await fs.mkdtemp(path.join(admin, 'work-'));
     try {
-      await apply(sha, scratch, journal);
+      await apply(sha, scratch, journal, executorInstaller(admin));
     } finally {
       await fs.rm(scratch, { recursive: true, force: true });
     }
