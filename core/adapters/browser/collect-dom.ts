@@ -1754,10 +1754,7 @@ async function prepare(
               const transformedOwner = transformedOwners.has(i);
               if (geometry.mask) {
                 if (!partial.has(i)) {
-                  const exactBounds =
-                    transformedOwner ||
-                    (node.role === 'input' && node.field && observation.viewport);
-                  protect(i, [r], exactBounds ? 0 : 4);
+                  protect(i, [r]);
                   if (node.field && geometry.runs.length) protect(i, geometry.runs);
                 }
                 protectedNodes.add(i);

@@ -1436,10 +1436,16 @@ test(
           assert.equal(after.width, viewport.width);
           assert.equal(after.height, viewport.height);
           const labels = await numberedLabelAreas(page);
-          assertRectBlack(after, box, labels);
+          const mask = {
+            x: box.x - 4,
+            y: box.y - 4,
+            width: box.width + 8,
+            height: box.height + 8,
+          };
+          assertRectBlack(after, mask, labels);
           for (let y = 0; y < viewport.height; y++)
             for (let x = 0; x < viewport.width; x++) {
-              if (!contains(box, x, y) && !isNumberedLabelPixel(x, y, labels))
+              if (!contains(mask, x, y) && !isNumberedLabelPixel(x, y, labels))
                 assert.deepEqual(
                   pixelAt(after, x, y),
                   pixelAt(before, x, y),
