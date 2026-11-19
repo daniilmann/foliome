@@ -1,7 +1,11 @@
 #!/bin/sh
 set -eu
 
-[ "$#" -eq 0 ] || exit 1
+case "$#" in
+  0) ;;
+  1) [ "$1" = --previous ] || exit 1 ;;
+  *) exit 1 ;;
+esac
 
 base='/Library/Application Support/Foliome/base'
 exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$base/node" \

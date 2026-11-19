@@ -63,7 +63,9 @@ The installer checks the approved Git objects before loading the installer and o
 
 If inputs or verification fail, check the approved SHA, the private file's format and permissions, and the release status. For a cancelled password prompt, interruption, or failed sign-in, rerun the same command with the same SHA and keys. If an installed dispatcher or existing keys differ, stop and report the error code to the release operator. A valid existing source configuration is preserved. If device sign-in is blocked, have the account or workspace enable it before retrying.
 
-Launch Foliome again from Terminal with the installed owner launcher.
+In Finder, open `~/Library/Application Support/Foliome/app/Система.app` to launch Foliome. To return to the previous release, hold Option (⌥) while opening **Система** and keep it held until the launcher dialog appears. Select **Вернуть и подтвердить** to confirm. The launcher asks for an administrator password only if the rollback changes system files.
+
+You can also launch Foliome from Terminal. Add `--previous` to open the same rollback dialog.
 
 ```sh
 "/Library/Application Support/Foliome/base/launch"

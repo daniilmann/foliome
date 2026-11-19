@@ -168,7 +168,7 @@ function checkInstalledSchema(db: DatabaseSync): void {
 async function selfCheck(
   paths: Paths,
   sha: string,
-  input: { fixtureFile: string } | { installedEntry: string },
+  input: { fixtureFile: string } | { installedEntry: string; initialSeed: boolean },
 ): Promise<void> {
   const uid = process.getuid?.();
   if (!uid || process.geteuid?.() !== uid || !shaPattern.test(sha) || !validPaths(paths))
@@ -201,8 +201,15 @@ async function selfCheck(
     )
       throw Error();
   }
-  if ((await fs.realpath(file)) !== file || (await fs.realpath(paths.database)) !== paths.database)
-    throw Error();
+  let source = paths.database;
+  if ('installedEntry' in input && input.initialSeed) {
+    const active = await fs.lstat(source).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    if (active) throw Error();
+    source = path.join(paths.data, `.initial-${sha}.db`);
+  }
+  if ((await fs.realpath(file)) !== file || (await fs.realpath(source)) !== source) throw Error();
   // Require a self-contained backup before using SQLite's immutable mode.
   const entries = await fs.opendir(data);
   try {
@@ -211,7 +218,7 @@ async function selfCheck(
   } finally {
     await entries.close();
   }
-  const live = await fs.lstat(paths.database);
+  const live = await fs.lstat(source);
   if (!privateDatabase(live, uid)) throw Error();
   const handle = await fs.open(
     file,
@@ -331,7 +338,9 @@ exports.runProgram = runProgramImpl;
 exports.launchProgram = launchProgramImpl;
 
 async function checkInstalledEntry(argv: string[]): Promise<Result> {
-  if (argv.length !== 1 || argv[0] !== '--self-check') return { ok: false, code: 'self-check' };
+  const initialSeed = argv.length === 2 && argv[1] === '--initial-seed';
+  if (argv[0] !== '--self-check' || (argv.length !== 1 && !initialSeed))
+    return { ok: false, code: 'self-check' };
   try {
     const owner = os.userInfo();
     if (
@@ -358,7 +367,7 @@ async function checkInstalledEntry(argv: string[]): Promise<Result> {
         config: path.join(data, 'config.json'),
       },
       sha,
-      { installedEntry: __filename },
+      { installedEntry: __filename, initialSeed },
     );
     return { ok: true };
   } catch {

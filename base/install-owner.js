@@ -9,10 +9,18 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { deserialize } = require('node:v8');
 const { DatabaseSync } = require('node:sqlite');
-const { exclusive, marker, sameSelection, commitActivation } = require('./activation-state.js');
-const { verifyInventory } = require('./launcher.js');
+const { pathToFileURL } = require('node:url');
+const {
+  exclusive,
+  initialDatabasePaths,
+  marker,
+  sameSelection,
+  commitActivation,
+} = require('./activation-state.js');
+const { preflightAcceptedRelease, verifyInventory } = require('./launcher.js');
 const { installationJournal, stat, syncDirectory } = require('./install-transaction.js');
 const { readInstallationRelease } = require('./installation-release.js');
+const { requireAcl } = require('./install-platform.js');
 
 const root = '/Library/Application Support/Foliome';
 const shaPattern = /^[a-f0-9]{40}$/;
@@ -225,13 +233,19 @@ async function requireInitialAuthority(sha) {
     throw Error('owner-authority');
 }
 
-function initialDatabasePaths(data, sha) {
-  return { live: path.join(data, 'core.db'), staging: path.join(data, '.initial-' + sha + '.db') };
-}
-
 async function requireInitialMarker(file, sha) {
   if (!ownedFile(await fs.lstat(file), 0o600)) throw Error('owner-database');
-  const db = new DatabaseSync(file, { readOnly: true, defensive: true });
+  const wal = await stat(file + '-wal');
+  const shm = await stat(file + '-shm');
+  if (
+    (await stat(file + '-journal')) ||
+    !!wal !== !!shm ||
+    (wal && (!ownedFile(wal, 0o600) || !ownedFile(shm, 0o600)))
+  )
+    throw Error('owner-database');
+  const source = pathToFileURL(file);
+  if (!wal) source.searchParams.set('immutable', '1');
+  const db = new DatabaseSync(source, { readOnly: true, defensive: true });
   try {
     const state = marker(db);
     if (state?.current !== sha || state.previous !== null) throw Error('owner-database');
@@ -299,17 +313,95 @@ async function prepareInitialDatabase({ sha, data, releases }) {
   await syncDirectory(data);
 }
 
-async function activate({ sha, data, releases }) {
+const systemAppName = 'Система.app';
+const systemAppScript = `
+ObjC.import('AppKit');
+function run() {
+  const previous = ($.NSEvent.modifierFlags & $.NSEventModifierFlagOption) !== 0;
+  const task = $.NSTask.alloc.init;
+  task.launchPath = '/Library/Application Support/Foliome/base/launch';
+  task.arguments = previous ? ['--previous'] : [];
+  task.currentDirectoryPath = '/';
+  task.environment = $({});
+  const sink = $.NSFileHandle.fileHandleWithNullDevice;
+  task.standardInput = sink;
+  task.standardOutput = sink;
+  task.standardError = sink;
+  task.launch;
+}
+`.trim();
+
+async function verifySystemApp(bundle) {
+  const executable = path.join(bundle, 'Contents/MacOS/applet');
+  const script = path.join(bundle, 'Contents/Resources/Scripts/main.scpt');
+  let entries = 0;
+  async function visit(dir) {
+    await requireDir(dir);
+    await requireAcl(dir, []);
+    for await (const { name } of await fs.opendir(dir)) {
+      if (++entries > 64) throw Error('owner-app');
+      const file = path.join(dir, name);
+      const info = await fs.lstat(file);
+      if (info.isDirectory()) await visit(file);
+      else {
+        if (!ownedFile(info, file === executable ? 0o700 : 0o600)) throw Error('owner-app');
+        await requireAcl(file, []);
+      }
+    }
+  }
+  await visit(bundle);
+  if (!ownedFile(await fs.lstat(executable), 0o700) || !ownedFile(await fs.lstat(script), 0o600))
+    throw Error('owner-app');
+  const options = { cwd: '/', env: {}, timeout: 10000, maxBuffer: 65536, encoding: 'utf8' };
+  execFileSync('/usr/bin/codesign', ['--verify', '--strict', bundle], options);
+  if (execFileSync('/usr/bin/osadecompile', [script], options).trim() !== systemAppScript)
+    throw Error('owner-app');
+}
+
+async function installSystemApp(app) {
+  await requireDir(app);
+  await requireAcl(path.dirname(app), []);
+  await requireAcl(app, []);
+  const bundle = path.join(app, systemAppName);
+  const scratch = path.join(app, '.system-app');
+  if (await stat(scratch)) {
+    await requireDir(scratch);
+    await requireAcl(scratch, []);
+    await fs.rm(scratch, { recursive: true });
+  }
+  if (await stat(bundle)) return verifySystemApp(bundle);
+  await fs.mkdir(scratch, { mode: 0o700 });
+  try {
+    const staged = path.join(scratch, systemAppName);
+    execFileSync('/usr/bin/osacompile', ['-l', 'JavaScript', '-o', staged, '-e', systemAppScript], {
+      cwd: scratch,
+      env: { TMPDIR: scratch },
+      timeout: 10000,
+      stdio: 'ignore',
+    });
+    await verifySystemApp(staged);
+    await fs.rename(staged, bundle);
+    await syncDirectory(app);
+  } finally {
+    await fs.rm(scratch, { recursive: true });
+  }
+}
+
+async function activate({ sha, data, app, releases }) {
   await requireInitialAuthority(sha);
   const release = path.join(releases, sha);
   await verifyInventory(release, path.join(data, 'accepted', sha + '.json'), sha, uid);
   const { live, staging } = initialDatabasePaths(data, sha);
-  if (await alreadyActive(live, staging, sha)) return;
-  for (const suffix of ['-journal', '-shm', '-wal'])
-    if ((await stat(live + suffix)) || (await stat(staging + suffix)))
-      throw Error('owner-database');
-  await requireInitialMarker(staging, sha);
-  await requireDir(data);
+  const active = await alreadyActive(live, staging, sha);
+  if (!active) {
+    for (const suffix of ['-journal', '-shm', '-wal'])
+      if ((await stat(live + suffix)) || (await stat(staging + suffix)))
+        throw Error('owner-database');
+    await requireInitialMarker(staging, sha);
+    await requireDir(data);
+  }
+  await installSystemApp(app);
+  if (active) return;
   await fs.link(staging, live);
   await fs.unlink(staging);
   await syncDirectory(data);
@@ -413,6 +505,7 @@ async function main() {
     requireRootParent();
     return prepare({ sha, data, app, releases }, await input(), true);
   }
+  if (mode === 'prepare-initial') requireRootParent();
   await exclusive(path.join(data, 'activation.json'), async () => {
     for (const dir of [app, releases, path.join(data, 'accepted'), path.join(data, 'tmp')])
       await ensureDir(dir);
@@ -424,7 +517,17 @@ async function main() {
     if (mode === 'activate') await activate(paths);
     else {
       await prepare(paths, await input());
-      if (mode === 'prepare-initial') await prepareInitialDatabase(paths);
+      if (mode === 'prepare-initial') {
+        await prepareInitialDatabase(paths);
+        await preflightAcceptedRelease({
+          home,
+          systemRoot: root,
+          sha,
+          accept: (requested) => requested === sha,
+          initial: true,
+          compatible: true,
+        });
+      }
     }
   });
 }

@@ -332,14 +332,26 @@ async function preflightAcceptedRelease({
   accept,
   compatible = false,
   runtimeNode,
+  initial = false,
 }) {
   if (typeof sha !== 'string' || !shaPattern.test(sha) || typeof accept !== 'function')
     throw Error('boundary');
-  const { uid, releases, accepted, node, dbPath } = await installedPaths(home, root);
-  if (releases !== (await fs.realpath(releases)) || dbPath !== (await fs.realpath(dbPath)))
-    throw Error('boundary');
+  const {
+    uid,
+    data: ownerData,
+    releases,
+    accepted,
+    node,
+    dbPath,
+  } = await installedPaths(home, root);
+  if (releases !== (await fs.realpath(releases))) throw Error('boundary');
   // The caller supplies the owner decision for this exact staged SHA.
   if ((await accept(sha)) !== true) throw Error('acceptance');
+  const { stat } = require('./install-transaction.js');
+  const { initialDatabasePaths } = require('./activation-state.js');
+  const initialSeed = initial && !(await stat(dbPath));
+  const source = initialSeed ? initialDatabasePaths(ownerData, sha).staging : dbPath;
+  if (source !== (await fs.realpath(source))) throw Error('boundary');
   const release = path.join(releases, sha);
   try {
     await verifyInventory(release, path.join(accepted, `${sha}.json`), sha, uid);
@@ -349,6 +361,11 @@ async function preflightAcceptedRelease({
   const scratch = path.join(releases, `${sha}.check`);
   const data = path.join(scratch, 'data');
   try {
+    // An interrupted first install is retried under the same activation lease.
+    if (initial && (await stat(scratch))) {
+      await directory(scratch, uid);
+      await fs.rm(scratch, { recursive: true });
+    }
     await fs.mkdir(scratch, { mode: 0o700 });
   } catch {
     throw Error('copy');
@@ -356,12 +373,15 @@ async function preflightAcceptedRelease({
   try {
     try {
       await fs.mkdir(data, { mode: 0o700 });
-      await snapshotDatabase(dbPath, path.join(data, 'core.db'), uid);
+      await snapshotDatabase(source, path.join(data, 'core.db'), uid);
     } catch {
       throw Error('copy');
     }
-    const args = releaseArgs(home, data, runtimeNode ?? node, release);
-    await runSelfCheck([...args, '--self-check'], release);
+    const args = releaseArgs(home, data, initial ? node : (runtimeNode ?? node), release);
+    await runSelfCheck(
+      [...args, '--self-check', ...(initialSeed ? ['--initial-seed'] : [])],
+      release,
+    );
     if (compatible) {
       try {
         await runSelfCheck([...args.slice(0, -1), '-e', schemaCheck, release], release);
@@ -450,6 +470,7 @@ function ownerCode(error) {
     [
       'self-check',
       'incompatible',
+      'previous-unavailable',
       'release-verification',
       'boundary-failed',
       'restore-failed',
@@ -725,9 +746,10 @@ async function confirmDialog(prompt, button) {
   return result.stdout.trim() === 'confirm';
 }
 
-function confirmPrevious(card) {
+function confirmPrevious(card, startupFailed) {
   const prompt = [
-    `Ядро не запустилось. Вернуть v${card.from} → v${card.to}?`,
+    startupFailed ? 'Ядро не запустилось.' : '',
+    `Вернуть v${card.from} → v${card.to}?`,
     card.checks === 'changed' ? 'Набор проверок изменён.' : 'Набор проверок закреплён.',
     card.boundary ? 'Подтвердите ранее утверждённые изменения границы.' : '',
     card.password ? 'Нужен пароль администратора.' : 'Пароль администратора не нужен.',
@@ -853,7 +875,23 @@ async function applyOwnerOffer(paths, updates, offer, authority) {
   await recordHandoff(paths, updates, handoff, code);
 }
 
-async function superviseOwner(paths) {
+async function restorePrevious(paths, updates, authority, startupFailed) {
+  if (!paths.state.previous) throw Error('previous-unavailable');
+  const active = await trustedMetadata(paths, paths.state.current, paths.inventory);
+  const rejected = await rejectedShas(path.join(updates, 'rejected'), paths.uid);
+  const previous = await ownOffer(paths, updates, authority, active, 'previous', rejected);
+  if (!previous) {
+    if (startupFailed) return false;
+    throw Error('previous-unavailable');
+  }
+  if (!(await confirmPrevious(previous.card, startupFailed))) return false;
+  await applyOwnerOffer(paths, updates, previous, authority);
+  if (readActivation(paths.dbPath).current === previous.card.sha) return true;
+  const failure = await readRecord(path.join(updates, 'result.json'), paths.uid);
+  throw Error(failure?.code ?? 'update-failed');
+}
+
+async function superviseOwner(paths, previousOnly) {
   const { readInstallationRelease } = require('./installation-release.js');
   const { parseHandoff, rootFence } = require('./install-production.js');
   const { stat } = require('./install-transaction.js');
@@ -875,6 +913,7 @@ async function superviseOwner(paths) {
   const interrupted = saved && parseHandoff(saved);
   if (await stat(rootFence)) {
     if (
+      previousOnly ||
       !interrupted?.password ||
       !(await confirmDialog(
         'Установка прервана. Восстановить системные файлы? Нужен пароль администратора.',
@@ -890,6 +929,7 @@ async function superviseOwner(paths) {
   if (await stat(rootFence)) throw Error('restore-failed');
   const authority = await readInstallationRelease();
   if (authority.ownerUid !== paths.uid) throw Error('boundary-state');
+  if (previousOnly) return restorePrevious(paths, updates, authority, false);
   const result = await readRecord(path.join(updates, 'result.json'), paths.uid);
   const args = releaseArgs(paths.home, paths.tmpdir, paths.node, paths.release);
   const child = spawn(paths.node, args.slice(5), {
@@ -950,17 +990,8 @@ async function superviseOwner(paths) {
   const status = await done;
   exited = true;
   if (!released || status !== 0) {
-    if (status !== 0 && !applying && paths.state.previous) {
-      const active = await trustedMetadata(paths, paths.state.current, paths.inventory);
-      const rejected = await rejectedShas(path.join(updates, 'rejected'), paths.uid);
-      const previous = await ownOffer(paths, updates, authority, active, 'previous', rejected);
-      if (previous && (await confirmPrevious(previous.card))) {
-        await applyOwnerOffer(paths, updates, previous, authority);
-        if (readActivation(paths.dbPath).current === previous.card.sha) return true;
-        const failure = await readRecord(path.join(updates, 'result.json'), paths.uid);
-        throw Error(failure?.code ?? 'update-failed');
-      }
-    }
+    if (status !== 0 && !applying && paths.state.previous)
+      return restorePrevious(paths, updates, authority, true);
     return false;
   }
   await discovery;
@@ -980,8 +1011,9 @@ module.exports = { launchAcceptedRelease, preflightAcceptedRelease, verifyInvent
 
 if (require.main === module) {
   void (async () => {
+    const previousOnly = process.argv.length === 3 && process.argv[2] === '--previous';
     if (
-      process.argv.length !== 2 ||
+      (process.argv.length !== 2 && !previousOnly) ||
       process.platform !== 'darwin' ||
       __filename !== path.join(systemRoot, 'base/launcher.js') ||
       process.execPath !== path.join(systemRoot, 'base/node')
@@ -1012,7 +1044,7 @@ if (require.main === module) {
     const relaunch = await launchAcceptedRelease({
       home,
       systemRoot,
-      supervise: superviseOwner,
+      supervise: (paths) => superviseOwner(paths, previousOnly),
     });
     if (relaunch) {
       const child = spawn(path.join(systemRoot, 'base/launch'), [], {
@@ -1032,7 +1064,9 @@ if (require.main === module) {
       const title =
         code === 'restore-failed'
           ? 'Требуется восстановление системных файлов'
-          : 'Запуск системы не завершён';
+          : code === 'previous-unavailable'
+            ? 'Предыдущая версия недоступна'
+            : 'Запуск системы не завершён';
       const child = spawn(
         '/usr/bin/osascript',
         ['-e', 'display alert ' + JSON.stringify(title) + ' message "Код ' + code + '."'],

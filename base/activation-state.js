@@ -67,7 +67,11 @@ function marker(db) {
     throw new Error('state');
   return { current: row.current_sha, previous: row.previous_sha };
 }
-module.exports = { exclusive, marker };
+function initialDatabasePaths(data, sha) {
+  return { live: path.join(data, 'core.db'), staging: path.join(data, '.initial-' + sha + '.db') };
+}
+
+module.exports = { exclusive, initialDatabasePaths, marker };
 
 function sameSelection(left, right) {
   return left?.current === right.current && left?.previous === right.previous;
