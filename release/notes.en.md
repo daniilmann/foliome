@@ -1,4 +1,4 @@
-# Foliome 1.0.0
+# Foliome 1.0.1
 
 This first local release includes a trusted kernel for preparation sessions and controlled page reads, filtered text and PNG snapshots, an owner interface, an executor channel, and decision records. It also includes installation and update components and synthetic stand and boundary tests.
 
