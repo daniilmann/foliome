@@ -2,7 +2,7 @@
 
 const fs = require('node:fs/promises');
 const { constants } = require('node:fs');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const os = require('node:os');
 const path = require('node:path');
 const { exclusive } = require('./activation-state.js');
@@ -391,11 +391,17 @@ async function main() {
   const launch = path.join(system, 'base/launch');
   if (!fileMode(await fs.lstat(launch), 0, 0o755, 0)) throw Error('owner-boundary');
   await requireAcl(launch, []);
-  if (spawnSync(launch, [], { cwd: '/', env: {}, stdio: 'inherit' }).status !== 0)
-    throw Error('owner-launch');
+  await new Promise((resolve, reject) => {
+    const child = spawn(launch, [], { cwd: '/', env: {}, stdio: 'ignore', detached: true });
+    child.once('error', () => reject(Error('owner-launch')));
+    child.once('spawn', () => {
+      child.unref();
+      resolve();
+    });
+  });
 }
 
-module.exports = { ensureKeyPair, initializeConfig, publishStage };
+module.exports = { ensureKeyPair, initializeConfig, publishStage, readPrivate };
 
 if (require.main === module) {
   main().catch((error) => {

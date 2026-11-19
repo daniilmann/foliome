@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-[ "$#" -eq 0 ] || { [ "$#" -eq 2 ] && [ "$1" = --accept-preflight ]; } || exit 1
+[ "$#" -eq 0 ] || exit 1
 
 base='/Library/Application Support/Foliome/base'
 exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$base/node" \

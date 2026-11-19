@@ -61,14 +61,17 @@ export declare function validateReleaseCandidate(
 // The package loads .ts files as CommonJS and Node strips the type declaration above.
 export declare const isReleaseCheckPath: typeof isCheckPath;
 export declare const readReleaseCheckPins: typeof checkPins;
+export declare const isReleaseNewer: typeof isNewerVersion;
 
 declare const exports: {
   validateReleaseCandidate: typeof validateReleaseCandidate;
   isReleaseCheckPath: typeof isCheckPath;
   readReleaseCheckPins: typeof checkPins;
+  isReleaseNewer: typeof isNewerVersion;
 };
 exports.isReleaseCheckPath = isCheckPath;
 exports.readReleaseCheckPins = checkPins;
+exports.isReleaseNewer = isNewerVersion;
 exports.validateReleaseCandidate = function validateReleaseCandidate(candidate, trustedPolicy) {
   const policy = readPolicy(trustedPolicy);
   if (!policy) return { ok: false, code: 'policy' };

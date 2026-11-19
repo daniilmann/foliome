@@ -179,7 +179,12 @@ function verifyRegistry(bytes, signature, entry, registry) {
 }
 
 // The caller supplies closed release entries and trusted registry metadata, not archive claims.
-function createProductionPublisherVerifier({ entries, registry, scratchRoot = os.tmpdir() }) {
+function createProductionPublisherVerifier({
+  entries,
+  registry,
+  scratchRoot = os.tmpdir(),
+  observeRuntime,
+}) {
   if (!Array.isArray(entries) || entries.length !== 3 || !registry) throw Error('configuration');
   const trustedRegistry = structuredClone(registry);
   const byName = new Map();
@@ -228,7 +233,11 @@ function createProductionPublisherVerifier({ entries, registry, scratchRoot = os
       )
         return false;
       if (entry.kind === 'playwright') verifyRegistry(bytes, signature, entry, trustedRegistry);
-      else await verifyBinary(bytes, entry, scratchRoot);
+      else {
+        const binary = await verifyBinary(bytes, entry, scratchRoot, !!observeRuntime);
+        if (observeRuntime)
+          observeRuntime(name, crypto.createHash('sha256').update(binary).digest('hex'));
+      }
       return true;
     } catch {
       return false;

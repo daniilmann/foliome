@@ -209,6 +209,8 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
   let archive;
   let workflow;
   let pinnedCheckBlobs;
+  let transportFailure;
+  let runtime;
   const result = await observeRelease(input, async (tree) => {
     const entries = new Map(tree.map((entry) => [entry.path, entry]));
     const manifestBytes = entries.get('release/manifest.json').bytes;
@@ -236,11 +238,15 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
       now: input.now,
       transport: input.transport,
       initial: input.initial,
+      productionErrors: input.productionErrors,
       verifyBase: (observed) => {
         if (!observed.manifestBytes.equals(manifestBytes)) return false;
         observations = observed;
         return true;
       },
+    }).catch((error) => {
+      transportFailure = error;
+      throw error;
     });
     if (!origin.ok) throw Error();
     workflow = {
@@ -259,7 +265,15 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
       policy.pinnedCheckBlobs = pinnedCheckBlobs;
     }
     const runtimeDependencies = packageEvidence(entries, committed, observations.registry);
-    const { artifacts, verifyPublisher } = await provideArtifacts(observations);
+    let provided;
+    try {
+      provided = await provideArtifacts(observations);
+    } catch (error) {
+      if (['network', 'network-timeout'].includes(error.message)) transportFailure = error;
+      throw error;
+    }
+    const { artifacts, verifyPublisher } = provided;
+    runtime = provided.runtime;
     if (
       artifacts.length !== artifactNames.length ||
       !artifactNames.every((name) => artifacts.some((item) => item.name === name))
@@ -293,8 +307,18 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
       },
     };
   });
+  if (transportFailure) throw transportFailure;
   if (!result.ok) return refused();
-  return { ...result, sha: input.commit, version, checks, archive, workflow, pinnedCheckBlobs };
+  return {
+    ...result,
+    sha: input.commit,
+    version,
+    checks,
+    archive,
+    workflow,
+    pinnedCheckBlobs,
+    runtime,
+  };
 }
 
 // Local test port. The repository and issuer ports are supplied by the fixture.
@@ -389,9 +413,18 @@ async function publisherArtifacts({ manifest, registry, codexBytes }, scratchRoo
     archiveName,
     sha256,
   }));
+  const runtime = {};
   return {
     artifacts: archives,
-    verifyPublisher: createProductionPublisherVerifier({ entries, registry, scratchRoot }),
+    runtime,
+    verifyPublisher: createProductionPublisherVerifier({
+      entries,
+      registry,
+      scratchRoot,
+      observeRuntime: (name, digest) => {
+        runtime[name] = digest;
+      },
+    }),
   };
 }
 
@@ -406,6 +439,7 @@ async function stageReleaseFromOrigin(selection, installed) {
   };
   try {
     const { commit, version } = selection;
+    const productionErrors = installed.productionErrors === true;
     const scratchRoot = installed.scratchRoot ?? os.tmpdir();
     const { mode, stagingRoot, policy, boundary, rejectedShas } = structuredClone(installed);
     if (
@@ -414,7 +448,7 @@ async function stageReleaseFromOrigin(selection, installed) {
       !isReleaseRepository(policy?.repository) ||
       typeof stagingRoot !== 'string' ||
       !path.isAbsolute(stagingRoot) ||
-      !['initial', 'update', 'admin'].includes(mode)
+      !['initial', 'update', 'owner', 'admin'].includes(mode)
     )
       return refused();
     if (mode === 'initial') {
@@ -427,10 +461,10 @@ async function stageReleaseFromOrigin(selection, installed) {
         return refused();
       policy.installedVersion = '0.0.0';
     } else if (
-      mode === 'update' &&
+      (mode === 'update' || mode === 'owner') &&
       (typeof version !== 'string' ||
         !versionPattern.test(version) ||
-        !boundary ||
+        (mode === 'update' && !boundary) ||
         !Array.isArray(rejectedShas) ||
         rejectedShas.includes(commit) ||
         rejectedShas.some((sha) => typeof sha !== 'string' || !shaPattern.test(sha)))
@@ -440,7 +474,19 @@ async function stageReleaseFromOrigin(selection, installed) {
     scratch = await fs.mkdtemp(path.join(scratchRoot, '.release-read-'));
     await fs.chmod(scratch, 0o700);
     const repository = path.join(scratch, 'git');
-    await fetchReleaseCommit(repository, policy.repository, commit);
+    try {
+      await fetchReleaseCommit(repository, policy.repository, commit);
+    } catch (error) {
+      if (error.code === 'ETIMEDOUT') throw Error('network-timeout');
+      const stderr = error.stderr?.toString('utf8').slice(0, 2048) ?? '';
+      if (
+        /Could not resolve host|Failed to connect|Operation timed out|(?:HTTP |URL returned error: )(?:429|5\d\d)|Connection (?:reset|closed)/i.test(
+          stderr,
+        )
+      )
+        throw Error('network');
+      throw error;
+    }
     return await compose(
       {
         repository,
@@ -449,13 +495,16 @@ async function stageReleaseFromOrigin(selection, installed) {
         policy,
         version,
         initial: mode === 'initial',
+        productionErrors,
         now: new Date().toISOString(),
       },
       (tree, manifest) => mode !== 'update' || matchingBoundary(tree, manifest, boundary),
       (observed) => publisherArtifacts(observed, scratch),
       removeScratch,
     );
-  } catch {
+  } catch (error) {
+    if (installed.productionErrors && ['network', 'network-timeout'].includes(error.message))
+      return { ok: false, code: error.message };
     return refused();
   } finally {
     if (scratch) await removeScratch().catch(() => {});

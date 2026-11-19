@@ -68,3 +68,39 @@ function marker(db) {
   return { current: row.current_sha, previous: row.previous_sha };
 }
 module.exports = { exclusive, marker };
+
+function sameSelection(left, right) {
+  return left?.current === right.current && left?.previous === right.previous;
+}
+
+/**
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{kind: 'update' | 'previous', current: string, previous: string | null}} selected
+ * @param {string} target
+ */
+function commitActivation(db, selected, target) {
+  if (
+    !shaPattern.test(target) ||
+    target === selected.current ||
+    (selected.kind !== 'update' && (selected.kind !== 'previous' || target !== selected.previous))
+  )
+    throw Error('state');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    if (!sameSelection(marker(db), selected)) throw Error('state');
+    const previous = selected.kind === 'update' ? selected.current : null;
+    if (
+      db
+        .prepare('UPDATE activation_state SET current_sha = ?, previous_sha = ? WHERE id = 1')
+        .run(target, previous).changes !== 1
+    )
+      throw Error('state');
+    db.exec('COMMIT');
+  } catch (error) {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+module.exports.sameSelection = sameSelection;
+module.exports.commitActivation = commitActivation;

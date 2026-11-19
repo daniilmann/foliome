@@ -4,9 +4,10 @@ const fs = require('node:fs/promises');
 const { constants } = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { createHash } = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { createHash, randomUUID } = require('node:crypto');
+const { spawn, execFile } = require('node:child_process');
 const { DatabaseSync, backup } = require('node:sqlite');
+const { promisify } = require('node:util');
 const { pathToFileURL } = require('node:url');
 
 const systemRoot = '/Library/Application Support/Foliome';
@@ -130,6 +131,7 @@ async function verifyInventory(release, record, sha, uid) {
   }
   await visit(release, '');
   if (remaining.size || performance.now() > deadline) throw Error('inventory');
+  return value.files;
 }
 async function installedPaths(home, root) {
   const uid = process.getuid?.();
@@ -170,12 +172,12 @@ function releaseArgs(home, tmpdir, node, release) {
   ];
 }
 
-async function launchAcceptedRelease({ home, systemRoot: root, run }) {
-  if (typeof run !== 'function') throw Error('boundary');
+async function launchAcceptedRelease({ home, systemRoot: root, run, supervise }) {
+  if (typeof run !== 'function' && typeof supervise !== 'function') throw Error('boundary');
   const { uid, data, releases, accepted, tmpdir, node, dbPath } = await installedPaths(home, root);
   await directory(tmpdir, uid);
   const { exclusive, marker } = require('./activation-state.js');
-  await exclusive(path.join(data, 'activation.json'), async () => {
+  return exclusive(path.join(data, 'activation.json'), async () => {
     const file = await openFile(dbPath, uid, Number.MAX_SAFE_INTEGER);
     try {
       const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -190,12 +192,26 @@ async function launchAcceptedRelease({ home, systemRoot: root, run }) {
       }
       if (!state || !shaPattern.test(state.current)) throw Error('state');
       const release = path.join(releases, state.current);
-      await verifyInventory(
+      const inventory = await verifyInventory(
         release,
         path.join(accepted, `${state.current}.json`),
         state.current,
         uid,
       );
+      if (supervise)
+        return await supervise({
+          uid,
+          home,
+          data,
+          releases,
+          accepted,
+          tmpdir,
+          node,
+          dbPath,
+          state,
+          release,
+          inventory,
+        });
       await run('/usr/bin/env', releaseArgs(home, tmpdir, node, release), {
         stdio: 'ignore',
         env: {},
@@ -284,7 +300,39 @@ async function runSelfCheck(args, cwd) {
   });
 }
 
-async function preflightAcceptedRelease({ home, systemRoot: root, sha, accept }) {
+// Compare the actual copy with the schema built by the accepted release's
+// ordinary store initializers. P1 has no source-approval store or schema migration.
+const schemaCheck = `
+const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
+const live = new DatabaseSync(path.join(process.env.TMPDIR, 'core.db'), {readOnly: true, defensive: true});
+const schema = new DatabaseSync(':memory:', {defensive: true});
+const records = (db) => db.prepare('SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name').all();
+const tables = ['action_browser_events', 'action_log_events', 'action_outcomes',
+  'action_snapshot_deviations', 'action_verdicts', 'activation_state', 'channel_denials',
+  'sqlite_sequence', 'text_snapshots'];
+if (JSON.stringify(records(live).filter(row => row.type === 'table').map(row => row.name)) !== JSON.stringify(tables))
+  process.exit(1);
+live.exec('PRAGMA trusted_schema = OFF');
+if (live.prepare('PRAGMA user_version').get().user_version !== 0 ||
+  live.prepare('PRAGMA application_id').get().application_id !== 0 ||
+  live.prepare('PRAGMA table_list').all().some(row => row.name === 'activation_state' && row.strict !== 1))
+  process.exit(1);
+schema.exec('CREATE TABLE activation_state (id INTEGER PRIMARY KEY CHECK (id = 1), current_sha TEXT NOT NULL, previous_sha TEXT) STRICT');
+const entry = process.argv[1];
+require(path.join(entry, 'core/adapters/store/action-protocol.ts')).createActionProtocol(schema, () => 0);
+require(path.join(entry, 'core/adapters/store/text-snapshot-store.ts')).createTextSnapshotStore(schema, () => 0);
+if (JSON.stringify(records(live)) !== JSON.stringify(records(schema))) process.exit(1);
+`;
+
+async function preflightAcceptedRelease({
+  home,
+  systemRoot: root,
+  sha,
+  accept,
+  compatible = false,
+  runtimeNode,
+}) {
   if (typeof sha !== 'string' || !shaPattern.test(sha) || typeof accept !== 'function')
     throw Error('boundary');
   const { uid, releases, accepted, node, dbPath } = await installedPaths(home, root);
@@ -312,21 +360,628 @@ async function preflightAcceptedRelease({ home, systemRoot: root, sha, accept })
     } catch {
       throw Error('copy');
     }
-    await runSelfCheck([...releaseArgs(home, data, node, release), '--self-check'], release);
+    const args = releaseArgs(home, data, runtimeNode ?? node, release);
+    await runSelfCheck([...args, '--self-check'], release);
+    if (compatible) {
+      try {
+        await runSelfCheck([...args.slice(0, -1), '-e', schemaCheck, release], release);
+      } catch (error) {
+        if (error.message === 'self-check-timeout') throw error;
+        throw Error('incompatible');
+      }
+    }
   } finally {
     await fs.rm(scratch, { recursive: true, force: true });
   }
+}
+
+async function atomicRecord(file, value) {
+  const { syncDirectory } = require('./install-transaction.js');
+  const temporary = `${file}.${randomUUID()}`;
+  try {
+    const handle = await fs.open(temporary, 'wx', 0o600);
+    try {
+      await handle.writeFile(JSON.stringify(value));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(temporary, file);
+    await syncDirectory(path.dirname(file));
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+async function makePrivate(dir, uid) {
+  await fs.mkdir(dir, { mode: 0o700 }).catch((error) => {
+    if (error.code !== 'EEXIST') throw error;
+  });
+  await directory(dir, uid);
+}
+
+function readActivation(dbPath, write) {
+  const { marker } = require('./activation-state.js');
+  const db = new DatabaseSync(dbPath, { readOnly: !write, defensive: true });
+  try {
+    db.exec('PRAGMA trusted_schema = OFF');
+    const state = marker(db);
+    if (!state) throw Error('boundary-state');
+    return write ? write(db, state) : state;
+  } finally {
+    db.close();
+  }
+}
+
+async function readRecord(file, uid, limit = 4096) {
+  try {
+    return JSON.parse((await bytes(file, uid, limit)).toString('utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function trustedMetadata(paths, sha, files) {
+  const release = path.join(paths.releases, sha);
+  files ??= await verifyInventory(
+    release,
+    path.join(paths.accepted, sha + '.json'),
+    sha,
+    paths.uid,
+  );
+  const raw = await bytes(path.join(release, 'release/manifest.json'), paths.uid, 65536);
+  if (createHash('sha256').update(raw).digest('hex') !== files['release/manifest.json'])
+    throw Error('receipt');
+  return { manifest: JSON.parse(raw.toString('utf8')), files };
+}
+
+const retryable = [
+  'admin-canceled',
+  'admin-timeout',
+  'network',
+  'network-timeout',
+  'self-check-timeout',
+];
+
+function ownerCode(error) {
+  const code = error.message;
+  if (
+    [
+      'self-check',
+      'incompatible',
+      'release-verification',
+      'boundary-failed',
+      'restore-failed',
+      ...retryable,
+    ].includes(code)
+  )
+    return code;
+  if (/^boundary-/.test(code)) return 'boundary-failed';
+  if (/^release-|^receipt$/.test(code)) return 'release-verification';
+  return 'update-failed';
+}
+
+async function rejectedShas(dir, uid) {
+  const rejected = [];
+  for await (const entry of await fs.opendir(dir)) {
+    if (entry.isFile() && /^[a-f0-9]{40}\.[a-f0-9-]{36}$/.test(entry.name)) {
+      // An interrupted atomic write left an unpublished record.
+      await fs.unlink(path.join(dir, entry.name));
+      continue;
+    }
+    if (rejected.length >= 10000 || !entry.isFile() || !shaPattern.test(entry.name))
+      throw Error('boundary-state');
+    const sha = await readRecord(path.join(dir, entry.name), uid, 128);
+    if (sha !== entry.name) throw Error('boundary-state');
+    rejected.push(sha);
+  }
+  return rejected;
+}
+
+async function releaseProof(paths, updates, sha, authority, files) {
+  const proofFile = path.join(updates, sha + '.json');
+  const proof = await readRecord(proofFile, paths.uid);
+  if (proof) return proof;
+  if (sha !== authority.initialSha || sha !== authority.sha) throw Error('release-verification');
+  const { installedRuntime } = require('./install-production.js');
+  const initial = {
+    checks: 'pinned',
+    workflow: authority.initialWorkflow,
+    runtime: await installedRuntime(authority),
+  };
+  if (files['base/system-install-layout.js'] !== initial.runtime.planner)
+    throw Error('release-verification');
+  await atomicRecord(proofFile, initial);
+  return initial;
+}
+
+function boundaryChanges(from, to) {
+  const { isReleaseCheckPath } = require('./release-policy.ts');
+  const covered =
+    /^(?:base|system|executor|core\/adapters\/(?:browser|channel|system|ui|executor|version|update)|core\/domain|agents|\.claude)\/|^(?:README\.md|core\/(?:main|system-entrypoint)\.ts)$/;
+  return [...new Set([...Object.keys(from), ...Object.keys(to)])].some(
+    (name) => (isReleaseCheckPath(name) || covered.test(name)) && from[name] !== to[name],
+  );
+}
+
+function descriptor(kind, sha, from, to, checks, password, boundary) {
+  return {
+    kind,
+    sha,
+    from: from.version,
+    to: to.version,
+    checks,
+    password,
+    boundary,
+    notes: kind === 'update' ? to.notesRu : '',
+    node: [process.versions.node, kind === 'previous' ? process.versions.node : to.node.version],
+    codex: [from.codex.version, to.codex.version],
+    playwright: [from.playwrightCore.version, to.playwrightCore.version],
+  };
+}
+
+async function stageOwnerRelease(paths, updates, selection, authority, activeVersion, rejected) {
+  const { stageReleaseFromOrigin } = require('./release-pipeline.js');
+  const { releasePolicy, keySetSha256 } = require('./installation-release.js');
+  const { materializeRelease } = require('./release-materialization.js');
+  const { publishStage, readPrivate } = require('./first-install.js');
+  const { ownerPayload, needsRoot } = require('./install-production.js');
+  const { prepare } = require('./install-owner.js');
+  const stageParent = path.join(paths.data, 'install-staging');
+  await directory(stageParent, paths.uid);
+  const scratch = await fs.mkdtemp(path.join(stageParent, '.owner-'));
+  try {
+    const stage = await stageReleaseFromOrigin(selection, {
+      mode: 'owner',
+      stagingRoot: scratch,
+      scratchRoot: scratch,
+      policy: releasePolicy(activeVersion, authority),
+      rejectedShas: rejected,
+      productionErrors: true,
+    });
+    if (!stage.ok) throw Error(stage.code ?? 'release-verification');
+    const manifest = JSON.parse(
+      (await readPrivate(path.join(stage.stagingDir, 'release/manifest.json'), 65536)).toString(
+        'utf8',
+      ),
+    );
+    if (
+      manifest.securityFix !== null ||
+      manifest.securityNarrowing !== null ||
+      stage.tree.some(({ path }) => /^(system|executor)\//i.test(path))
+    )
+      throw Error('incompatible');
+    const password = await needsRoot(
+      { stage, manifest, runtime: stage.runtime, kind: 'update' },
+      authority,
+    );
+    const target = path.join(scratch, 'materialized');
+    await fs.mkdir(target, { mode: 0o700 });
+    const materialized = await materializeRelease({
+      stage,
+      approval: stage.sha,
+      releasesRoot: target,
+    });
+    if (!materialized.ok) throw Error('release-verification');
+    const initialStage = path.join(stageParent, authority.initialSha);
+    for (const dir of [initialStage, path.join(initialStage, '.install-keys')])
+      await directory(dir, paths.uid);
+    const keys = Object.fromEntries(
+      await Promise.all(
+        ['owner', 'launch', 'dev'].map(async (kind) => [
+          kind,
+          (await readPrivate(path.join(initialStage, '.install-keys', kind + '.pub'), 256))
+            .toString('utf8')
+            .trimEnd(),
+        ]),
+      ),
+    );
+    if (keySetSha256(keys) !== authority.keySetSha256) throw Error('boundary-state');
+    await publishStage(stageParent, stage, keys);
+    await prepare(
+      { sha: stage.sha, ...paths, app: path.dirname(paths.releases) },
+      await ownerPayload(materialized),
+    );
+    const planner = stage.tree.find(({ path }) => path === 'base/system-install-layout.js').sha256;
+    const proof = {
+      checks: stage.checks,
+      workflow: stage.workflow,
+      runtime: { ...stage.runtime, planner },
+    };
+    await atomicRecord(path.join(updates, stage.sha + '.json'), proof);
+    return { password, proof, tree: stage.tree, ...(await trustedMetadata(paths, stage.sha)) };
+  } finally {
+    await fs.rm(scratch, { recursive: true, force: true });
+  }
+}
+
+async function ownOffer(paths, updates, authority, active, kind, rejected) {
+  const { releaseTags } = require('./release-origin.js');
+  const { isReleaseNewer } = require('./installation-release.js');
+  const { needsRoot, parseHandoff } = require('./install-production.js');
+  let selection;
+  if (kind === 'update') {
+    for (const tag of await releaseTags()) {
+      if (
+        tag.commit !== paths.state.current &&
+        !rejected.includes(tag.commit) &&
+        isReleaseNewer(tag.version, selection?.version ?? active.manifest.version)
+      )
+        selection = tag;
+    }
+  } else selection = { commit: paths.state.previous };
+  if (!selection?.commit || rejected.includes(selection.commit)) return null;
+  let target;
+  try {
+    if (kind === 'update') {
+      target = await stageOwnerRelease(
+        paths,
+        updates,
+        selection,
+        authority,
+        active.manifest.version,
+        rejected,
+      );
+    } else {
+      const metadata = await trustedMetadata(paths, selection.commit);
+      const proof = await releaseProof(paths, updates, selection.commit, authority, metadata.files);
+      if (!isReleaseNewer(active.manifest.version, metadata.manifest.version))
+        throw Error('incompatible');
+      const tree = [
+        {
+          path: 'base/system-install-layout.js',
+          sha256: metadata.files['base/system-install-layout.js'],
+        },
+      ];
+      const password = await needsRoot(
+        {
+          stage: { tree },
+          manifest: metadata.manifest,
+          kind,
+          runtime: proof.runtime,
+        },
+        authority,
+      );
+      target = { ...metadata, proof, password, tree };
+    }
+  } catch (error) {
+    const code = ownerCode(error);
+    if (
+      kind === 'update' &&
+      ['release-verification', 'incompatible', 'boundary-failed'].includes(code)
+    )
+      await atomicRecord(path.join(updates, 'rejected', selection.commit), selection.commit);
+    throw error;
+  }
+  const card = descriptor(
+    kind,
+    selection.commit,
+    active.manifest,
+    target.manifest,
+    target.proof.checks,
+    target.password,
+    target.password || boundaryChanges(active.files, target.files),
+  );
+  return {
+    card,
+    runtime: target.proof.runtime,
+    files: target.files,
+    manifest: target.manifest,
+    tree: target.tree,
+    handoff: parseHandoff({
+      kind,
+      sha: selection.commit,
+      ...paths.state,
+      version: card.to,
+      fromVersion: card.from,
+      workflow: target.proof.workflow,
+      password: card.password,
+    }),
+  };
+}
+
+async function askAdministrator(sha) {
+  if (!shaPattern.test(sha)) throw Error('boundary-state');
+  const command =
+    '/usr/bin/env -i "' +
+    path.join(systemRoot, 'base/node') +
+    '" "' +
+    path.join(systemRoot, 'base/install-root.js') +
+    '" ' +
+    sha;
+  const script =
+    'with timeout of 600 seconds\ntry\ndo shell script ' +
+    JSON.stringify(command) +
+    ' with administrator privileges\nreturn "ok"\non error messageText number errorNumber\n' +
+    'if errorNumber = -128 then return "admin-canceled"\n' +
+    'if errorNumber = -1712 then return "admin-timeout"\nreturn messageText\nend try\nend timeout';
+  const result = await promisify(execFile)('/usr/bin/osascript', ['-e', script], {
+    cwd: '/',
+    env: {},
+    maxBuffer: 4096,
+  });
+  const code = result.stdout.trim();
+  if (code !== 'ok') {
+    if ([...retryable, 'release-verification', 'restore-failed'].includes(code)) throw Error(code);
+    throw Error('boundary-failed');
+  }
+}
+
+async function confirmDialog(prompt, button) {
+  const script =
+    'try\n' +
+    'display dialog ' +
+    JSON.stringify(prompt) +
+    ' buttons {"Отмена", ' +
+    JSON.stringify(button) +
+    '} default button 1 cancel button 1\nreturn "confirm"\non error number -128\nreturn "cancel"\nend try';
+  const result = await promisify(execFile)('/usr/bin/osascript', ['-e', script], {
+    cwd: '/',
+    env: {},
+    maxBuffer: 4096,
+    timeout: 120000,
+  });
+  return result.stdout.trim() === 'confirm';
+}
+
+function confirmPrevious(card) {
+  const prompt = [
+    `Ядро не запустилось. Вернуть v${card.from} → v${card.to}?`,
+    card.checks === 'changed' ? 'Набор проверок изменён.' : 'Набор проверок закреплён.',
+    card.boundary ? 'Подтвердите ранее утверждённые изменения границы.' : '',
+    card.password ? 'Нужен пароль администратора.' : 'Пароль администратора не нужен.',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return confirmDialog(prompt, 'Вернуть и подтвердить');
+}
+
+async function recordHandoff(paths, updates, handoff, code) {
+  const { activationCommitted, rootFence } = require('./install-production.js');
+  const { stat, syncDirectory } = require('./install-transaction.js');
+  if (await stat(rootFence)) throw Error('restore-failed');
+  const { sameSelection } = require('./activation-state.js');
+  const marker = readActivation(paths.dbPath);
+  if (activationCommitted(marker, handoff)) {
+    if (handoff.kind === 'previous')
+      await atomicRecord(path.join(updates, 'rejected', handoff.current), handoff.current);
+    await atomicRecord(path.join(updates, 'result.json'), {
+      code: handoff.kind === 'previous' ? 'restored' : 'updated',
+      version: handoff.version,
+      sha: marker.current,
+    });
+  } else {
+    if (!sameSelection(marker, handoff)) throw Error('restore-failed');
+    if (
+      handoff.kind === 'update' &&
+      ['self-check', 'incompatible', 'release-verification', 'boundary-failed'].includes(code)
+    )
+      await atomicRecord(path.join(updates, 'rejected', handoff.sha), handoff.sha);
+    await atomicRecord(path.join(updates, 'result.json'), { code, sha: marker.current });
+  }
+  await fs.rm(path.join(updates, 'handoff.json'), { force: true });
+  await syncDirectory(updates);
+}
+
+async function applyOwnerOffer(paths, updates, offer, authority) {
+  const { handoff } = offer;
+  const { sameSelection, commitActivation } = require('./activation-state.js');
+  const { isReleaseNewer } = require('./installation-release.js');
+  const { rootFence, needsRoot, installedRuntime } = require('./install-production.js');
+  const { stat } = require('./install-transaction.js');
+  if (
+    !sameSelection(readActivation(paths.dbPath), handoff) ||
+    (await stat(rootFence)) ||
+    (handoff.kind === 'update' &&
+      (!isReleaseNewer(handoff.version, handoff.fromVersion) ||
+        (await rejectedShas(path.join(updates, 'rejected'), paths.uid)).includes(handoff.sha)))
+  )
+    throw Error('boundary-state');
+  const { readInstallationRelease } = require('./installation-release.js');
+  const now = await readInstallationRelease();
+  if (
+    JSON.stringify(now) !== JSON.stringify(authority) ||
+    (await needsRoot(
+      {
+        stage: { tree: offer.tree },
+        manifest: offer.manifest,
+        runtime: offer.runtime,
+        kind: handoff.kind,
+      },
+      now,
+    )) !== handoff.password
+  )
+    throw Error('boundary-state');
+  await atomicRecord(path.join(updates, 'handoff.json'), handoff);
+  let code = 'update-failed';
+  let runtimeWork;
+  try {
+    const check = (sha, runtimeNode) =>
+      preflightAcceptedRelease({
+        home: paths.home,
+        systemRoot,
+        sha,
+        accept: (requested) => requested === sha,
+        compatible: true,
+        runtimeNode,
+      });
+    let runtimeNode;
+    if (handoff.kind === 'update') {
+      // Build the same known schema and ensure the selected runtime also supports rollback.
+      if (offer.runtime.node !== (await installedRuntime(authority)).node) {
+        const { verifiedRuntime } = require('./publisher-verification.js');
+        runtimeWork = await fs.mkdtemp(path.join(paths.tmpdir, 'runtime-'));
+        const archive = path.join(
+          paths.data,
+          'install-staging',
+          handoff.sha,
+          '.release-artifacts/node',
+        );
+        const binary = await verifiedRuntime(
+          await bytes(archive, paths.uid, 128 * 1024 * 1024),
+          'node',
+          offer.manifest.node,
+          runtimeWork,
+        );
+        if (createHash('sha256').update(binary).digest('hex') !== offer.runtime.node)
+          throw Error('release-verification');
+        runtimeNode = path.join(runtimeWork, 'node');
+        await fs.writeFile(runtimeNode, binary, { flag: 'wx', mode: 0o700 });
+      }
+      await check(handoff.current, runtimeNode);
+    }
+    await check(handoff.sha, runtimeNode);
+    for (const [sha, expected] of [
+      [handoff.sha, offer.files],
+      [handoff.current, paths.inventory],
+    ]) {
+      const { files } = await trustedMetadata(paths, sha);
+      if (
+        Object.keys(files).length !== Object.keys(expected).length ||
+        Object.entries(expected).some(([name, digest]) => files[name] !== digest)
+      )
+        throw Error('release-verification');
+    }
+    if (handoff.password) await askAdministrator(handoff.sha);
+    else readActivation(paths.dbPath, (db) => commitActivation(db, handoff, handoff.sha));
+  } catch (error) {
+    code = ownerCode(error);
+  } finally {
+    if (runtimeWork) await fs.rm(runtimeWork, { recursive: true, force: true });
+  }
+  await recordHandoff(paths, updates, handoff, code);
+}
+
+async function superviseOwner(paths) {
+  const { readInstallationRelease } = require('./installation-release.js');
+  const { parseHandoff, rootFence } = require('./install-production.js');
+  const { stat } = require('./install-transaction.js');
+  const { requireAcl } = require('./install-platform.js');
+  for (const directory of [
+    paths.data,
+    paths.accepted,
+    path.dirname(paths.releases),
+    paths.releases,
+    paths.tmpdir,
+  ])
+    await requireAcl(directory, []);
+  const updates = path.join(paths.data, 'updates');
+  await makePrivate(updates, paths.uid);
+  await makePrivate(path.join(updates, 'rejected'), paths.uid);
+  await requireAcl(updates, []);
+  await requireAcl(path.join(updates, 'rejected'), []);
+  const saved = await readRecord(path.join(updates, 'handoff.json'), paths.uid);
+  const interrupted = saved && parseHandoff(saved);
+  if (await stat(rootFence)) {
+    if (
+      !interrupted?.password ||
+      !(await confirmDialog(
+        'Установка прервана. Восстановить системные файлы? Нужен пароль администратора.',
+        'Восстановить',
+      ))
+    )
+      throw Error('restore-failed');
+    await askAdministrator(interrupted.sha);
+    if (await stat(rootFence)) throw Error('restore-failed');
+    return true;
+  }
+  if (interrupted) await recordHandoff(paths, updates, interrupted, 'update-failed');
+  if (await stat(rootFence)) throw Error('restore-failed');
+  const authority = await readInstallationRelease();
+  if (authority.ownerUid !== paths.uid) throw Error('boundary-state');
+  const result = await readRecord(path.join(updates, 'result.json'), paths.uid);
+  const args = releaseArgs(paths.home, paths.tmpdir, paths.node, paths.release);
+  const child = spawn(paths.node, args.slice(5), {
+    cwd: '/',
+    env: { HOME: paths.home, PATH: '/usr/bin:/bin:/usr/sbin:/sbin', TMPDIR: paths.tmpdir },
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+  });
+  let ready = false;
+  let applying;
+  let released = false;
+  let exited = false;
+  const offers = new Map();
+  const send = (message) => {
+    if (child.connected) child.send(message, () => {});
+  };
+  const done = new Promise((resolve) => {
+    child.once('error', () => resolve(null));
+    child.once('close', resolve);
+  });
+  async function discover() {
+    const active = await trustedMetadata(paths, paths.state.current, paths.inventory);
+    await releaseProof(paths, updates, paths.state.current, authority, active.files);
+    const rejected = await rejectedShas(path.join(updates, 'rejected'), paths.uid);
+    // Publish a usable previous-release card without waiting for GitHub.
+    for (const kind of ['previous', 'update']) {
+      if (exited || applying) return;
+      try {
+        const offer = await ownOffer(paths, updates, authority, active, kind, rejected);
+        if (offer && !exited && !applying) {
+          offers.set(offer.card.sha, offer);
+          send({ type: 'release-card', card: offer.card });
+        }
+      } catch (error) {
+        if (!result) send({ type: 'release-result', code: ownerCode(error) });
+      }
+    }
+  }
+  let discovery;
+  child.on('message', (message) => {
+    if (message?.type === 'release-ready' && !ready) {
+      ready = true;
+      if (result?.sha === paths.state.current)
+        send({ type: 'release-result', code: result.code, version: result.version });
+      discovery = discover().catch((error) => {
+        if (!result) send({ type: 'release-result', code: ownerCode(error) });
+      });
+    } else if (message?.type === 'release-accept' && typeof message.sha === 'string') {
+      const offer = offers.get(message.sha);
+      if (offer && !applying) {
+        applying = offer;
+        offers.clear();
+        send({ type: 'release-handoff', accepted: true, sha: message.sha });
+      } else send({ type: 'release-handoff', accepted: false, sha: message.sha });
+    } else if (message?.type === 'release-closed' && message.sha === applying?.card.sha) {
+      released = true;
+    }
+  });
+  const status = await done;
+  exited = true;
+  if (!released || status !== 0) {
+    if (status !== 0 && !applying && paths.state.previous) {
+      const active = await trustedMetadata(paths, paths.state.current, paths.inventory);
+      const rejected = await rejectedShas(path.join(updates, 'rejected'), paths.uid);
+      const previous = await ownOffer(paths, updates, authority, active, 'previous', rejected);
+      if (previous && (await confirmPrevious(previous.card))) {
+        await applyOwnerOffer(paths, updates, previous, authority);
+        if (readActivation(paths.dbPath).current === previous.card.sha) return true;
+        const failure = await readRecord(path.join(updates, 'result.json'), paths.uid);
+        throw Error(failure?.code ?? 'update-failed');
+      }
+    }
+    return false;
+  }
+  await discovery;
+  try {
+    await applyOwnerOffer(paths, updates, applying, authority);
+  } catch (error) {
+    if (await stat(rootFence)) throw Error('restore-failed');
+    await atomicRecord(path.join(updates, 'result.json'), {
+      code: ownerCode(error),
+      sha: paths.state.current,
+    });
+  }
+  return true;
 }
 
 module.exports = { launchAcceptedRelease, preflightAcceptedRelease, verifyInventory };
 
 if (require.main === module) {
   void (async () => {
-    const argv = process.argv.slice(2);
-    const preflight =
-      argv.length === 2 && argv[0] === '--accept-preflight' && shaPattern.test(argv[1]);
     if (
-      (argv.length && !preflight) ||
+      process.argv.length !== 2 ||
       process.platform !== 'darwin' ||
       __filename !== path.join(systemRoot, 'base/launcher.js') ||
       process.execPath !== path.join(systemRoot, 'base/node')
@@ -354,37 +1009,37 @@ if (require.main === module) {
     }
     process.umask(0o077);
     const home = os.userInfo().homedir;
-    if (preflight) {
-      try {
-        await preflightAcceptedRelease({
-          home,
-          systemRoot,
-          sha: argv[1],
-          accept: (sha) => sha === argv[1],
-        });
-      } catch (error) {
-        const codes = ['acceptance', 'receipt', 'copy', 'self-check', 'self-check-timeout'];
-        process.stderr.write(`${codes.includes(error.message) ? error.message : 'boundary'}\n`);
-        process.exitCode = 1;
-        return;
-      }
-      process.stdout.write('ok\n');
-      return;
-    }
-    await launchAcceptedRelease({
+    const relaunch = await launchAcceptedRelease({
       home,
       systemRoot,
-      run: (command, args, options) =>
-        new Promise((resolve, reject) => {
-          const child = spawn(command, args, options);
-          child.once('error', reject);
-          child.once('spawn', () => {
-            child.unref();
-            resolve();
-          });
-        }),
+      supervise: superviseOwner,
     });
-  })().catch(() => {
+    if (relaunch) {
+      const child = spawn(path.join(systemRoot, 'base/launch'), [], {
+        cwd: '/',
+        env: {},
+        stdio: 'ignore',
+        detached: true,
+      });
+      child.once('error', () => {
+        process.exitCode = 1;
+      });
+      child.once('spawn', () => child.unref());
+    }
+  })().catch((error) => {
+    if (process.platform === 'darwin' && __filename === path.join(systemRoot, 'base/launcher.js')) {
+      const code = ownerCode(error);
+      const title =
+        code === 'restore-failed'
+          ? 'Требуется восстановление системных файлов'
+          : 'Запуск системы не завершён';
+      const child = spawn(
+        '/usr/bin/osascript',
+        ['-e', 'display alert ' + JSON.stringify(title) + ' message "Код ' + code + '."'],
+        { cwd: '/', env: {}, stdio: 'ignore' },
+      );
+      child.on('error', () => {});
+    }
     process.exitCode = 1;
   });
 }

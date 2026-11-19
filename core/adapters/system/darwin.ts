@@ -498,6 +498,7 @@ async function runInstalledImpl(run: typeof runProgram) {
           return createInstalledKernel({
             ...options,
             configureSocket: socketConfiguration(owner.uid, installed.executorName),
+            supervisedRelease: process.connected === true,
           });
         },
       },

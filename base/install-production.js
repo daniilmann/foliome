@@ -3,8 +3,9 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const { spawn } = require('node:child_process');
 const { serialize } = require('node:v8');
-const { exclusive } = require('./activation-state.js');
+const { exclusive, sameSelection } = require('./activation-state.js');
 const { installationJournal, syncDirectory } = require('./install-transaction.js');
 const { planInstalledSystemInstall } = require('./system-install-layout.js');
 const { stageReleaseFromOrigin } = require('./release-pipeline.js');
@@ -51,6 +52,7 @@ const {
 
 const authority = path.join(root, 'installation-release.json');
 const admin = path.join(root, '.install');
+const rootFence = path.join(root, '.update-pending');
 const node = path.join(base, 'node');
 const sshDirectory = path.dirname(sshProfile);
 const packages = ['node', 'codex', 'playwrightCore'];
@@ -86,19 +88,22 @@ async function trustedFile(file, mode) {
   await requireAcl(file, []);
 }
 
-async function observe(sha, current, scratch, owner, initialInstall) {
-  const selectedVersion = current?.sha === sha ? '0.0.0' : (current?.version ?? '0.0.0');
+async function observe(sha, current, scratch, owner, initialInstall, handoff) {
+  const selectedVersion = handoff?.kind === 'update' ? handoff.fromVersion : '0.0.0';
   const evidence = await stageReleaseFromOrigin(
-    { commit: sha },
+    { commit: sha, version: handoff?.version },
     {
       mode: current ? 'admin' : 'initial',
       approvedInitialSha: current ? undefined : sha,
       stagingRoot: scratch,
       scratchRoot: scratch,
       policy: releasePolicy(selectedVersion, current),
+      productionErrors: true,
     },
   );
-  if (!evidence.ok || evidence.sha !== sha) throw Error('release-verification');
+  if (!evidence.ok || evidence.sha !== sha) throw Error(evidence.code ?? 'release-verification');
+  if (handoff && !sameWorkflow(evidence.workflow, handoff.workflow))
+    throw Error('release-verification');
   if (
     current?.initialSha === sha &&
     (evidence.checks !== 'pinned' ||
@@ -111,23 +116,10 @@ async function observe(sha, current, scratch, owner, initialInstall) {
   const get = (relative, mode, limit) =>
     readOwnerStage(owner.home, owner.uid, prefix + relative, mode, limit);
   const accepted = await fs.mkdtemp(path.join(scratch, 'accepted-'));
-  const observed = new Map(evidence.tree.map((entry) => [entry.path, entry]));
-  const sourceNames = evidence.tree.filter((entry) => entry.path.toLowerCase().startsWith('base/'));
-  if (sourceNames.some((entry) => !trustedSource.has(entry.path))) throw Error('boundary-base');
-  let replacesBase = false;
-  for (const [name, installed] of trustedSource) {
-    const entry = observed.get(name);
-    await trustedFile(installed, name === 'base/launch' ? 0o755 : 0o644);
-    if (!entry || entry.mode !== '100644') throw Error('boundary-base');
-    if (hash(await fs.readFile(installed)) !== entry.sha256) {
-      // The dispatcher is a separate trust anchor, installed by the administrator.
-      if (name === 'base/bootstrap-root.pl') throw Error('boundary-base');
-      replacesBase = true;
-    }
-  }
+  const replacesBase = await compareBase(evidence.tree);
   for (const { path: relative, sha256: expected, mode } of evidence.tree) {
     const privateMode = mode === '100755' ? 0o700 : 0o600;
-    const bytes = await get(relative, initialInstall ? 0o600 : privateMode, 8 * 1024 * 1024);
+    const bytes = await get(relative, 0o600, 8 * 1024 * 1024);
     if (hash(bytes) !== expected) throw Error('release-stage');
     const target = path.join(accepted, relative);
     await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
@@ -156,10 +148,223 @@ async function observe(sha, current, scratch, owner, initialInstall) {
   );
   if (
     manifest.version !== evidence.version ||
-    (current?.sha === sha && manifest.version !== current.version)
+    (initialInstall && current && manifest.version !== current.version)
   )
     throw Error('release-verification');
   return { stage: { ...evidence, stagingDir: accepted }, keys, manifest, replacesBase };
+}
+
+function sameWorkflow(left, right) {
+  return left.id === right.id && left.runId === right.runId && left.attempt === right.attempt;
+}
+
+async function compareBase(tree) {
+  const observed = new Map(tree.map((entry) => [entry.path, entry]));
+  if (
+    tree.some(
+      ({ path: name }) => name.toLowerCase().startsWith('base/') && !trustedSource.has(name),
+    )
+  )
+    throw Error('boundary-base');
+  let changed = false;
+  for (const [name, installed] of trustedSource) {
+    const entry = observed.get(name);
+    await trustedFile(installed, name === 'base/launch' ? 0o755 : 0o644);
+    if (!entry || entry.mode !== '100644') throw Error('boundary-base');
+    if (hash(await fs.readFile(installed)) !== entry.sha256) {
+      if (name === 'base/bootstrap-root.pl') throw Error('boundary-base');
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+const plannerPath = 'base/system-install-layout.js';
+
+async function installedRuntime(current) {
+  const runtime = {};
+  const paths = {
+    node,
+    codex: path.join(root, 'executor/share', current.sha, 'codex'),
+    planner: path.join(base, 'system-install-layout.js'),
+  };
+  for (const [kind, file] of Object.entries(paths)) {
+    await rootParents(path.dirname(file));
+    await trustedFile(file, kind === 'planner' ? 0o644 : 0o755);
+    const opened = await fs.open(file, 'r');
+    try {
+      if ((await opened.stat()).size > maxArtifact) throw Error('boundary-base');
+      const digest = createHash('sha256');
+      for await (const chunk of opened.createReadStream({ autoClose: false })) digest.update(chunk);
+      runtime[kind] = digest.digest('hex');
+      if (current.runtime && runtime[kind] !== current.runtime[kind]) throw Error('boundary-base');
+    } finally {
+      await opened.close();
+    }
+  }
+  await rootParents(path.dirname(pfFile));
+  await trustedFile(pfFile, 0o644);
+  if ((await fs.lstat(pfFile)).size > 65536 || hash(await fs.readFile(pfFile)) !== current.pfDigest)
+    throw Error('boundary-pf');
+  return runtime;
+}
+
+async function needsRoot({ stage, manifest, runtime, kind }, current) {
+  const installed = await installedRuntime(current);
+  if (stage.tree.find((entry) => entry.path === plannerPath)?.sha256 !== installed.planner)
+    throw Error('incompatible');
+  const baseChanged =
+    kind === 'update' && ((await compareBase(stage.tree)) || runtime.node !== installed.node);
+  const rootChanged = runtime.codex !== installed.codex;
+  if (
+    kind === 'update' &&
+    ((baseChanged && !manifest.baseChange) || (rootChanged && !manifest.rootChange))
+  )
+    throw Error('boundary-base');
+  return baseChanged || rootChanged;
+}
+
+const handoffRelative = 'Library/Application Support/Foliome/data/updates/handoff.json';
+const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+function parseHandoff(value) {
+  const fields = [
+    'kind',
+    'sha',
+    'current',
+    'previous',
+    'version',
+    'fromVersion',
+    'workflow',
+    'password',
+  ];
+  if (
+    !value ||
+    Object.keys(value).length !== fields.length ||
+    fields.some((key) => !Object.hasOwn(value, key)) ||
+    !['update', 'previous'].includes(value.kind) ||
+    typeof value.password !== 'boolean' ||
+    typeof value.sha !== 'string' ||
+    !shaPattern.test(value.sha) ||
+    typeof value.current !== 'string' ||
+    !shaPattern.test(value.current) ||
+    value.current === value.sha ||
+    (value.previous !== null &&
+      (typeof value.previous !== 'string' ||
+        !shaPattern.test(value.previous) ||
+        value.previous === value.current)) ||
+    (value.kind === 'previous' && value.sha !== value.previous) ||
+    ![value.version, value.fromVersion].every(
+      (version) =>
+        typeof version === 'string' && version.length <= 64 && versionPattern.test(version),
+    ) ||
+    !value.workflow ||
+    Object.keys(value.workflow).length !== 3 ||
+    !['id', 'runId', 'attempt'].every(
+      (key) => Number.isSafeInteger(value.workflow[key]) && value.workflow[key] > 0,
+    )
+  )
+    throw Error('boundary-state');
+  return value;
+}
+
+async function activationStatus(owner, sha) {
+  const result = await asUser(owner, 'activation-status', sha);
+  return JSON.parse(result.toString('utf8'));
+}
+
+function activationCommitted(state, selection) {
+  return (
+    state.current === selection.sha &&
+    state.previous === (selection.kind === 'update' ? selection.current : null)
+  );
+}
+
+async function recoverActivation(selection) {
+  parseHandoff(selection);
+  const owner = await localOwner();
+  const state = await activationStatus(owner, selection.sha);
+  return activationDecision(state, selection);
+}
+
+function activationDecision(state, selection) {
+  if (sameSelection(state, selection)) return false;
+  if (activationCommitted(state, selection)) return true;
+  throw Error('restore-failed');
+}
+
+async function settleSystem(journal, resolve = recoverActivation) {
+  try {
+    await journal.recover(restoreExternal, resolve);
+    if (await stat(rootFence)) {
+      await trustedFile(rootFence, 0o644);
+      await fs.unlink(rootFence);
+      await syncDirectory(root);
+    }
+  } catch {
+    throw Error('restore-failed');
+  }
+}
+
+async function ownerCommit(owner, selection) {
+  const child = spawn(
+    node,
+    ['--disable-sigusr1', path.join(base, 'install-owner.js'), 'activate-update', selection.sha],
+    {
+      cwd: '/',
+      env: {},
+      uid: owner.uid,
+      gid: owner.gid,
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    },
+  );
+  const waiting = Promise.withResolvers();
+  const completed = Promise.withResolvers();
+  const exited = new Promise((resolve) => child.once('close', resolve));
+  function fail() {
+    waiting.resolve(false);
+    completed.resolve(null);
+  }
+  const timer = setTimeout(() => {
+    child.kill('SIGKILL');
+    fail();
+  }, 30000);
+  child.once('error', fail);
+  child.once('close', () => {
+    clearTimeout(timer);
+    fail();
+  });
+  child.on('message', (message) => {
+    if (message === 'listening')
+      child.send(selection, (error) => {
+        if (error) fail();
+      });
+    else if (message === 'ready') waiting.resolve(true);
+    else if (message?.state) completed.resolve(message.state);
+  });
+  if (!(await waiting.promise)) {
+    child.kill('SIGKILL');
+    await exited;
+    throw Error('boundary-state');
+  }
+  let requested = false;
+  return {
+    async select(operation) {
+      if (!requested) {
+        requested = true;
+        if (!child.connected) fail();
+        else
+          child.send(operation, (error) => {
+            if (error) fail();
+          });
+      }
+      return completed.promise;
+    },
+    async close() {
+      child.kill();
+      await exited;
+    },
+  };
 }
 
 async function approvedState() {
@@ -318,11 +523,11 @@ async function ownerPayload(materialized, settings) {
     if (hash(bytes) !== expected) throw Error('release-stage');
     files.push({ path: relative, mode: mode === '100755' ? 0o700 : 0o600, hash: expected, bytes });
   }
-  return serialize({ files, settings });
+  return { files, settings };
 }
 
 async function asUser(person, mode, sha, input) {
-  await run(node, ['--disable-sigusr1', path.join(base, 'install-owner.js'), mode, sha], {
+  return run(node, ['--disable-sigusr1', path.join(base, 'install-owner.js'), mode, sha], {
     uid: person.uid,
     gid: person.gid,
     input,
@@ -365,7 +570,23 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
     current && (await verifiedExecutor({ uid: current.executorUid, guid: current.executorGuid }));
   if (existing) await accounts.finish(current, existing);
 
-  const selected = await observe(sha, current, scratch, owner, initialInstall);
+  const handoff = initialInstall
+    ? null
+    : parseHandoff(
+        JSON.parse(
+          (await readOwnerStage(owner.home, owner.uid, handoffRelative, 0o600, 4096)).toString(
+            'utf8',
+          ),
+        ),
+      );
+  if (
+    handoff &&
+    (handoff.sha !== sha ||
+      !handoff.password ||
+      !sameSelection(await activationStatus(owner, sha), handoff))
+  )
+    throw Error('boundary-state');
+  const selected = await observe(sha, current, scratch, owner, initialInstall, handoff);
   const keyDigest = keySetSha256(selected.keys);
   if (
     (initialProof &&
@@ -380,7 +601,19 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
     );
     runtime[name] = await verifiedRuntime(archive, name, selected.manifest[name], scratch);
   }
-  const replaceBase = selected.replacesBase || !(await fs.readFile(node)).equals(runtime.node);
+  const runtimeDigests = {
+    node: hash(runtime.node),
+    codex: hash(runtime.codex),
+    planner: selected.stage.tree.find((entry) => entry.path === plannerPath)?.sha256,
+  };
+  if (
+    handoff &&
+    !(await needsRoot({ ...selected, runtime: runtimeDigests, kind: handoff.kind }, current))
+  )
+    throw Error('boundary-base');
+  const replaceBase =
+    handoff?.kind !== 'previous' &&
+    (selected.replacesBase || !(await fs.readFile(node)).equals(runtime.node));
   if (replaceBase && (!current || selected.manifest.baseChange !== true))
     throw Error('boundary-base');
 
@@ -408,14 +641,16 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
     agent,
     scratch,
   );
-  const payload = await ownerPayload(materialized, settings);
+  const payload = serialize(await ownerPayload(materialized, settings));
   await fs.writeFile(path.join(scratch, 'pf'), pf.content, { flag: 'wx', mode: 0o600 });
   await fs.writeFile(path.join(scratch, 'plist'), task.content, { flag: 'wx', mode: 0o600 });
   await run('/sbin/pfctl', ['-n', '-a', 'com.apple/foliome', '-f', path.join(scratch, 'pf')]);
   await run('/usr/bin/plutil', ['-lint', '--', path.join(scratch, 'plist')]);
 
-  const tx = await journal.begin();
+  if (handoff) await asUser(owner, 'verify-update', sha, payload);
+  let activation;
   try {
+    const tx = await journal.begin(handoff ?? undefined);
     for (const item of plan.directories) {
       if (
         item.path === root ||
@@ -454,9 +689,12 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
     await startSsh(lastSsh);
     const live = await checkInstalled(plan, host, agent);
     await requireAcl(path.join(root, 'channel'), ['user:executor allow search']);
-    await asUser(agent, 'prepare-executor', sha);
-    const initial = !current || current.initialSha === sha;
-    await asUser(owner, initial ? 'prepare-initial' : 'prepare', sha, payload);
+    if (!handoff) {
+      await asUser(agent, 'prepare-executor', sha);
+      await asUser(owner, 'prepare-initial', sha, payload);
+    } else {
+      activation = await ownerCommit(owner, handoff);
+    }
     if ((await localOwner()).uid !== owner.uid) throw Error('boundary-account');
     await verifiedExecutor(agent);
     if (replaceBase) await replaceTrustedBase(tx, selected, runtime.node);
@@ -472,22 +710,43 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
       executorGuid: agent.guid,
       pfRules: live.rules,
       pfDigest: hash(pf.content),
+      runtime:
+        handoff?.kind === 'previous'
+          ? { ...runtimeDigests, node: (await installedRuntime(current)).node }
+          : runtimeDigests,
     };
     await systemFile(tx, {
       path: authority,
       mode: 0o644,
       content: encodeInstallationRelease(accepted),
     });
-    await tx.commit();
+    if (activation) {
+      const state = await activation.select('commit');
+      if (!state || !activationCommitted(state, handoff)) throw Error('boundary-state');
+    } else await tx.commit();
   } finally {
     try {
-      await journal.recover(restoreExternal);
-    } catch {
-      throw Error('restore-failed');
+      await settleSystem(journal, async (selection) => {
+        const state = await activation?.select('status');
+        return state ? activationDecision(state, selection) : recoverActivation(selection);
+      });
+    } finally {
+      await activation?.close();
     }
   }
   await accounts.finish({ initialSha: current?.initialSha ?? sha, ownerUid: owner.uid }, agent);
-  if (!current || current.initialSha === sha) await asUser(owner, 'activate', sha);
+  if (initialInstall) await asUser(owner, 'activate', sha);
+}
+
+async function publishRootFence() {
+  const fence = await fs.open(rootFence, 'wx', 0o644);
+  try {
+    await fence.chmod(0o644);
+    await fence.sync();
+  } finally {
+    await fence.close();
+  }
+  await syncDirectory(root);
 }
 
 async function installApprovedSystem(sha, initialInstall) {
@@ -515,11 +774,9 @@ async function installApprovedSystem(sha, initialInstall) {
   await requireAcl(admin, []);
   await exclusive(path.join(admin, 'install'), async () => {
     const journal = installationJournal(admin, authorize);
-    try {
-      await journal.recover(restoreExternal);
-    } catch {
-      throw Error('restore-failed');
-    }
+    const recovering = !!(await stat(rootFence));
+    await settleSystem(journal);
+    if (recovering && !initialInstall) return;
     for (const entry of await fs.readdir(admin, { withFileTypes: true })) {
       if (entry.isDirectory() && /^work-[A-Za-z0-9]{6}$/.test(entry.name)) {
         const file = path.join(admin, entry.name);
@@ -529,11 +786,26 @@ async function installApprovedSystem(sha, initialInstall) {
     }
     const scratch = await fs.mkdtemp(path.join(admin, 'work-'));
     try {
+      // Fence new launches before reading the owner's handoff. On restart,
+      // the launcher discards an interrupted handoff before checking the fence again.
+      if (!initialInstall) await publishRootFence();
       await apply(sha, initialInstall, scratch, journal, executorInstaller(admin));
     } finally {
-      await fs.rm(scratch, { recursive: true, force: true });
+      try {
+        await settleSystem(journal);
+      } finally {
+        await fs.rm(scratch, { recursive: true, force: true });
+      }
     }
   });
 }
 
-module.exports = { installApprovedSystem };
+module.exports = {
+  installApprovedSystem,
+  needsRoot,
+  installedRuntime,
+  ownerPayload,
+  rootFence,
+  parseHandoff,
+  activationCommitted,
+};

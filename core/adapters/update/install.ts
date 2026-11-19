@@ -41,6 +41,7 @@ declare const exports: {
   acceptUpdate: typeof acceptUpdate;
   restorePrevious: typeof restorePrevious;
   launchVerified: typeof launchVerified;
+  connectInstalledOwnerUpdates: typeof connectOwnerUpdates;
 };
 const fs = require('node:fs/promises') as typeof import('node:fs/promises');
 const path = require('node:path') as typeof import('node:path');
@@ -277,3 +278,154 @@ exports.launchVerified = async function launchVerified(options) {
     throw new Error('launch-failed');
   }
 };
+
+export type ReleaseCard = Readonly<{
+  kind: 'update' | 'previous';
+  sha: string;
+  from: string;
+  to: string;
+  checks: 'pinned' | 'changed';
+  boundary: boolean;
+  password: boolean;
+  notes: string;
+  node: readonly [string, string];
+  codex: readonly [string, string];
+  playwright: readonly [string, string];
+}>;
+
+const ownerUpdateCodes = {
+  'admin-timeout': 'Время ожидания пароля истекло. Можно повторить.',
+  'admin-canceled': 'Ввод пароля отменён. Можно повторить.',
+  network: 'Сбой сети. Можно повторить.',
+  'network-timeout': 'Сеть не ответила вовремя. Можно повторить.',
+  'self-check-timeout': 'Самопроверка не завершилась вовремя. Можно повторить.',
+  'self-check': 'Выпуск не прошёл самопроверку.',
+  incompatible: 'Выпуск несовместим с текущим хранилищем или версиями источника.',
+  'release-verification': 'Проверка выпуска не пройдена.',
+  'boundary-failed': 'Проверка системных файлов не пройдена.',
+  'update-failed': 'Переход не выполнен.',
+  'restore-failed': 'Требуется восстановление системных файлов.',
+} as const;
+
+function ownerUpdateStatus(value: Record<string, unknown>): string {
+  const version = readVersion(value.version);
+  if (value.code === 'updated' && version) return `Обновлено до v${version}`;
+  if (value.code === 'restored' && version) return `Возвращена версия v${version}`;
+  if (typeof value.code !== 'string' || !Object.hasOwn(ownerUpdateCodes, value.code)) return '';
+  const code = value.code as keyof typeof ownerUpdateCodes;
+  return `${ownerUpdateCodes[code]} Код ${code}.`;
+}
+
+function readVersion(value: unknown): string | null {
+  return typeof value === 'string' &&
+    value.length <= 64 &&
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value)
+    ? value
+    : null;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function versionPair(value: unknown): [string, string] | null {
+  if (!Array.isArray(value) || value.length !== 2) return null;
+  const from = readVersion(value[0]);
+  const to = readVersion(value[1]);
+  return from && to ? [from, to] : null;
+}
+
+function readCard(value: unknown): ReleaseCard | null {
+  const card = record(value);
+  if (!card) return null;
+  const { kind, sha, checks, boundary, password, notes } = card;
+  const from = readVersion(card.from);
+  const to = readVersion(card.to);
+  const node = versionPair(card.node);
+  const codex = versionPair(card.codex);
+  const playwright = versionPair(card.playwright);
+  if (
+    (kind !== 'update' && kind !== 'previous') ||
+    typeof sha !== 'string' ||
+    !shaPattern.test(sha) ||
+    (checks !== 'pinned' && checks !== 'changed') ||
+    typeof boundary !== 'boolean' ||
+    typeof password !== 'boolean' ||
+    typeof notes !== 'string' ||
+    notes.length > 4000 ||
+    !from ||
+    !to ||
+    !node ||
+    !codex ||
+    !playwright
+  )
+    return null;
+  return { kind, sha, from, to, checks, boundary, password, notes, node, codex, playwright };
+}
+
+function connectOwnerUpdates(
+  publish: (cards: readonly ReleaseCard[]) => void,
+  status: (message: string) => void,
+) {
+  let acceptance: { sha: string; resolve: (accepted: boolean) => void } | undefined;
+  function disconnected() {
+    acceptance?.resolve(false);
+    acceptance = undefined;
+  }
+  function receive(input: unknown) {
+    const message = record(input);
+    if (!message) return;
+    if (message.type === 'release-card') {
+      const card = readCard(message.card);
+      if (card) {
+        cards.set(card.kind, card);
+        publish([...cards.values()]);
+      }
+    } else if (message.type === 'release-result') {
+      const visible = ownerUpdateStatus(message);
+      if (visible) status(visible);
+    } else if (message.type === 'release-handoff' && acceptance && message.sha === acceptance.sha) {
+      acceptance.resolve(message.accepted === true);
+      acceptance = undefined;
+    }
+  }
+  function send(message: object, callback: (error: Error | null) => void = () => {}) {
+    if (!process.connected || !process.send) {
+      callback(new Error('handoff'));
+      return;
+    }
+    process.send(message, callback);
+  }
+  const cards = new Map<ReleaseCard['kind'], ReleaseCard>();
+  process.on('message', receive);
+  process.on('disconnect', disconnected);
+  send({ type: 'release-ready' });
+  return {
+    accept(sha: string) {
+      return new Promise<boolean>((resolve) => {
+        if (acceptance) {
+          resolve(false);
+          return;
+        }
+        acceptance = { sha, resolve };
+        send({ type: 'release-accept', sha }, (error) => {
+          if (error) disconnected();
+        });
+      });
+    },
+    close() {
+      process.off('message', receive);
+      process.off('disconnect', disconnected);
+      disconnected();
+    },
+    finish(sha: string) {
+      send({ type: 'release-closed', sha }, () => {
+        if (process.connected) process.disconnect?.();
+      });
+    },
+  };
+}
+export declare const connectInstalledOwnerUpdates: typeof connectOwnerUpdates;
+exports.connectInstalledOwnerUpdates = connectOwnerUpdates;

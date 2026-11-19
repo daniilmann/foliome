@@ -1,6 +1,8 @@
+import type { ReleaseCard } from '../update/install.ts';
 import type { LogProtocolRow } from '../store/action-protocol.ts';
 import type { TechnicalLogLevel } from '../technical-log.ts';
 
+const { randomUUID } = require('node:crypto') as typeof import('node:crypto');
 const { createOwnerLoginConfirmation } =
   require('./owner-login-confirmation.ts') as typeof import('./owner-login-confirmation.ts');
 const { renderProtocol } = require('./protocol-view.ts') as typeof import('./protocol-view.ts');
@@ -45,6 +47,7 @@ type Options = Readonly<{
   onLoginComplete: (sessionId: string) => boolean;
   onOpen?: () => Promise<void>;
   logEvents?: () => readonly LogProtocolRow[];
+  onRelease?: (sha: string) => Promise<boolean>;
   onLogLevel?: (level: TechnicalLogLevel) => void;
 }>;
 
@@ -53,6 +56,7 @@ declare const exports: { attachOwnerWindow: typeof attach };
 
 const origin = 'https://foliome-owner.invalid';
 const endpoint = '/preparation/login-complete';
+const releaseEndpoint = '/system/release';
 const openEndpoint = '/preparation/open';
 const logLevelEndpoint = '/diagnostics/log-level';
 const headers = {
@@ -86,11 +90,11 @@ function escapeAttribute(value: string): string {
   );
 }
 
-function parseBody(buffer: Buffer | null): Pending | null {
+function parseBody(buffer: Buffer | null, id = 'sessionId', consent = false): Pending | null {
   if (buffer === null || buffer.length > 8192) return null;
   const body = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
   const parts = body.split('&');
-  if (parts.length !== 2) return null;
+  if (parts.length !== (consent ? 3 : 2)) return null;
   const values = new Map<string, string>();
   for (const part of parts) {
     const index = part.indexOf('=');
@@ -98,11 +102,16 @@ function parseBody(buffer: Buffer | null): Pending | null {
     const decode = (value: string) => decodeURIComponent(value.replace(/\+/g, ' '));
     const key = decode(part.slice(0, index));
     const value = decode(part.slice(index + 1));
-    if ((key !== 'sessionId' && key !== 'nonce') || values.has(key) || value.length === 0)
+    if (
+      (key !== id && key !== 'nonce' && !(consent && key === 'consent')) ||
+      values.has(key) ||
+      value.length === 0
+    )
       return null;
     values.set(key, value);
   }
-  const sessionId = values.get('sessionId');
+  if (consent && values.get('consent') !== 'yes') return null;
+  const sessionId = values.get(id);
   const nonce = values.get('nonce');
   return sessionId && nonce ? { sessionId, nonce } : null;
 }
@@ -115,6 +124,7 @@ async function attach({
   onOpen,
   logEvents,
   onLogLevel,
+  onRelease,
 }: Options) {
   const frame = page.mainFrame();
   const confirmation = createOwnerLoginConfirmation({
@@ -134,18 +144,48 @@ async function attach({
   let opening = false;
   let posting = false;
   let showingDiagnostics = false;
+  let applying = false;
+  let releaseStatus = '';
+  const releases = new Map<
+    ReleaseCard['kind'],
+    {
+      card: ReleaseCard;
+      nonce: string;
+      consume: ReturnType<typeof createOwnerLoginConfirmation>['handle'];
+    }
+  >();
   let logLevel: TechnicalLogLevel = 'error';
+
+  function renderRelease({ card, nonce }: { card: ReleaseCard; nonce: string }): string {
+    const text = escapeAttribute;
+    const warning = card.checks === 'changed' || card.boundary;
+    const action = card.kind === 'previous' ? 'Вернуть предыдущую' : 'Принять';
+    const consent = warning ? ' name="consent" value="yes"' : '';
+    const label = warning ? `${action} и подтвердить изменения` : action;
+    const warnings = [
+      card.checks === 'changed'
+        ? '<p>Изменены проверки и стенд. Результат проверок и ревью со слов разработки.</p>'
+        : '<p>Проверки GitHub пройдены. Набор совпадает с закреплённым.</p>',
+      card.boundary ? '<p>Изменены граница или системные файлы.</p>' : '',
+      warning ? '<p>Принимайте только изменения, которые вы уже утвердили.</p>' : '',
+    ].join('');
+    const form =
+      engaged || opening || applying
+        ? ''
+        : `<form method="post" action="${releaseEndpoint}"><input type="hidden" name="sha" value="${card.sha}"><input type="hidden" name="nonce" value="${nonce}"><button type="submit"${consent}>${label}</button></form>`;
+    return `<section><h2>${card.kind === 'previous' ? 'Предыдущая версия' : 'Обновление'}</h2><p>Версия v${text(card.from)} → v${text(card.to)}</p>${warnings}<p>Нужен пароль администратора: ${card.password ? 'да' : 'нет'}.</p><p>Переутверждать версии источников не нужно.</p>${engaged || opening ? '<p>Доступно после завершения подготовки.</p>' : ''}<p>Node.js ${card.node.map(text).join(' → ')} · Codex ${card.codex.map(text).join(' → ')} · playwright-core ${card.playwright.map(text).join(' → ')}</p>${card.notes ? `<p>Примечание разработчика</p><pre>${text(card.notes)}</pre>` : ''}${form}</section>`;
+  }
 
   function render(): string {
     const table = renderProtocol(rows(), logEvents?.());
     const form =
       pending === null
-        ? onOpen && !engaged && !opening
+        ? onOpen && !engaged && !opening && !applying
           ? `<form method="post" action="${openEndpoint}"><button type="submit">Открыть подготовку</button></form>`
           : ''
         : `<form method="post" action="${endpoint}"><input type="hidden" name="sessionId" value="${escapeAttribute(pending.sessionId)}"><input type="hidden" name="nonce" value="${escapeAttribute(pending.nonce)}"><button type="submit">Вход завершён, продолжить</button></form>`;
     const diagnostics = onLogLevel ? `<a href="${logLevelEndpoint}">Технический журнал</a>` : '';
-    return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}<p>${escapeAttribute(status)}</p>${diagnostics}</body></html>`;
+    return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Протокол</title></head><body>${table}${form}<p>${escapeAttribute(status)}</p><p>${escapeAttribute(releaseStatus)}</p>${[...releases.values()].map(renderRelease).join('')}${diagnostics}</body></html>`;
   }
 
   function renderDiagnostics(): string {
@@ -181,6 +221,7 @@ async function attach({
     closed = true;
     subscription.unsubscribe?.();
     pending = null;
+    releases.clear();
     confirmation.close();
   }
 
@@ -271,10 +312,18 @@ async function attach({
         url === `${origin}${openEndpoint}` &&
         onOpen &&
         !engaged &&
-        !opening
+        !opening &&
+        !applying
       ) {
         const requestHeaders = await request.allHeaders();
-        if (closed || !isOwnerForm(requestHeaders) || (request.postDataBuffer()?.length ?? 0) !== 0)
+        if (
+          closed ||
+          engaged ||
+          opening ||
+          applying ||
+          !isOwnerForm(requestHeaders) ||
+          (request.postDataBuffer()?.length ?? 0) !== 0
+        )
           throw new Error('refused');
         opening = true;
         posting = true;
@@ -287,6 +336,54 @@ async function attach({
           opening = false;
         }
         if (closed) throw new Error('refused');
+        dirty = false;
+        await route.fulfill({ status: 200, headers, body: render() });
+        return;
+      }
+      if (
+        request.method() === 'POST' &&
+        url === `${origin}${releaseEndpoint}` &&
+        request.isNavigationRequest() &&
+        onRelease
+      ) {
+        const requestHeaders = await request.allHeaders();
+        if (
+          closed ||
+          showingDiagnostics ||
+          engaged ||
+          opening ||
+          applying ||
+          !isOwnerForm(requestHeaders)
+        )
+          throw new Error('refused');
+        let matched = false;
+        for (const [kind, offer] of releases) {
+          const body = parseBody(
+            request.postDataBuffer(),
+            'sha',
+            offer.card.checks === 'changed' || offer.card.boundary,
+          );
+          if (
+            !body ||
+            !offer.consume({ method: 'POST', path: releaseEndpoint, frame, origin, body })
+          )
+            continue;
+          releases.delete(kind);
+          matched = true;
+          applying = true;
+          posting = true;
+          try {
+            if (await onRelease(body.sessionId)) {
+              await route.abort().catch(() => {});
+              return;
+            }
+            releaseStatus = 'Переход недоступен. Код update-failed.';
+          } finally {
+            applying = false;
+          }
+          break;
+        }
+        if (!matched || closed) throw new Error('refused');
         dirty = false;
         await route.fulfill({ status: 200, headers, body: render() });
         return;
@@ -329,6 +426,26 @@ async function attach({
       pending = null;
       engaged = false;
       confirmation.close();
+      refresh();
+    },
+    setReleases(cards: readonly ReleaseCard[]) {
+      if (closed || !onRelease) return;
+      for (const card of cards) {
+        if (releases.get(card.kind)?.card === card) continue;
+        const nonce = randomUUID();
+        const approval = createOwnerLoginConfirmation({
+          ownerFrame: frame,
+          origin,
+          endpoint: releaseEndpoint,
+          complete: () => true,
+        });
+        approval.begin({ sessionId: card.sha, nonce });
+        releases.set(card.kind, { card, nonce, consume: approval.handle });
+      }
+      refresh();
+    },
+    setReleaseStatus(value: string) {
+      releaseStatus = value;
       refresh();
     },
     setStatus(value: string) {

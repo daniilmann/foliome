@@ -217,6 +217,23 @@ async function installedMain() {
   const node = path.join(base, 'node');
   const [sha, mode] = process.argv.slice(2);
   if (
+    process.platform === 'darwin' &&
+    process.arch === 'arm64' &&
+    process.getuid() === 0 &&
+    process.geteuid() === 0 &&
+    process.getgid() === 0 &&
+    process.getegid() === 0 &&
+    process.argv.length === 3 &&
+    /^[a-f0-9]{40}$/.test(sha) &&
+    !Object.keys(process.env).length &&
+    !process.execArgv.length &&
+    process.cwd() === '/' &&
+    process.execPath === node &&
+    process.argv[1] === entry &&
+    __filename === entry
+  )
+    process.execve(node, [node, '--disable-sigusr1', entry, sha], {});
+  if (
     process.platform !== 'darwin' ||
     process.arch !== 'arm64' ||
     process.getuid() !== 0 ||
@@ -281,7 +298,7 @@ async function installedMain() {
 if (require.main === module) {
   installedMain().catch((error) => {
     const code =
-      /^(boundary-(entry|permissions|base|account|config|pf|ssh|program|state)|release-(verification|stage|materialization)|restore-failed)$/.test(
+      /^(boundary-(entry|permissions|base|account|config|pf|ssh|program|state)|release-(verification|stage|materialization)|restore-failed|network|network-timeout)$/.test(
         error.message,
       )
         ? error.message

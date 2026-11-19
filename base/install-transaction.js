@@ -68,6 +68,7 @@ function installationJournal(directory, authorize) {
       if ((old && !same(old, before)) || (pending && after && !same(pending, after)))
         throw Error('restore-failed');
       if (value.committed) {
+        if (!same(installed, after)) throw Error('restore-failed');
         if (old) {
           if (tree) await fs.rm(backup, { recursive: true });
           else await fs.unlink(backup);
@@ -98,7 +99,7 @@ function installationJournal(directory, authorize) {
     await syncDirectory(directory);
   }
 
-  async function recover(restoreExternal) {
+  async function recover(restoreExternal, selectActivation) {
     const s = await stat(record);
     if (!s) return;
     if (
@@ -122,12 +123,19 @@ function installationJournal(directory, authorize) {
       )
     )
       throw Error('restore-failed');
+    if (value.activation !== undefined) {
+      if (!selectActivation) throw Error('restore-failed');
+      const committed = await selectActivation(value.activation);
+      if (typeof committed !== 'boolean' || (value.committed && !committed))
+        throw Error('restore-failed');
+      value.committed = committed;
+    }
     await settle(value, restoreExternal);
   }
 
-  async function begin() {
+  async function begin(activation) {
     if (await stat(record)) throw Error('restore-failed');
-    const value = { operations: [], committed: false, external: null };
+    const value = { operations: [], committed: false, external: null, activation };
     await save(value);
     return {
       async replace(target, prepare, validate, isDirectory = false, tree = false) {

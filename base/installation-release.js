@@ -7,7 +7,7 @@ const path = require('node:path');
 const { productionRepository } = require('./release-origin.js');
 const { requireAcl, rootParents } = require('./install-platform.js');
 const systemRoot = '/Library/Application Support/Foliome';
-const { readReleaseCheckPins } = require(
+const { readReleaseCheckPins, isReleaseNewer } = require(
   __dirname === path.join(systemRoot, 'base') ? './release-policy.ts' : '../core/domain/release.ts',
 );
 
@@ -89,6 +89,7 @@ function parseInstallationRelease(value) {
       'initialWorkflow',
       'pinnedCheckBlobs',
       'keySetSha256',
+      ...(value?.runtime === undefined ? [] : ['runtime']),
     ]) ||
     !matches(sha, value.sha) ||
     !matches(sha, value.initialSha) ||
@@ -102,7 +103,10 @@ function parseInstallationRelease(value) {
     value.pfRules.length > 65536 ||
     !exact(value.initialWorkflow, ['id', 'runId', 'attempt']) ||
     !Object.values(value.initialWorkflow).every(positive) ||
-    !matches(digest, value.keySetSha256)
+    !matches(digest, value.keySetSha256) ||
+    (value.runtime !== undefined &&
+      (!exact(value.runtime, ['node', 'codex', 'planner']) ||
+        !Object.values(value.runtime).every((value) => matches(digest, value))))
   )
     throw Error('boundary-state');
   const pinnedCheckBlobs = readReleaseCheckPins(
@@ -168,6 +172,7 @@ function initialProofSha256(sha, keySet, { id, runId, attempt }) {
 
 module.exports = {
   releasePolicy,
+  isReleaseNewer,
   parseInstallationRelease,
   readInstallationRelease,
   encodeInstallationRelease,

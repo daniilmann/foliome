@@ -9,7 +9,7 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { deserialize } = require('node:v8');
 const { DatabaseSync } = require('node:sqlite');
-const { exclusive, marker } = require('./activation-state.js');
+const { exclusive, marker, sameSelection, commitActivation } = require('./activation-state.js');
 const { verifyInventory } = require('./launcher.js');
 const { installationJournal, stat, syncDirectory } = require('./install-transaction.js');
 const { readInstallationRelease } = require('./installation-release.js');
@@ -56,15 +56,16 @@ async function input() {
   return deserialize(Buffer.concat(chunks, size));
 }
 
-async function prepare({ sha, data, app, releases }, payload) {
+async function prepare({ sha, data, app, releases }, payload, verifyOnly = false) {
   const { files, settings } = payload;
   if (
     !Array.isArray(files) ||
     !files.length ||
     files.length > 2200 ||
-    !Array.isArray(settings) ||
-    settings.length !== 2 ||
-    settings.some((value) => typeof value !== 'string' || value.length > 4096)
+    (settings !== undefined &&
+      (!Array.isArray(settings) ||
+        settings.length !== 2 ||
+        settings.some((value) => typeof value !== 'string' || value.length > 4096)))
   )
     throw Error('owner-input');
   const release = path.join(releases, sha);
@@ -104,7 +105,7 @@ async function prepare({ sha, data, app, releases }, payload) {
       throw Error('owner-path');
     await requireDir(path.dirname(target));
   });
-  await journal.recover();
+  if (!verifyOnly) await journal.recover();
   if (await stat(release)) {
     // Only allow the exact privately published bytes on a retry.
     const expected = JSON.stringify({ sha, files: hashes });
@@ -115,6 +116,7 @@ async function prepare({ sha, data, app, releases }, payload) {
       throw Error('owner-receipt');
     await verifyInventory(release, receipt, sha, uid);
   } else {
+    if (verifyOnly) throw Error('owner-receipt');
     const expected = JSON.stringify({ sha, files: hashes });
     const previousReceipt = await stat(receipt);
     if (
@@ -157,6 +159,22 @@ async function prepare({ sha, data, app, releases }, payload) {
     }
   }
 
+  if (settings === undefined) {
+    if (verifyOnly) throw Error('owner-input');
+    return;
+  }
+  if (verifyOnly) {
+    for (const [index, target] of [ssh, hosts].entries()) {
+      const existing = await fs.lstat(target);
+      if (
+        !ownedFile(existing, 0o600) ||
+        existing.size > 4096 ||
+        (await fs.readFile(target, 'utf8')) !== settings[index]
+      )
+        throw Error('owner-path');
+    }
+    return;
+  }
   const config = await journal.begin();
   try {
     for (const [target, contents] of [
@@ -187,7 +205,7 @@ async function prepare({ sha, data, app, releases }, payload) {
   }
 }
 
-async function requireInitialAuthority(sha) {
+function requireRootParent() {
   if (
     execFileSync('/bin/ps', ['-p', String(process.ppid), '-o', 'uid='], {
       env: {},
@@ -198,6 +216,10 @@ async function requireInitialAuthority(sha) {
     }).trim() !== '0'
   )
     throw Error('owner-authority');
+}
+
+async function requireInitialAuthority(sha) {
+  requireRootParent();
   const approved = await readInstallationRelease();
   if (approved.sha !== sha || approved.initialSha !== sha || approved.ownerUid !== uid)
     throw Error('owner-authority');
@@ -293,6 +315,52 @@ async function activate({ sha, data, releases }) {
   await syncDirectory(data);
 }
 
+async function ownerActivation(mode, data, sha) {
+  requireRootParent();
+  const file = path.join(data, 'core.db');
+  if (!ownedFile(await fs.lstat(file), 0o600)) throw Error('owner-database');
+  if (mode === 'activation-status') {
+    const db = new DatabaseSync(file, { readOnly: true, defensive: true });
+    try {
+      const selected = marker(db);
+      if (!selected) throw Error('owner-database');
+      process.stdout.write(JSON.stringify(selected));
+    } finally {
+      db.close();
+    }
+    return;
+  }
+  if (!process.send || !process.connected) throw Error('owner-authority');
+  // The root parent uses this already loaded owner helper after replacing base.
+  const db = new DatabaseSync(file, { defensive: true });
+  try {
+    const receive = () =>
+      new Promise((resolve, reject) => {
+        process.once('message', resolve);
+        process.once('disconnect', reject);
+      });
+    const request = receive();
+    process.send('listening');
+    const selection = await request;
+    if (selection?.sha !== sha || !sameSelection(marker(db), selection))
+      throw Error('owner-database');
+    const decision = receive();
+    process.send('ready');
+    const operation = await decision;
+    if (operation !== 'commit' && operation !== 'status') throw Error('owner-authority');
+    if (operation === 'commit') {
+      try {
+        commitActivation(db, selection, sha);
+      } catch {
+        // The journal settles from the actual marker even after a failed transaction.
+      }
+    }
+    process.send({ state: marker(db) }, () => process.disconnect());
+  } finally {
+    db.close();
+  }
+}
+
 async function main() {
   const [mode, sha] = process.argv.slice(2);
   const user = os.userInfo();
@@ -301,7 +369,15 @@ async function main() {
     __filename !== path.join(root, 'base/install-owner.js') ||
     process.execPath !== path.join(root, 'base/node') ||
     process.argv.length !== 4 ||
-    !['prepare', 'prepare-initial', 'activate', 'prepare-executor'].includes(mode) ||
+    ![
+      'prepare',
+      'prepare-initial',
+      'activate',
+      'prepare-executor',
+      'verify-update',
+      'activate-update',
+      'activation-status',
+    ].includes(mode) ||
     !shaPattern.test(sha) ||
     Object.keys(process.env).length ||
     !uid ||
@@ -331,6 +407,12 @@ async function main() {
   await requireDir(data);
   const app = path.join(application, 'app');
   const releases = path.join(app, 'releases');
+  if (mode === 'activate-update' || mode === 'activation-status')
+    return ownerActivation(mode, data, sha);
+  if (mode === 'verify-update') {
+    requireRootParent();
+    return prepare({ sha, data, app, releases }, await input(), true);
+  }
   await exclusive(path.join(data, 'activation.json'), async () => {
     for (const dir of [app, releases, path.join(data, 'accepted'), path.join(data, 'tmp')])
       await ensureDir(dir);
@@ -347,7 +429,10 @@ async function main() {
   });
 }
 
+module.exports = { prepare };
+
 if (require.main === module)
   main().catch(() => {
     process.exitCode = 1;
+    if (process.connected) process.disconnect();
   });

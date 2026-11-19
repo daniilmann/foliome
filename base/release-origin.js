@@ -55,16 +55,31 @@ async function fetchBounded(url, limit) {
         accept: new URL(url).hostname === 'api.github.com' ? 'application/vnd.github+json' : '*/*',
         'user-agent': 'release-reader',
       },
+    }).catch(() => {
+      throw Error(controller.signal.aborted ? 'network-timeout' : 'network');
     });
+    if (
+      response.status === 429 ||
+      response.status >= 500 ||
+      (response.status === 403 &&
+        (response.headers.has('retry-after') ||
+          response.headers.get('x-ratelimit-remaining') === '0'))
+    )
+      throw Error('network');
     const length = response.headers.get('content-length');
     if (length !== null && (!/^\d+$/.test(length) || Number(length) > limit)) throw Error();
     const chunks = [];
     let size = 0;
     if (response.body) {
-      for await (const chunk of response.body) {
-        size += chunk.length;
-        if (size > limit) throw Error();
-        chunks.push(chunk);
+      try {
+        for await (const chunk of response.body) {
+          size += chunk.length;
+          if (size > limit) throw Error('size');
+          chunks.push(chunk);
+        }
+      } catch (error) {
+        if (error.message === 'size') throw error;
+        throw Error(controller.signal.aborted ? 'network-timeout' : 'network');
       }
     }
     return {
@@ -109,6 +124,30 @@ function completeList(value, field) {
   )
     throw Error();
   return value[field];
+}
+
+async function releaseTags() {
+  const api = 'https://api.github.com/repos/' + productionRepository;
+  const refs = await json(fetchBounded, api + '/git/matching-refs/tags/v');
+  if (!Array.isArray(refs) || refs.length > 100) throw Error('release-verification');
+  const versions = new Set();
+  const selected = [];
+  for (const ref of refs) {
+    if (typeof ref?.ref !== 'string' || !ref.ref.startsWith('refs/tags/v'))
+      throw Error('release-verification');
+    const version = ref.ref.slice('refs/tags/v'.length);
+    if (version.length > 64 || !versionPattern.test(version)) continue;
+    if (versions.has(version)) throw Error('release-verification');
+    versions.add(version);
+    if (ref.object?.type !== 'commit') continue;
+    if (
+      !shaPattern.test(ref.object.sha) ||
+      ref.object.url !== api + '/git/commits/' + ref.object.sha
+    )
+      throw Error('release-verification');
+    selected.push({ commit: ref.object.sha, version });
+  }
+  return selected;
 }
 
 async function readReleaseOrigin(input) {
@@ -263,8 +302,10 @@ async function readReleaseOrigin(input) {
     };
     if ((await verifyBase(observations)) !== true) throw Error();
     return { ok: true, sha, version };
-  } catch {
+  } catch (error) {
     // Never expose a redirect URL or remote response in errors or logs.
+    if (input.productionErrors && ['network', 'network-timeout'].includes(error.message))
+      throw error;
     return { ok: false };
   }
 }
@@ -294,6 +335,7 @@ async function readReleaseArchives(nodeVersion, playwrightVersion, observedTarba
 }
 
 module.exports = {
+  releaseTags,
   readReleaseOrigin,
   readReleaseArchives,
   productionRepository,

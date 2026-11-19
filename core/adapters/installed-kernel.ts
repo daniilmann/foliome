@@ -3,6 +3,8 @@ import type { createPreparationRuntime } from '../main.ts';
 import type { prepareDomCollector } from './browser/collect-dom.ts';
 import type { attachOwnerWindow } from './ui/owner-window.ts';
 
+const { connectInstalledOwnerUpdates } =
+  require('./update/install.ts') as typeof import('./update/install.ts');
 const { randomUUID } = require('node:crypto') as typeof import('node:crypto');
 const { mkdir } = require('node:fs/promises') as typeof import('node:fs/promises');
 const os = require('node:os') as typeof import('node:os');
@@ -60,6 +62,7 @@ type Options = {
   observeMacOS(paths: Paths): Promise<Observation>;
   runProcess: Parameters<typeof startExecutor>[0]['run'];
   launchChrome(): Promise<Chrome>;
+  supervisedRelease?: boolean;
   peerUid?: (socket: Socket) => Promise<number>;
   configureSocket?: (file: string) => Promise<void>;
   source: {
@@ -93,6 +96,11 @@ async function createInstalled(options: Options) {
   let running = false,
     closed = false,
     generation = 0;
+  let preparationBusy = false;
+  let releaseHandoff = false;
+  let releasingSha: string | undefined;
+  let workers = 0;
+  let updates: ReturnType<typeof connectInstalledOwnerUpdates> | undefined;
   let worker: { stop(): void | Promise<void> } | undefined;
   let channelClose: (() => Promise<void>) | undefined;
   let closePromise: Promise<void> | undefined;
@@ -158,7 +166,6 @@ async function createInstalled(options: Options) {
     log.endSession();
     running = false;
     stopWorker();
-    window?.cancel();
     const oldCollector = collector,
       oldContext = sourceContext,
       oldBrowser = sourceBrowser;
@@ -181,6 +188,9 @@ async function createInstalled(options: Options) {
       await oldBrowser?.close();
     } catch {
       /* Continue releasing resources. */
+    } finally {
+      preparationBusy = false;
+      window?.cancel();
     }
   }
   async function close() {
@@ -210,6 +220,9 @@ async function createInstalled(options: Options) {
         /* Continue releasing resources. */
       }
       db.close();
+      updates?.close();
+      if (releasingSha) updates?.finish(releasingSha);
+      else if (updates && process.connected) process.disconnect?.();
     })();
     return closePromise;
   }
@@ -369,12 +382,18 @@ async function createInstalled(options: Options) {
       void close();
     });
     async function openSource(refresh = true) {
-      if (closed) throw new Error('session-unavailable');
+      if (closed || releaseHandoff || preparationBusy) throw new Error('session-unavailable');
+      preparationBusy = true;
       const token = generation;
-      const sessionId = await runtime!.open();
-      if (closed || token !== generation) throw new Error('session-unavailable');
-      window!.begin({ sessionId, nonce: randomUUID() });
-      if (refresh) window!.refresh();
+      try {
+        const sessionId = await runtime!.open();
+        if (closed || token !== generation) throw new Error('session-unavailable');
+        window!.begin({ sessionId, nonce: randomUUID() });
+        if (refresh) window!.refresh();
+      } catch (error) {
+        if (generation === token) preparationBusy = false;
+        throw error;
+      }
     }
     window = await attach({
       context: ownerContext,
@@ -383,9 +402,23 @@ async function createInstalled(options: Options) {
       logEvents: runtime.logEvents,
       onLogLevel: log.setLevel,
       onOpen: () => openSource(false),
+      onRelease: options.supervisedRelease
+        ? async (sha) => {
+            if (closed || releaseHandoff || preparationBusy || workers || !updates) return false;
+            releaseHandoff = true;
+            if (!(await updates.accept(sha)) || closed) {
+              releaseHandoff = false;
+              return false;
+            }
+            releasingSha = sha;
+            void close().catch(() => {});
+            return true;
+          }
+        : undefined,
       onLoginComplete(sessionId) {
         if (closed || !runtime!.confirmLogin(sessionId)) return false;
         const token = generation;
+        workers++;
         void (async () => {
           let observation: Observation | undefined;
           try {
@@ -417,6 +450,14 @@ async function createInstalled(options: Options) {
           );
           if (result.ok && 'worker' in result) {
             const started = result.worker;
+            void started.finished.then(
+              () => {
+                workers--;
+              },
+              () => {
+                workers--;
+              },
+            );
             if (closed || token !== generation) {
               try {
                 await started.stop();
@@ -443,9 +484,15 @@ async function createInstalled(options: Options) {
                 void runtime?.closeSource().catch(() => {});
               },
             );
-          } else if (!closed && token === generation)
-            window?.setStatus(result.ok ? 'executor-launch' : result.code);
-        })();
+          } else {
+            workers--;
+            if (!closed && token === generation)
+              window?.setStatus(result.ok ? 'executor-launch' : result.code);
+          }
+        })().catch(() => {
+          workers--;
+          if (!closed && token === generation) window?.setStatus('executor-launch');
+        });
         return true;
       },
     });
@@ -465,6 +512,10 @@ async function createInstalled(options: Options) {
     });
     if (!channel.ok) throw new Error('boundary-permissions');
     channelClose = channel.close;
+    if (options.supervisedRelease) {
+      updates = connectInstalledOwnerUpdates(window.setReleases, window.setReleaseStatus);
+      window.refresh();
+    }
     return {
       openSource,
       ownerPage() {
