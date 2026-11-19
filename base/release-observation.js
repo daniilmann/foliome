@@ -6,6 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const { TextDecoder } = require('node:util');
+const { isReleaseRepository } = require('./release-origin.js');
 
 const sha1 = /^[a-f0-9]{40}$/;
 const sha256 = /^[a-f0-9]{64}$/;
@@ -14,13 +15,40 @@ const maxFiles = 2000;
 const maxBlob = 8 * 1024 * 1024;
 const maxTreeBytes = 64 * 1024 * 1024;
 const maxArchive = 256 * 1024 * 1024;
+const gitTimeout = 30000;
 const executable = 'scripts/telegram-agent.sh';
 const artifactDirectory = '.release-artifacts';
 
-function git(repository, args, maxBuffer) {
+function git(repository, args, maxBuffer, timeout = gitTimeout) {
   return execFileSync(
     '/usr/bin/git',
-    ['--no-optional-locks', '-C', repository, '-c', 'core.hooksPath=/dev/null', ...args],
+    [
+      '--no-optional-locks',
+      '--no-replace-objects',
+      '-C',
+      repository,
+      '-c',
+      'core.hooksPath=/dev/null',
+      '-c',
+      'protocol.allow=never',
+      '-c',
+      'protocol.https.allow=always',
+      '-c',
+      'credential.helper=',
+      '-c',
+      'http.followRedirects=false',
+      '-c',
+      'http.sslVerify=true',
+      '-c',
+      'http.proxy=',
+      '-c',
+      'http.lowSpeedLimit=1024',
+      '-c',
+      'http.lowSpeedTime=15',
+      '-c',
+      'fetch.fsckObjects=true',
+      ...args,
+    ],
     {
       env: {
         PATH: '/usr/bin:/bin',
@@ -29,13 +57,35 @@ function git(repository, args, maxBuffer) {
         GIT_CONFIG_NOSYSTEM: '1',
         GIT_CONFIG_GLOBAL: '/dev/null',
         GIT_TERMINAL_PROMPT: '0',
-        GIT_NO_REPLACE_OBJECTS: '1',
+        GIT_ALLOW_PROTOCOL: 'https',
       },
       encoding: 'buffer',
-      timeout: 30000,
+      timeout,
+      killSignal: 'SIGKILL',
       maxBuffer,
       stdio: ['ignore', 'pipe', 'pipe'],
     },
+  );
+}
+
+async function fetchReleaseCommit(repository, slug, commit) {
+  if (!isReleaseRepository(slug) || typeof commit !== 'string' || !sha1.test(commit)) throw Error();
+  await fs.mkdir(repository, { mode: 0o700 });
+  git(repository, ['init', '--bare', '--template=', '--object-format=sha1'], 1024 * 1024);
+  git(
+    repository,
+    [
+      'fetch',
+      '--no-tags',
+      '--depth=1',
+      '--no-recurse-submodules',
+      '--no-auto-maintenance',
+      '--no-write-fetch-head',
+      '--',
+      `https://github.com/${slug}.git`,
+      commit,
+    ],
+    1024 * 1024,
   );
 }
 
@@ -50,9 +100,7 @@ function validPath(name) {
           part.length > 0 &&
           part.length <= 255 &&
           component.test(part) &&
-          part !== '.' &&
-          part !== '..' &&
-          part.toLowerCase() !== '.git',
+          !['.', '..', '.git', '.gitmodules', 'node_modules'].includes(part.toLowerCase()),
       ) &&
     !name.toLowerCase().endsWith('.node') &&
     name.split('/')[0].toLowerCase() !== artifactDirectory
@@ -71,32 +119,47 @@ async function readBounded(file, limit) {
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size > limit) throw Error();
-    const bytes = await handle.readFile();
-    if (bytes.length !== stat.size || bytes.length > limit) throw Error();
-    return bytes;
+    const bytes = Buffer.alloc(stat.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    if (offset !== stat.size) throw Error();
+    return bytes.subarray(0, offset);
   } finally {
     await handle.close();
   }
 }
 
-function observeTree({ repository, commit, manifest, allowedPaths, allowedExecutablePaths }) {
+function observeTree({
+  repository,
+  commit,
+  manifest,
+  allowedPaths,
+  allowedExecutablePaths,
+  policy,
+}) {
   if (
     typeof repository !== 'string' ||
+    typeof commit !== 'string' ||
     !sha1.test(commit) ||
-    !manifest ||
-    manifest.commit !== commit ||
-    !manifest.files ||
-    typeof manifest.files !== 'object' ||
-    !Array.isArray(allowedPaths)
+    (manifest !== undefined &&
+      (manifest?.commit !== commit ||
+        !manifest.files ||
+        typeof manifest.files !== 'object' ||
+        !Array.isArray(allowedPaths))) ||
+    (manifest === undefined &&
+      (!Array.isArray(policy?.allowedRootFiles) || !Array.isArray(policy.allowedDirectories)))
   )
     throw Error();
-  const names = Object.keys(manifest.files);
+  const expectedPaths = new Set(allowedPaths);
   if (
-    !names.length ||
-    names.length > maxFiles ||
-    names.length !== allowedPaths.length ||
-    new Set(allowedPaths).size !== names.length ||
-    names.some((name) => !validPath(name) || !allowedPaths.includes(name))
+    manifest &&
+    (expectedPaths.size !== allowedPaths.length ||
+      expectedPaths.size > maxFiles ||
+      Object.keys(manifest.files).length !== expectedPaths.size)
   )
     throw Error();
   if (
@@ -105,78 +168,113 @@ function observeTree({ repository, commit, manifest, allowedPaths, allowedExecut
       allowedExecutablePaths.some((name) => name !== executable))
   )
     throw Error();
-  const seen = new Map();
-  for (const name of names) {
-    const parts = name.split('/');
-    for (let i = 1; i <= parts.length; i++) {
-      const prefix = parts.slice(0, i).join('/');
-      const key = prefix.toLowerCase();
-      const entry = seen.get(key);
-      const file = i === parts.length;
-      if (entry && (entry.prefix !== prefix || entry.file || file)) throw Error();
-      seen.set(key, { prefix, file });
+  const rootFiles = new Set(policy?.allowedRootFiles);
+  const rootDirs = new Set(policy?.allowedDirectories);
+  const expectedDirs = new Set();
+  for (const name of expectedPaths) {
+    if (!validPath(name)) throw Error();
+    for (let end = name.indexOf('/'); end !== -1; end = name.indexOf('/', end + 1)) {
+      expectedDirs.add(name.slice(0, end));
     }
   }
-  if (git(repository, ['cat-file', '-t', commit], 1024).toString('ascii') !== 'commit\n')
-    throw Error();
-  const raw = git(repository, ['ls-tree', '-r', '-z', '--full-tree', commit], 4 * 1024 * 1024);
-  if (!raw.length || raw[raw.length - 1] !== 0) throw Error();
-  const records = raw.subarray(0, -1).toString('latin1').split('\0');
-  if (records.length !== names.length) throw Error();
   const result = [];
   let total = 0;
+  let objects = 0;
+  const deadline = performance.now() + gitTimeout;
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  for (const record of records) {
-    const match = /^(100644|100755) blob ([a-f0-9]{40})\t([\x20-\x7e]+)$/.exec(record);
-    if (!match) throw Error();
-    const [, mode, blobSha, name] = match;
-    const expected = manifest.files[name];
+
+  function readObject(type, sha, limit) {
+    const remaining = Math.floor(deadline - performance.now());
+    if (remaining < 1 || ++objects > maxFiles * 2 + 1) throw Error();
+    const bytes = git(repository, ['cat-file', type, sha], limit + 1, remaining);
+    const actual = crypto.createHash('sha1').update(`${type} ${bytes.length}\0`).update(bytes);
+    if (bytes.length > limit || actual.digest('hex') !== sha) throw Error();
+    return bytes;
+  }
+
+  function visit(treeSha, prefix = '') {
+    const bytes = readObject('tree', treeSha, 4 * 1024 * 1024);
+    if (!bytes.length) throw Error();
+    const seen = new Set();
+    for (let offset = 0; offset < bytes.length;) {
+      const end = bytes.indexOf(0, offset);
+      if (end === -1 || end + 21 > bytes.length) throw Error();
+      const entry = /^(40000|100644|100755) ([A-Za-z0-9._-]+)$/.exec(
+        bytes.toString('latin1', offset, end),
+      );
+      if (!entry) throw Error();
+      const [, mode, componentName] = entry;
+      const objectSha = bytes.toString('hex', end + 1, end + 21);
+      offset = end + 21;
+      const name = prefix ? `${prefix}/${componentName}` : componentName;
+      const folded = componentName.toLowerCase();
+      if (!validPath(name) || seen.has(folded)) throw Error();
+      seen.add(folded);
+      if (mode === '40000') {
+        if (manifest ? !expectedDirs.has(name) : !prefix && !rootDirs.has(name)) throw Error();
+        visit(objectSha, name);
+      } else {
+        if (
+          (manifest && !expectedPaths.has(name)) ||
+          (!manifest && !prefix && !rootFiles.has(name))
+        )
+          throw Error();
+        readBlob(name, mode, objectSha);
+      }
+    }
+  }
+
+  function readBlob(name, mode, blobSha) {
+    const expected = manifest?.files[name];
     if (
-      !validPath(name) ||
-      !Object.hasOwn(manifest.files, name) ||
-      !allowedPaths.includes(name) ||
-      !expected ||
-      expected.mode !== mode ||
-      expected.blobSha !== blobSha ||
-      !sha256.test(expected.sha256) ||
+      result.length === maxFiles ||
+      (manifest &&
+        (!Object.hasOwn(manifest.files, name) ||
+          expected?.mode !== mode ||
+          expected.blobSha !== blobSha)) ||
       (mode === '100755' &&
         (name !== executable ||
           (allowedExecutablePaths !== undefined && !allowedExecutablePaths.includes(name))))
     )
       throw Error();
-    const bytes = git(repository, ['cat-file', 'blob', blobSha], maxBlob + 1);
+    const bytes = readObject('blob', blobSha, maxBlob);
     total += bytes.length;
-    if (bytes.length > maxBlob || total > maxTreeBytes || bytes.includes(0)) throw Error();
+    if (total > maxTreeBytes || bytes.includes(0)) throw Error();
     decoder.decode(bytes);
-    if (
-      hash('sha1', Buffer.concat([Buffer.from(`blob ${bytes.length}\0`), bytes])) !== blobSha ||
-      hash('sha256', bytes) !== expected.sha256
-    )
-      throw Error();
-    result.push({ path: name, mode, blobSha, sha256: expected.sha256, bytes });
+    const digest = hash('sha256', bytes);
+    if (manifest && expected.sha256 !== digest) throw Error();
+    result.push({ path: name, mode, blobSha, sha256: digest, bytes });
   }
+
+  const commitBytes = readObject('commit', commit, maxBlob);
+  const head = /^tree ([a-f0-9]{40})\n$/.exec(commitBytes.toString('latin1', 0, 46));
+  if (!head) throw Error();
+  visit(head[1]);
+  if (!result.length || (manifest && result.length !== expectedPaths.size)) throw Error();
   result.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  if (new Set(result.map((entry) => entry.path)).size !== names.length) throw Error();
   return result;
 }
 
-async function observeRelease(input) {
+async function observeRelease(input, prepare) {
   let tree;
   try {
+    if (!prepare && input.manifest === undefined) throw Error();
     tree = observeTree(input);
   } catch {
     return { ok: false, code: 'tree' };
   }
   const checked = [];
+  let configuration;
   try {
+    configuration = prepare ? await prepare(tree) : input;
     if (
-      !Array.isArray(input.artifacts) ||
-      input.artifacts.length !== 3 ||
-      typeof input.verifyPublisher !== 'function'
+      !Array.isArray(configuration.artifacts) ||
+      configuration.artifacts.length !== 3 ||
+      typeof configuration.verifyPublisher !== 'function'
     )
       throw Error();
     const names = new Set();
-    for (const item of input.artifacts) {
+    for (const item of configuration.artifacts) {
       if (
         !item ||
         typeof item.name !== 'string' ||
@@ -186,10 +284,21 @@ async function observeRelease(input) {
       )
         throw Error();
       names.add(item.name);
-      const bytes = await readBounded(item.archivePath, maxArchive);
-      const signature = await readBounded(item.signaturePath, 1024 * 1024);
-      if (hash('sha256', bytes) !== item.sha256) throw Error();
-      checked.push({ name: item.name, bytes, signature });
+      const bytes =
+        prepare && Buffer.isBuffer(item.bytes)
+          ? item.bytes
+          : await readBounded(item.archivePath, maxArchive);
+      const signature =
+        prepare && Buffer.isBuffer(item.signature)
+          ? item.signature
+          : await readBounded(item.signaturePath, 1024 * 1024);
+      if (
+        bytes.length > maxArchive ||
+        signature.length > 1024 * 1024 ||
+        hash('sha256', bytes) !== item.sha256
+      )
+        throw Error();
+      checked.push({ name: item.name, bytes, signature, sha256: item.sha256 });
     }
   } catch {
     return { ok: false, code: 'artifact' };
@@ -197,7 +306,7 @@ async function observeRelease(input) {
   for (const item of checked) {
     try {
       if (
-        (await input.verifyPublisher({
+        (await configuration.verifyPublisher({
           name: item.name,
           bytes: Buffer.from(item.bytes),
           signature: Buffer.from(item.signature),
@@ -210,12 +319,13 @@ async function observeRelease(input) {
   }
   let stage;
   try {
+    if (prepare && (await configuration.validate(checked)) !== true) throw Error();
     const root = await fs.lstat(input.stagingRoot);
     if (
       !root.isDirectory() ||
       root.isSymbolicLink() ||
       root.uid !== process.getuid() ||
-      root.mode & 0o077
+      (root.mode & 0o7777) !== 0o700
     )
       throw Error();
     stage = await fs.mkdtemp(path.join(input.stagingRoot, '.stage-'));
@@ -260,6 +370,7 @@ async function observeRelease(input) {
 
 module.exports = {
   observeRelease,
+  fetchReleaseCommit,
   createProductionPublisherVerifier: require('./publisher-verification.js')
     .createProductionPublisherVerifier,
 };

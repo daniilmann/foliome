@@ -101,14 +101,40 @@ async function verifyBinary(bytes, entry, scratchRoot) {
     command('/usr/bin/codesign', [
       '--verify',
       '--strict',
+      '--check-notarization',
       '-R',
       `=anchor apple generic and identifier "${entry.identifier}" and certificate leaf[subject.OU] = "${entry.team}"`,
       file,
     ]);
-    command('/usr/sbin/spctl', ['-a', '-t', 'install', file]);
+    command('/usr/sbin/spctl', ['-a', '-t', 'install', '--ignore-cache', '--no-cache', file]);
   } finally {
     await fs.rm(scratch, { recursive: true, force: true });
   }
+}
+
+function registryReleaseSignature(metadata) {
+  const signatures = metadata?.dist?.signatures;
+  if (!Array.isArray(signatures) || signatures.length > 16) throw Error();
+  for (const item of signatures) {
+    if (item?.keyid !== keyId || typeof item.sig !== 'string' || item.sig.length > 256) continue;
+    const signature = Buffer.from(item.sig, 'base64');
+    if (
+      signature.length &&
+      signature.toString('base64') === item.sig &&
+      matchesRegistrySignature(metadata.version, metadata.dist.integrity, signature)
+    )
+      return signature;
+  }
+  throw Error();
+}
+
+function matchesRegistrySignature(version, integrity, signature) {
+  return crypto.verify(
+    'sha256',
+    Buffer.from(`playwright-core@${version}:${integrity}`, 'utf8'),
+    { key: keyDer, format: 'der', type: 'spki' },
+    signature,
+  );
 }
 
 function verifyRegistry(bytes, signature, entry, registry) {
@@ -146,12 +172,7 @@ function verifyRegistry(bytes, signature, entry, registry) {
         typeof item.sig === 'string' &&
         Buffer.from(item.sig, 'base64').equals(signature),
     ) ||
-    !crypto.verify(
-      'sha256',
-      Buffer.from(`playwright-core@${entry.version}:${integrity}`, 'utf8'),
-      { key: keyDer, format: 'der', type: 'spki' },
-      signature,
-    )
+    !matchesRegistrySignature(entry.version, integrity, signature)
   )
     throw Error();
 }
@@ -214,4 +235,4 @@ function createProductionPublisherVerifier({ entries, registry, scratchRoot = os
   };
 }
 
-module.exports = { createProductionPublisherVerifier };
+module.exports = { createProductionPublisherVerifier, registryReleaseSignature };

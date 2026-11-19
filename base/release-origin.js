@@ -23,6 +23,14 @@ const registryLimit = 32 * 1024 * 1024;
 const archiveLimit = 256 * 1024 * 1024;
 const timeout = 30000;
 
+function isReleaseRepository(value) {
+  return (
+    typeof value === 'string' &&
+    repositoryPattern.test(value) &&
+    value.split('/').every((part) => !['.', '..', '.git'].includes(part.toLowerCase()))
+  );
+}
+
 function canonicalUrl(value, host) {
   if (typeof value !== 'string' || !value.startsWith(`https://${host}/`)) throw Error();
   const url = new URL(value);
@@ -38,6 +46,7 @@ async function fetchBounded(url, limit) {
     const response = await fetch(url, {
       method: 'GET',
       redirect: 'manual',
+      credentials: 'omit',
       signal: controller.signal,
       headers: {
         accept: new URL(url).hostname === 'api.github.com' ? 'application/vnd.github+json' : '*/*',
@@ -104,10 +113,7 @@ async function readReleaseOrigin(input) {
     const { policy, version, sha, now, verifyBase } = input;
     if (
       !policy ||
-      !repositoryPattern.test(policy.repository) ||
-      policy.repository
-        .split('/')
-        .some((part) => part === '.' || part === '..' || part.toLowerCase() === '.git') ||
+      !isReleaseRepository(policy.repository) ||
       !Number.isSafeInteger(policy.workflowId) ||
       policy.workflowId < 1 ||
       !versionPattern.test(version) ||
@@ -134,9 +140,9 @@ async function readReleaseOrigin(input) {
     const encoded = content.content.replace(/\n/g, '');
     if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded))
       throw Error();
-    const manifest = JSON.parse(
-      new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(encoded, 'base64')),
-    );
+    const manifestBytes = Buffer.from(encoded, 'base64');
+    if (manifestBytes.toString('base64') !== encoded) throw Error();
+    const manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes));
     const codexVersion = manifest?.codex?.version;
     const playwrightVersion = manifest?.playwrightCore?.version;
     if (
@@ -219,13 +225,13 @@ async function readReleaseOrigin(input) {
     canonicalUrl(redirect.headers.location, 'release-assets.githubusercontent.com');
     const archive = await request(transport, redirect.headers.location, archiveLimit);
     if (archive.status !== 200 || archive.body.length === 0) throw Error();
-    // The callback is supplied by installed code, never by the manifest. It must
-    // independently verify the repository tree and all issuer artifacts.
+    // Installed code binds these observations to the independently read Git bytes.
     const observations = {
       sha,
       version,
       tag: { name: tag, sha },
       manifest,
+      manifestBytes,
       run,
       jobs,
       candidateRun: {
@@ -252,4 +258,33 @@ async function readReleaseOrigin(input) {
   }
 }
 
-module.exports = { readReleaseOrigin };
+async function readReleaseArchive(url, limit) {
+  const response = await request(fetchBounded, url, limit);
+  if (response.status !== 200 || !response.body.length) throw Error();
+  return response.body;
+}
+
+function playwrightArchiveUrl(version) {
+  if (typeof version !== 'string' || !/^1\.64\.(0|[1-9]\d*)$/.test(version)) throw Error();
+  return `https://registry.npmjs.org/playwright-core/-/playwright-core-${version}.tgz`;
+}
+
+async function readReleaseArchives(nodeVersion, playwrightVersion, observedTarball) {
+  if (typeof nodeVersion !== 'string' || !/^26\.13\.(0|[1-9]\d*)$/.test(nodeVersion)) throw Error();
+  const playwrightUrl = playwrightArchiveUrl(playwrightVersion);
+  if (observedTarball !== playwrightUrl) throw Error();
+  const nodeArchive = `node-v${nodeVersion}-darwin-arm64.tar.gz`;
+  const node = await readReleaseArchive(
+    `https://nodejs.org/dist/v${nodeVersion}/${nodeArchive}`,
+    128 * 1024 * 1024,
+  );
+  const playwright = await readReleaseArchive(playwrightUrl, 32 * 1024 * 1024);
+  return { node, nodeArchive, playwright };
+}
+
+module.exports = {
+  readReleaseOrigin,
+  readReleaseArchives,
+  isReleaseRepository,
+  playwrightArchiveUrl,
+};
