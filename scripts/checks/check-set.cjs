@@ -7,6 +7,7 @@ const { fileURLToPath, pathToFileURL } = require('node:url');
 
 // Release CI only. Keep this policy in the pinned check set and update it with direct test imports.
 const publicEntries = new Set([
+  'base/install-platform.js',
   'base/install-root.js',
   'base/launcher.js',
   'base/release-materialization.js',

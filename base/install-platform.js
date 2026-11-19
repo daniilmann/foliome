@@ -227,26 +227,32 @@ function numeric(value) {
   return Number(value);
 }
 
+/** @param {string} record @param {string[]} required @param {string[]} [optional] */
+function accountAttributes(record, required, optional = []) {
+  const properties = /** @type {Record<string, string>} */ (Object.create(null));
+  for (const line of record.split('\n')) {
+    const [, label, value] = /^(dsAttrTypeNative:IsHidden|[A-Za-z]+): (.+)$/.exec(line) ?? [];
+    const key = label === 'dsAttrTypeNative:IsHidden' ? 'IsHidden' : label;
+    if ((!required.includes(key) && !optional.includes(key)) || Object.hasOwn(properties, key))
+      throw Error('boundary-account');
+    properties[key] = value;
+  }
+  if (required.some((key) => !Object.hasOwn(properties, key))) throw Error('boundary-account');
+  return properties;
+}
+
 /** @param {string} name @param {boolean} [agent] */
 async function account(name, agent = false) {
   if (!/^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$/.test(name)) throw Error('boundary-account');
   const attributes = ['UniqueID', 'PrimaryGroupID', 'NFSHomeDirectory', 'UserShell'];
   if (agent) attributes.push('RecordName', 'GeneratedUID', 'IsHidden');
   const record = await output('/usr/bin/dscl', ['.', '-read', '/Users/' + name, ...attributes]);
-  const properties = Object.fromEntries(
-    record.split('\n').map((line) => {
-      const [, key, value] = /^([A-Za-z]+): (.+)$/.exec(line) ?? [];
-      if (!attributes.includes(key)) throw Error('boundary-account');
-      return [key, value];
-    }),
-  );
+  const properties = accountAttributes(record, attributes);
   if (
-    record.split('\n').length !== attributes.length ||
-    Object.keys(properties).length !== attributes.length ||
-    (agent &&
-      (properties.RecordName !== executor ||
-        properties.IsHidden !== '1' ||
-        !guidPattern.test(properties.GeneratedUID)))
+    agent &&
+    (properties.RecordName !== executor ||
+      properties.IsHidden !== '1' ||
+      !guidPattern.test(properties.GeneratedUID))
   )
     throw Error('boundary-account');
   const uid = numeric(properties.UniqueID);
@@ -302,10 +308,60 @@ async function executorExists() {
   );
 }
 
+/**
+ * macOS reports these groups even for a non-admin local account.
+ * Verify the directory records rather than treating their GIDs as sufficient.
+ * @param {string} effective @param {string} guid @param {typeof output} [read]
+ */
+async function checkExecutorGroups(effective, guid, read = output) {
+  const groups = effective.split(' ').map(numeric);
+  if (groups.some((gid) => ![12, 20, 61, 100, 399, 701, 702].includes(gid)))
+    throw Error('boundary-account');
+
+  const fields = ['RecordName', 'PrimaryGroupID'];
+  if (groups.includes(399)) {
+    const required = [...fields, 'GroupMembership', 'GroupMembers'];
+    const sshGroup = accountAttributes(
+      await read('/usr/bin/dscl', ['.', '-read', '/Groups/com.apple.access_ssh', ...required]),
+      required,
+    );
+    if (
+      sshGroup.RecordName !== 'com.apple.access_ssh' ||
+      sshGroup.PrimaryGroupID !== '399' ||
+      !sshGroup.GroupMembership.split(' ').includes(executor) ||
+      !sshGroup.GroupMembers.split(' ').includes(guid)
+    )
+      throw Error('boundary-account');
+  }
+
+  // OpenDirectory assigns these fixed GUIDs to its well-known built-in groups.
+  const builtIn = (/** @type {string} */ suffix) => 'ABCDEFAB-CDEF-ABCD-EFAB-CDEF000000' + suffix;
+  for (const { gid, name, parents } of [
+    { gid: 100, name: '_lpoperator', parents: [builtIn('3D'), builtIn('62')] },
+    { gid: 702, name: 'com.apple.sharepoint.group.2', parents: [builtIn('0C')] },
+  ]) {
+    if (!groups.includes(gid)) continue;
+    const required = [...fields, 'NestedGroups'];
+    const ownMembers = ['GroupMembership', 'GroupMembers'];
+    const inherited = accountAttributes(
+      await read('/usr/bin/dscl', ['.', '-read', '/Groups/' + name, ...required, ...ownMembers]),
+      required,
+      ownMembers,
+    );
+    if (
+      inherited.RecordName !== name ||
+      inherited.PrimaryGroupID !== String(gid) ||
+      ownMembers.some((key) => Object.hasOwn(inherited, key)) ||
+      inherited.NestedGroups.split(' ').sort().join(' ') !== parents.join(' ')
+    )
+      throw Error('boundary-account');
+  }
+}
+
 /** @param {{uid: number}} owner */
 async function executorIdentity(owner) {
   const agent = await account(executor, true);
-  const groups = (await output('/usr/bin/id', ['-G', executor])).split(' ').map(numeric);
+  await checkExecutorGroups(await output('/usr/bin/id', ['-G', executor]), agent.guid);
   const shell = await fs.lstat(executorShell);
   if (
     agent.uid === owner.uid ||
@@ -313,7 +369,6 @@ async function executorIdentity(owner) {
     agent.home !== executorHome ||
     agent.shell !== executorShell ||
     agent.gid !== staff ||
-    groups.some((gid) => ![12, 20, 61, 701].includes(gid)) ||
     (await output('/usr/bin/dscl', ['.', '-read', '/Groups/staff', 'PrimaryGroupID'])) !==
       'PrimaryGroupID: 20' ||
     (await localUid(agent.uid)) !== executor + '\t\tUniqueID = (\n    ' + agent.uid + '\n)' ||
@@ -848,6 +903,8 @@ async function checkLiveBoundary(key, agent) {
 }
 
 module.exports = {
+  accountAttributes,
+  checkExecutorGroups,
   swapDirectories,
   acl,
   authorize,
