@@ -87,3 +87,36 @@ test(
     });
   },
 );
+
+test(
+  'ядро закрывает сессию ровно на десятой безусловной подписи',
+  { timeout: 60_000 },
+  async () => {
+    await stand(async (fixture) => {
+      await fixture.runtime.open();
+      await fixture.login();
+      const page = fixture.sourcePage() as import('playwright-core').Page;
+      await page.setContent('<button type="button">Settings</button>');
+      const client = await fixture.connect();
+      for (let count = 1; count <= 10; count++) {
+        const before = await client.call('snapshot');
+        assert.equal(before.result.isError, undefined, String(count));
+        const snapshot = JSON.parse(before.result.content[0].text);
+        const target = snapshot.elements.find((item: { text: string }) => item.text === 'Settings');
+        assert.ok(target);
+        const denied = await client.call('readText', {
+          snapshotNumber: snapshot.snapshot,
+          nodeNumber: target.n,
+        });
+        assert.equal(denied.result.content[0].text, 'blocked-change');
+      }
+      await fixture.closing.promise;
+      assert.equal((await client.call('snapshot')).result.content[0].text, 'session-unavailable');
+      assert.equal(fixture.successfulReads(), 0);
+      assert.deepEqual(
+        fixture.runtime.rows().map((row: { reason: string }) => row.reason),
+        [...Array(10).fill('blocked-change'), 'limit'],
+      );
+    });
+  },
+);

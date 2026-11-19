@@ -580,7 +580,7 @@ test(
       (await import('../../core/adapters/browser/capture-snapshot.ts')) as any;
     const { randomBytes } = require('node:crypto');
     const { chromium } = require(process.env.FOLIOME_STAND_PLAYWRIGHT_CORE ?? 'playwright-core');
-    const password = randomBytes(12).toString('hex');
+    const password = 'synthetic' + randomBytes(12).toString('hex');
     for (const uncertain of [false, true])
       await t.test(
         uncertain
