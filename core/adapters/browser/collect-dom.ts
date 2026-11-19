@@ -146,6 +146,7 @@ const expression = String.raw`(() => {
     return state;
   })());
   if (state.observer.takeRecords().length) state.revision++;
+  state.measuredRoots = new WeakSet();
   let unsupported = !!CSS.highlights?.size;
   const selection = getSelection();
   const selectionPainted = selection && !selection.isCollapsed;
@@ -287,6 +288,7 @@ const expression = String.raw`(() => {
     const choice = tag === 'INPUT' && ['checkbox', 'radio'].includes(type);
     const field = closedField || tag === 'INPUT' && !button && !choice || tag === 'SELECT' || tag === 'TEXTAREA' || fieldRoles.has(role);
     const root = element.shadowRoot;
+    if (root && !field) state.measuredRoots.add(root);
     if (root && !state.watched.has(root)) {
       state.observer.observe(root, { subtree: true, attributes: true, childList: true, characterData: true });
       root.addEventListener('slotchange', () => { state.revision++; });
@@ -384,7 +386,7 @@ const expression = String.raw`(() => {
   const animationIds = animations.map(a => { if (!state.ids.has(a)) state.ids.set(a, state.next++); return String(state.ids.get(a)); }).sort();
   const animationTargets = animations.map(a => {
     const target = a.effect instanceof KeyframeEffect ? a.effect.target : null;
-    return target instanceof Element && document.contains(target) && state.ids.has(target) ? state.ids.get(target) : null;
+    return target instanceof Element && target.isConnected && target.ownerDocument === document && state.ids.has(target) ? state.ids.get(target) : null;
   });
   const viewport = visualViewport;
   const viewportStable = !!viewport && devicePixelRatio === 1 && viewport.scale === 1 && viewport.offsetLeft === 0 && viewport.offsetTop === 0 && viewport.pageLeft === scrollX && viewport.pageTop === scrollY && viewport.width === innerWidth && viewport.height === innerHeight;
@@ -426,6 +428,7 @@ const shadowGeometry = `function() {
     state.watched.add(this);
   }
   const hostId = state.ids.get(this.host), mode = this.mode;
+  if (mode === "open" && state.measuredRoots?.has(this)) return { hostId, mode, composed: true };
   try {
     if (this.host.getAnimations({ subtree: true }).some(a => a.playState === 'running' || a.playState === 'pending')) throw new Error();
     const hasTransform = ${hasTransform};
@@ -849,6 +852,8 @@ async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: Nod
       if (!positiveId(value.hostId) || value.mode !== mode) throw new Error();
       const index = world.identities.indexOf(value.hostId);
       if (index < 0 || world.identities.lastIndexOf(value.hostId) !== index) throw new Error();
+      touched.add(world);
+      if (mode === 'open' && value.composed === true) continue;
       if (mode === 'closed') {
         const node = nodes[world.base + index];
         node.state = node.state ? node.state + ' unavailable' : 'unavailable';
@@ -864,7 +869,6 @@ async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: Nod
         throw new Error();
       world.shadows ??= [];
       world.shadows.push({ index, backendNodeId: backend, bounds });
-      touched.add(world);
     } catch {
       world.observation.unsupported = true;
     }

@@ -1750,6 +1750,37 @@ test(
   },
 );
 
+test(
+  'открытый shadow маскирует текст и сохраняет соседние пиксели',
+  { timeout: 60_000 },
+  async () => {
+    await measuredPage(
+      '<div id="host" style="left:20px;top:20px;width:300px;height:80px"></div><script>document.querySelector("#host").attachShadow({mode:"open"}).innerHTML=\'<span id="secret" style="position:absolute;left:10px;top:10px;font:20px monospace;color:red">4111 1111 1111 1111</span><div id="color" style="position:absolute;left:240px;top:10px;width:30px;height:30px;background:rgb(20,100,220)"></div>\'</script>',
+      async ({ page, capture, decode }: any) => {
+        const secret = await page.locator('#host').locator('#secret').boundingBox();
+        const swatch = await page.locator('#host').locator('#color').boundingBox();
+        assert.ok(secret && swatch);
+        const before = await decode(await capture.raw());
+        const result = await capture.result();
+        assert.equal(result.ok, true);
+        assert.ok(Buffer.isBuffer(result.image.bytes), 'image status: ' + result.image.code);
+        const after = await decode(result.image.bytes);
+        let painted = 0;
+        for (let y = Math.ceil(secret.y); y < Math.floor(secret.y + secret.height); y++)
+          for (let x = Math.ceil(secret.x); x < Math.floor(secret.x + secret.width / 2); x++) {
+            const raw = pixelAt(before, x, y);
+            if (raw[0] > 130 && raw[0] > raw[1] * 2 && raw[0] > raw[2] * 2) {
+              painted++;
+              assert.deepEqual(pixelAt(after, x, y), [0, 0, 0, 255]);
+            }
+          }
+        assert.ok(painted > 0);
+        assert.deepEqual(pixelAt(after, swatch.x + 15, swatch.y + 15), [20, 100, 220, 255]);
+      },
+    );
+  },
+);
+
 test('закрытый shadow обозначен недоступным в текстовом снимке', { timeout: 60_000 }, async () => {
   await measuredPage(
     '<div id="target" style="left:20px;top:20px;width:120px;height:60px"></div><div id="ordinary" style="left:300px;top:30px">Readable marker</div><script>document.querySelector("#target").attachShadow({mode:"closed"}).append(document.createTextNode("Hidden marker"))</script>',
