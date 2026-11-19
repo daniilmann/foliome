@@ -104,55 +104,6 @@ sub signed_node {
   command('/usr/sbin/spctl', '-a', '-t', 'install', '--ignore-cache', '--no-cache', $file);
 }
 
-sub previous_base {
-  my $admin = "$root/.install";
-  if (!lstat($admin)) { $!{ENOENT} or refuse(); return; }
-  info($admin, 0700, 1);
-  my $writer = "$admin/install.lease.sqlite";
-  if (lstat($writer)) {
-    info($writer, 0600, 0);
-    command('/usr/bin/sqlite3', '-batch', '-init', '/dev/null', $writer, 'BEGIN EXCLUSIVE; ROLLBACK;');
-  } else { $!{ENOENT} or refuse(); }
-  my $record = "$admin/pending.json";
-  my @s = lstat($record);
-  if (!@s) { $!{ENOENT} or refuse(); return; }
-  info($record, 0600, 0);
-  $s[7] <= 1048576 or refuse();
-  open(my $reader, '<', $record) or refuse();
-  local $/;
-  my $journal = decode_json(<$reader>);
-  close($reader) or refuse();
-  ref($journal->{operations}) eq 'ARRAY' && JSON::PP::is_bool($journal->{committed}) or refuse();
-  my @swaps = grep { $_->{target} eq $base } @{$journal->{operations}};
-  return unless @swaps;
-  @swaps == 1 or refuse();
-  my ($operation) = @swaps;
-  $operation->{tree} && $operation->{directory} && $operation->{token} =~ /\A[a-f0-9]{32}\z/ or refuse();
-  my $prefix = "$root/.foliome-install-$operation->{token}";
-  my ($backup, $staged) = ("$prefix.old", "$prefix.new");
-  my $matches = sub {
-    my ($dir, $expected) = @_;
-    info($dir, 0755, 1);
-    my @state = lstat($dir);
-    ref($expected) eq 'ARRAY' && @$expected == 2 &&
-      $state[0] == $expected->[0] && $state[1] == $expected->[1] or refuse();
-  };
-  if ($journal->{committed}) { $matches->($base, $operation->{after}); return; }
-  if (!lstat($backup)) {
-    $!{ENOENT} or refuse();
-    $matches->($base, $operation->{before});
-    return;
-  }
-  $matches->($backup, $operation->{before});
-  if (lstat($base)) {
-    $matches->($base, $operation->{after});
-    !lstat($staged) && $!{ENOENT} or refuse();
-    rename($base, $staged) or refuse();
-  } else { $!{ENOENT} or refuse(); }
-  rename($backup, $base) or refuse();
-  sync_directory($root);
-}
-
 sub assemble {
   my ($scratch, $sha, $self, $owner) = @_;
   my $new = "$scratch/base";
@@ -288,7 +239,6 @@ sub root_main {
     info("$root/$stale", 0700, 1);
     remove_tree("$root/$stale", { safe => 1 });
   }
-  previous_base();
   my $installed = lstat($base);
   $installed || $!{ENOENT} or refuse();
   if ($initial) {
@@ -326,32 +276,39 @@ sub root_main {
   exit($status == 0 ? 0 : 1);
 }
 
-# The privileged command is literal code from this approved blob. It treats
-# stdin as bytes and verifies their digest before publishing or invoking them.
+# This first elevated verifier is literal code from the exact SHA approved
+# before the password. It obtains the dispatcher independently of the owner.
 my $provision = <<'PROVISION';
 use strict;
 use warnings;
-use Digest::SHA qw(sha256_hex);
+use Digest::SHA qw(sha1_hex);
 use Fcntl qw(:flock O_CREAT O_DIRECTORY O_NOFOLLOW O_NONBLOCK O_RDONLY O_RDWR);
-use File::Temp qw(tempfile);
+use File::Path qw(remove_tree);
+use File::Temp qw(tempdir tempfile);
 use IO::Handle ();
 
 sub refuse { die "install-provision: approved release, checks or keys differ\n"; }
-my ($sha, $digest, $proof) = @ARGV;
-$^O eq 'darwin' && $< == 0 && $> == 0 && @ARGV == 3 && !keys(%ENV) &&
-  $sha =~ /\A[a-f0-9]{40}\z/ && $digest =~ /\A[a-f0-9]{64}\z/ &&
-  $proof =~ /\A[a-f0-9]{64}\z/ or refuse();
+my ($sha, $proof) = @ARGV;
+$^O eq 'darwin' && $< == 0 && $> == 0 && @ARGV == 2 && !keys(%ENV) &&
+  $sha =~ /\A[a-f0-9]{40}\z/ && $proof =~ /\A[a-f0-9]{64}\z/ or refuse();
 chdir '/' or refuse();
 umask 0077;
-my $bytes = '';
-while (1) {
-  my $n = sysread(STDIN, my $chunk, 16384);
-  defined($n) or refuse();
-  last unless $n;
-  $bytes .= $chunk;
-  length($bytes) <= 131072 or refuse();
+
+sub capture {
+  my ($limit, @args) = @_;
+  open(my $child, '-|', @args) or refuse();
+  binmode($child);
+  my $bytes = '';
+  while (1) {
+    my $n = sysread($child, my $chunk, 16384);
+    defined($n) or refuse();
+    last unless $n;
+    $bytes .= $chunk;
+    length($bytes) <= $limit or refuse();
+  }
+  close($child) or refuse();
+  return $bytes;
 }
-sha256_hex($bytes) eq $digest or refuse();
 
 sub acl {
   my ($file, $stock) = @_;
@@ -378,6 +335,39 @@ for my $dir ('/', '/Library', $parent) {
   @s && -d _ && $s[4] == 0 && ($s[2] & 07022) == 0 or refuse();
   acl($dir, 1);
 }
+# Use a root-owned object store and stock Git before touching installed files.
+my $scratch = tempdir('.foliome-verify-XXXXXXXX', DIR => $parent, CLEANUP => 1);
+chown(0, 0, $scratch) == 1 or refuse();
+check($scratch, 0700, 1);
+my $bytes;
+{
+  local %ENV = (PATH => '/usr/bin:/bin', HOME => '/dev/null', LC_ALL => 'C',
+    GIT_CONFIG_NOSYSTEM => '1', GIT_CONFIG_GLOBAL => '/dev/null',
+    GIT_TERMINAL_PROMPT => '0', GIT_ALLOW_PROTOCOL => 'https');
+  local $SIG{ALRM} = sub { refuse(); };
+  alarm 120;
+  my @git = ('/usr/bin/git', '--no-optional-locks', '--no-replace-objects', '-C', $scratch,
+    '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never',
+    '-c', 'protocol.https.allow=always', '-c', 'credential.helper=',
+    '-c', 'http.followRedirects=false', '-c', 'http.sslVerify=true', '-c', 'http.proxy=',
+    '-c', 'http.lowSpeedLimit=1024', '-c', 'http.lowSpeedTime=15', '-c', 'fetch.fsckObjects=true');
+  system(@git, 'init', '--quiet', '--bare', '--template=', '--object-format=sha1') == 0 or refuse();
+  system(@git, 'fetch', '--quiet', '--no-tags', '--depth=1', '--no-recurse-submodules',
+    '--no-auto-maintenance', '--no-write-fetch-head', '--',
+    'https://github.com/daniilmann/foliome.git', $sha) == 0 or refuse();
+  my $commit = capture(1048576, @git, 'cat-file', 'commit', $sha);
+  sha1_hex('commit ' . length($commit) . "\0" . $commit) eq $sha or refuse();
+  system(@git, 'fsck', '--strict', '--no-reflogs', '--no-dangling', $sha) == 0 or refuse();
+  my $record = capture(4096, @git, 'ls-tree', '--full-tree', '-r', '-z', $sha, '--', 'base/bootstrap-root.pl');
+  $record =~ /\A100644 blob ([a-f0-9]{40})\tbase\/bootstrap-root\.pl\0\z/ or refuse();
+  my $blob = $1;
+  $bytes = capture(131072, @git, 'cat-file', 'blob', $blob);
+  sha1_hex('blob ' . length($bytes) . "\0" . $bytes) eq $blob or refuse();
+  alarm 0;
+}
+remove_tree($scratch, { safe => 1 });
+!lstat($scratch) && $!{ENOENT} or refuse();
+
 if (!lstat($root)) {
   $!{ENOENT} or refuse();
   umask 0022;
@@ -470,12 +460,8 @@ sub owner_main {
   my $proof = capture(65, @owner, 'stage', $sha, $input);
   $proof =~ /\A([a-f0-9]{64})\n\z/ or refuse();
   $proof = $1;
-  my $digest = Digest::SHA::sha256_hex($self);
-  open(my $admin, '|-', '/usr/bin/sudo', '--', '/usr/bin/env', '-i',
-    '/usr/bin/perl', '-e', $provision, '--', $sha, $digest, $proof) or refuse();
-  binmode($admin);
-  print $admin $self or refuse();
-  close($admin) or refuse();
+  command('/usr/bin/sudo', '--', '/usr/bin/env', '-i',
+    '/usr/bin/perl', '-e', $provision, '--', $sha, $proof);
   command(@owner, 'finish', $sha, $input);
   print "Foliome is ready.\n";
 }

@@ -117,7 +117,7 @@ function completeList(value, field) {
   if (
     !value ||
     !Number.isSafeInteger(value.total_count) ||
-    value.total_count < 1 ||
+    value.total_count < 0 ||
     value.total_count > 100 ||
     !Array.isArray(value[field]) ||
     value[field].length !== value.total_count
@@ -207,7 +207,7 @@ async function readReleaseOrigin(input) {
       'workflow_runs',
     );
     // Multiple matching runs are ambiguous: do not choose an older successful run.
-    if (runs.length !== 1) throw Error();
+    if (runs.length !== 1) throw Error('ci-awaiting');
     const run = runs[0];
     if (
       !Number.isSafeInteger(run.id) ||
@@ -231,7 +231,7 @@ async function readReleaseOrigin(input) {
       !Array.isArray(run.pull_requests) ||
       run.pull_requests.length
     )
-      throw Error();
+      throw Error('ci-awaiting');
     const jobs = completeList(
       await json(
         transport,
@@ -252,10 +252,10 @@ async function readReleaseOrigin(input) {
         job.status !== 'completed' ||
         job.conclusion !== 'success'
       )
-        throw Error();
+        throw Error('ci-awaiting');
       names.add(job.name);
     }
-    if (!requiredJobs.every((name) => names.has(name))) throw Error();
+    if (!requiredJobs.every((name) => names.has(name))) throw Error('ci-awaiting');
     const npm = await json(transport, 'https://registry.npmjs.org/playwright-core', registryLimit);
     const packageVersion = npm?.versions?.[playwrightVersion];
     const publishedAt = npm?.time?.[playwrightVersion];
@@ -304,8 +304,10 @@ async function readReleaseOrigin(input) {
     return { ok: true, sha, version };
   } catch (error) {
     // Never expose a redirect URL or remote response in errors or logs.
-    if (input.productionErrors && ['network', 'network-timeout'].includes(error.message))
-      throw error;
+    if (input.productionErrors) {
+      if (['ci-awaiting', 'network', 'network-timeout'].includes(error.message)) throw error;
+      throw Error('release-observation');
+    }
     return { ok: false };
   }
 }

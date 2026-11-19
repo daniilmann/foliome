@@ -45,6 +45,7 @@ const {
   shaPattern,
   sshSnapshot,
   startSsh,
+  swapDirectories,
   sshProfile,
   stat,
   verifyHostKey,
@@ -268,8 +269,8 @@ function parseHandoff(value) {
   return value;
 }
 
-async function activationStatus(owner, sha) {
-  const result = await asUser(owner, 'activation-status', sha);
+async function activationStatus(owner, sha, recover = false) {
+  const result = await asUser(owner, recover ? 'recover-activation' : 'activation-status', sha);
   return JSON.parse(result.toString('utf8'));
 }
 
@@ -283,7 +284,7 @@ function activationCommitted(state, selection) {
 async function recoverActivation(selection) {
   parseHandoff(selection);
   const owner = await localOwner();
-  const state = await activationStatus(owner, selection.sha);
+  const state = await activationStatus(owner, selection.sha, true);
   return activationDecision(state, selection);
 }
 
@@ -306,7 +307,8 @@ async function settleSystem(journal, resolve = recoverActivation) {
   }
 }
 
-async function ownerCommit(owner, selection) {
+async function ownerCommit(owner, selection, payload, selectedNode, nodeDigest) {
+  const input = serialize({ selection, payload, selectedNode, nodeDigest });
   const child = spawn(
     node,
     ['--disable-sigusr1', path.join(base, 'install-owner.js'), 'activate-update', selection.sha],
@@ -315,37 +317,42 @@ async function ownerCommit(owner, selection) {
       env: {},
       uid: owner.uid,
       gid: owner.gid,
-      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      stdio: ['pipe', 'ignore', 'ignore', 'ipc'],
     },
   );
   const waiting = Promise.withResolvers();
   const completed = Promise.withResolvers();
   const exited = new Promise((resolve) => child.once('close', resolve));
   function fail() {
-    waiting.resolve(false);
+    waiting.resolve('boundary-state');
     completed.resolve(null);
   }
   const timer = setTimeout(() => {
     child.kill('SIGKILL');
     fail();
-  }, 30000);
+  }, 540000);
   child.once('error', fail);
   child.once('close', () => {
     clearTimeout(timer);
     fail();
   });
   child.on('message', (message) => {
-    if (message === 'listening')
-      child.send(selection, (error) => {
-        if (error) fail();
-      });
-    else if (message === 'ready') waiting.resolve(true);
+    if (message === 'ready') waiting.resolve(null);
+    else if (
+      ['self-check', 'incompatible', 'self-check-timeout', 'self-check-unavailable'].includes(
+        message?.preflight,
+      )
+    )
+      waiting.resolve(message.preflight);
     else if (message?.state) completed.resolve(message.state);
   });
-  if (!(await waiting.promise)) {
+  child.stdin.on('error', fail);
+  child.stdin.end(input);
+  const refusal = await waiting.promise;
+  if (refusal) {
     child.kill('SIGKILL');
     await exited;
-    throw Error('boundary-state');
+    throw Error(refusal);
   }
   let requested = false;
   return {
@@ -543,10 +550,10 @@ async function checkInstalled(plan, host, agent) {
       !fileMode(await fs.lstat(file.path), 0, file.mode, 0) ||
       !(await fs.readFile(file.path)).equals(Buffer.from(file.content))
     )
-      throw Error('boundary-permissions');
+      throw Error('boundary-refused');
     await requireAcl(file.path, file.acl ?? []);
   }
-  if ((await verifyHostKey(hostFile)) !== host) throw Error('boundary-ssh');
+  if ((await verifyHostKey(hostFile)) !== host) throw Error('boundary-refused');
   return checkLiveBoundary(host, agent);
 }
 
@@ -568,7 +575,6 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
   }
   const existing =
     current && (await verifiedExecutor({ uid: current.executorUid, guid: current.executorGuid }));
-  if (existing) await accounts.finish(current, existing);
 
   const handoff = initialInstall
     ? null
@@ -634,22 +640,34 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
       hash(await fs.readFile(pfFile)) !== current.pfDigest)
   )
     throw Error('boundary-pf');
-  const agent = existing ?? (await accounts.prepare(selected.stage.sha, owner));
+  if (handoff && !existing) throw Error('boundary-account');
+  const agent = handoff ? existing : (existing ?? (await accounts.prepare(sha, owner)));
   const { plan, settings, host, newHostKey, pf, task } = await planFor(
     selected,
     owner,
     agent,
     scratch,
   );
-  const payload = serialize(await ownerPayload(materialized, settings));
+  const payload = await ownerPayload(materialized, settings);
   await fs.writeFile(path.join(scratch, 'pf'), pf.content, { flag: 'wx', mode: 0o600 });
   await fs.writeFile(path.join(scratch, 'plist'), task.content, { flag: 'wx', mode: 0o600 });
   await run('/sbin/pfctl', ['-n', '-a', 'com.apple/foliome', '-f', path.join(scratch, 'pf')]);
   await run('/usr/bin/plutil', ['-lint', '--', path.join(scratch, 'plist')]);
 
-  if (handoff) await asUser(owner, 'verify-update', sha, payload);
   let activation;
   try {
+    if (handoff) {
+      const changesRuntime =
+        handoff.kind === 'update' && runtimeDigests.node !== (await installedRuntime(current)).node;
+      activation = await ownerCommit(
+        owner,
+        handoff,
+        payload,
+        changesRuntime ? runtime.node : undefined,
+        runtimeDigests.node,
+      );
+      await publishRootFence();
+    }
     const tx = await journal.begin(handoff ?? undefined);
     for (const item of plan.directories) {
       if (
@@ -691,9 +709,7 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
     await requireAcl(path.join(root, 'channel'), ['user:executor allow search']);
     if (!handoff) {
       await asUser(agent, 'prepare-executor', sha);
-      await asUser(owner, 'prepare-initial', sha, payload);
-    } else {
-      activation = await ownerCommit(owner, handoff);
+      await asUser(owner, 'prepare-initial', sha, serialize(payload));
     }
     if ((await localOwner()).uid !== owner.uid) throw Error('boundary-account');
     await verifiedExecutor(agent);
@@ -728,7 +744,9 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
     try {
       await settleSystem(journal, async (selection) => {
         const state = await activation?.select('status');
-        return state ? activationDecision(state, selection) : recoverActivation(selection);
+        if (state) return activationDecision(state, selection);
+        await activation?.close();
+        return recoverActivation(selection);
       });
     } finally {
       await activation?.close();
@@ -765,15 +783,18 @@ async function installApprovedSystem(sha, initialInstall) {
   await rootParents(base);
   await requireAcl(root, []);
   await etcAlias();
-  try {
-    await fs.mkdir(admin, { mode: 0o700 });
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
+  if (initialInstall) {
+    try {
+      await fs.mkdir(admin, { mode: 0o700 });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
   }
   if (!dirMode(await fs.lstat(admin), 0, 0o700, 0)) throw Error('boundary-entry');
   await requireAcl(admin, []);
+  if (!initialInstall) await trustedFile(path.join(admin, 'install.lease.sqlite'), 0o600);
   await exclusive(path.join(admin, 'install'), async () => {
-    const journal = installationJournal(admin, authorize);
+    const journal = installationJournal(admin, authorize, swapDirectories);
     const recovering = !!(await stat(rootFence));
     await settleSystem(journal);
     if (recovering && !initialInstall) return;
@@ -786,9 +807,6 @@ async function installApprovedSystem(sha, initialInstall) {
     }
     const scratch = await fs.mkdtemp(path.join(admin, 'work-'));
     try {
-      // Fence new launches before reading the owner's handoff. On restart,
-      // the launcher discards an interrupted handoff before checking the fence again.
-      if (!initialInstall) await publishRootFence();
       await apply(sha, initialInstall, scratch, journal, executorInstaller(admin));
     } finally {
       try {

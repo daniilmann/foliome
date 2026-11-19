@@ -75,7 +75,7 @@ async function bytes(p, uid, limit) {
     await h.close();
   }
 }
-async function verifyInventory(release, record, sha, uid) {
+async function readInventory(record, sha, uid) {
   const value = JSON.parse((await bytes(record, uid, maxInventory)).toString('utf8'));
   if (
     !value ||
@@ -91,7 +91,6 @@ async function verifyInventory(release, record, sha, uid) {
   const names = Object.keys(value.files);
   if (!names.length || names.length > 10000 || !names.includes('core/system-entrypoint.ts'))
     throw Error('inventory');
-  const directories = new Set();
   for (const name of names) {
     const parts = name.split('/');
     if (
@@ -103,6 +102,16 @@ async function verifyInventory(release, record, sha, uid) {
       !digestPattern.test(value.files[name])
     )
       throw Error('inventory');
+  }
+  return value.files;
+}
+
+async function verifyInventory(release, record, sha, uid) {
+  const files = await readInventory(record, sha, uid);
+  const names = Object.keys(files);
+  const directories = new Set();
+  for (const name of names) {
+    const parts = name.split('/');
     for (let i = 1; i < parts.length; i++) directories.add(parts.slice(0, i).join('/'));
   }
   const remaining = new Set(names);
@@ -124,14 +133,14 @@ async function verifyInventory(release, record, sha, uid) {
         total += stat.size;
         if (total > 1024 * 1024 * 1024) throw Error('inventory');
         const content = await bytes(file, uid, maxFile);
-        if (createHash('sha256').update(content).digest('hex') !== value.files[relative])
+        if (createHash('sha256').update(content).digest('hex') !== files[relative])
           throw Error('digest');
       }
     }
   }
   await visit(release, '');
   if (remaining.size || performance.now() > deadline) throw Error('inventory');
-  return value.files;
+  return files;
 }
 async function installedPaths(home, root) {
   const uid = process.getuid?.();
@@ -177,7 +186,15 @@ async function launchAcceptedRelease({ home, systemRoot: root, run, supervise })
   const { uid, data, releases, accepted, tmpdir, node, dbPath } = await installedPaths(home, root);
   await directory(tmpdir, uid);
   const { exclusive, marker } = require('./activation-state.js');
-  return exclusive(path.join(data, 'activation.json'), async () => {
+  return exclusive(path.join(data, 'activation.json'), async (withoutLease) => {
+    const paths = { uid, home, data, releases, accepted, tmpdir, node, dbPath, withoutLease };
+    if (supervise && root === systemRoot) {
+      const { rootFence } = require('./install-production.js');
+      const { stat } = require('./install-transaction.js');
+      // A killed SQLite writer may leave a hot journal. The installed recovery
+      // helper must settle it under the owner UID before reading the marker.
+      if (await stat(rootFence)) return supervise(paths);
+    }
     const file = await openFile(dbPath, uid, Number.MAX_SAFE_INTEGER);
     try {
       const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -186,32 +203,20 @@ async function launchAcceptedRelease({ home, systemRoot: root, run, supervise })
         const now = await fs.lstat(dbPath);
         if (now.dev !== file.s.dev || now.ino !== file.s.ino || !now.isFile())
           throw Error('database');
+        db.exec('PRAGMA trusted_schema = OFF');
         state = marker(db);
       } finally {
         db.close();
       }
       if (!state || !shaPattern.test(state.current)) throw Error('state');
       const release = path.join(releases, state.current);
-      const inventory = await verifyInventory(
+      if (supervise) return await supervise({ ...paths, state, release });
+      await verifyInventory(
         release,
         path.join(accepted, `${state.current}.json`),
         state.current,
         uid,
       );
-      if (supervise)
-        return await supervise({
-          uid,
-          home,
-          data,
-          releases,
-          accepted,
-          tmpdir,
-          node,
-          dbPath,
-          state,
-          release,
-          inventory,
-        });
       await run('/usr/bin/env', releaseArgs(home, tmpdir, node, release), {
         stdio: 'ignore',
         env: {},
@@ -283,6 +288,40 @@ async function snapshotDatabase(dbPath, copy, uid) {
   }
 }
 
+async function removeCheckWorkspace(scratch, releases, uid, root) {
+  const { stat } = require('./install-transaction.js');
+  const entry = await stat(scratch);
+  if (!entry) return;
+  const device = (await fs.lstat(releases)).dev;
+  async function check(dir, info) {
+    if (
+      !info.isDirectory() ||
+      info.uid !== uid ||
+      (info.mode & 0o7777) !== 0o700 ||
+      info.dev !== device ||
+      dir !== (await fs.realpath(dir))
+    )
+      throw Error('copy');
+    if (root === systemRoot) await require('./install-platform.js').requireAcl(dir, []);
+  }
+  await check(scratch, entry);
+  const data = path.join(scratch, 'data');
+  const contents = await stat(data);
+  if (contents) {
+    await check(data, contents);
+    for (const name of await fs.readdir(data)) {
+      if (!/^core\.db(?:-(?:wal|shm|journal))?$/.test(name)) throw Error('copy');
+      const file = path.join(data, name);
+      const info = await fs.lstat(file);
+      if (!info.isFile() || info.uid !== uid || info.nlink !== 1 || info.dev !== device)
+        throw Error('copy');
+      await fs.unlink(file);
+    }
+    await fs.rmdir(data);
+  }
+  await fs.rmdir(scratch);
+}
+
 async function runSelfCheck(args, cwd) {
   await new Promise((resolve, reject) => {
     const child = spawn('/usr/bin/env', args, {
@@ -292,10 +331,12 @@ async function runSelfCheck(args, cwd) {
       timeout: checkTimeout,
       killSignal: 'SIGKILL',
     });
-    child.once('error', () => reject(Error('self-check')));
+    child.once('error', () => reject(Error('self-check-unavailable')));
     child.once('close', (code, signal) => {
       if (code === 0) resolve();
-      else reject(Error(signal === 'SIGKILL' ? 'self-check-timeout' : 'self-check'));
+      else if (signal === 'SIGKILL') reject(Error('self-check-timeout'));
+      else if (signal || code === 126 || code === 127) reject(Error('self-check-unavailable'));
+      else reject(Error('self-check'));
     });
   });
 }
@@ -333,6 +374,8 @@ async function preflightAcceptedRelease({
   compatible = false,
   runtimeNode,
   initial = false,
+  selection,
+  expectedFiles,
 }) {
   if (typeof sha !== 'string' || !shaPattern.test(sha) || typeof accept !== 'function')
     throw Error('boundary');
@@ -348,24 +391,29 @@ async function preflightAcceptedRelease({
   // The caller supplies the owner decision for this exact staged SHA.
   if ((await accept(sha)) !== true) throw Error('acceptance');
   const { stat } = require('./install-transaction.js');
-  const { initialDatabasePaths } = require('./activation-state.js');
+  const {
+    holdsExclusive,
+    initialDatabasePaths,
+    marker,
+    sameSelection,
+  } = require('./activation-state.js');
+  if (!holdsExclusive(path.join(ownerData, 'activation.json'))) throw Error('boundary-state');
   const initialSeed = initial && !(await stat(dbPath));
   const source = initialSeed ? initialDatabasePaths(ownerData, sha).staging : dbPath;
   if (source !== (await fs.realpath(source))) throw Error('boundary');
   const release = path.join(releases, sha);
   try {
-    await verifyInventory(release, path.join(accepted, `${sha}.json`), sha, uid);
+    const files = await verifyInventory(release, path.join(accepted, `${sha}.json`), sha, uid);
+    if (expectedFiles && receiptDigest(files) !== receiptDigest(expectedFiles))
+      throw Error('receipt');
   } catch {
     throw Error('receipt');
   }
   const scratch = path.join(releases, `${sha}.check`);
   const data = path.join(scratch, 'data');
   try {
-    // An interrupted first install is retried under the same activation lease.
-    if (initial && (await stat(scratch))) {
-      await directory(scratch, uid);
-      await fs.rm(scratch, { recursive: true });
-    }
+    // A killed preflight can leave only this exact private workspace behind.
+    await removeCheckWorkspace(scratch, releases, uid, root);
     await fs.mkdir(scratch, { mode: 0o700 });
   } catch {
     throw Error('copy');
@@ -377,6 +425,17 @@ async function preflightAcceptedRelease({
     } catch {
       throw Error('copy');
     }
+    if (selection) {
+      const copy = pathToFileURL(path.join(data, 'core.db'));
+      copy.searchParams.set('immutable', '1');
+      const db = new DatabaseSync(copy, { readOnly: true, defensive: true });
+      try {
+        db.exec('PRAGMA trusted_schema = OFF');
+        if (!sameSelection(marker(db), selection)) throw Error('boundary-state');
+      } finally {
+        db.close();
+      }
+    }
     const args = releaseArgs(home, data, initial ? node : (runtimeNode ?? node), release);
     await runSelfCheck(
       [...args, '--self-check', ...(initialSeed ? ['--initial-seed'] : [])],
@@ -386,12 +445,12 @@ async function preflightAcceptedRelease({
       try {
         await runSelfCheck([...args.slice(0, -1), '-e', schemaCheck, release], release);
       } catch (error) {
-        if (error.message === 'self-check-timeout') throw error;
+        if (error.message !== 'self-check') throw error;
         throw Error('incompatible');
       }
     }
   } finally {
-    await fs.rm(scratch, { recursive: true, force: true });
+    await removeCheckWorkspace(scratch, releases, uid, root);
   }
 }
 
@@ -450,7 +509,11 @@ async function trustedMetadata(paths, sha, files) {
     sha,
     paths.uid,
   );
-  const raw = await bytes(path.join(release, 'release/manifest.json'), paths.uid, 65536);
+  return readMetadata(path.join(release, 'release/manifest.json'), paths.uid, files);
+}
+
+async function readMetadata(file, uid, files) {
+  const raw = await bytes(file, uid, 65536);
   if (createHash('sha256').update(raw).digest('hex') !== files['release/manifest.json'])
     throw Error('receipt');
   return { manifest: JSON.parse(raw.toString('utf8')), files };
@@ -459,9 +522,12 @@ async function trustedMetadata(paths, sha, files) {
 const retryable = [
   'admin-canceled',
   'admin-timeout',
+  'ci-awaiting',
   'network',
   'network-timeout',
+  'release-observation',
   'self-check-timeout',
+  'self-check-unavailable',
 ];
 
 function ownerCode(error) {
@@ -472,7 +538,9 @@ function ownerCode(error) {
       'incompatible',
       'previous-unavailable',
       'release-verification',
+      'release-invalid',
       'boundary-failed',
+      'boundary-refused',
       'restore-failed',
       ...retryable,
     ].includes(code)
@@ -481,6 +549,13 @@ function ownerCode(error) {
   if (/^boundary-/.test(code)) return 'boundary-failed';
   if (/^release-|^receipt$/.test(code)) return 'release-verification';
   return 'update-failed';
+}
+
+function visibleCode(code) {
+  if (code === 'release-invalid') return 'release-verification';
+  if (code === 'boundary-refused') return 'boundary-failed';
+  if (code === 'release-observation' || code === 'self-check-unavailable') return 'update-failed';
+  return code;
 }
 
 async function rejectedShas(dir, uid) {
@@ -503,18 +578,69 @@ async function rejectedShas(dir, uid) {
 async function releaseProof(paths, updates, sha, authority, files) {
   const proofFile = path.join(updates, sha + '.json');
   const proof = await readRecord(proofFile, paths.uid);
-  if (proof) return proof;
+  if (proof) {
+    if (
+      !['pinned', 'changed'].includes(proof.checks) ||
+      !proof.workflow ||
+      Object.keys(proof.workflow).length !== 3 ||
+      !['id', 'runId', 'attempt'].every(
+        (key) => Number.isSafeInteger(proof.workflow[key]) && proof.workflow[key] > 0,
+      ) ||
+      proof.workflow.id !== authority.initialWorkflow.id ||
+      (sha === authority.initialSha &&
+        (proof.checks !== 'pinned' ||
+          proof.workflow.runId !== authority.initialWorkflow.runId ||
+          proof.workflow.attempt !== authority.initialWorkflow.attempt)) ||
+      !proof.runtime ||
+      Object.keys(proof.runtime).length !== 3 ||
+      !['node', 'codex', 'planner'].every((key) => digestPattern.test(proof.runtime[key])) ||
+      proof.runtime.planner !== files['base/system-install-layout.js'] ||
+      (proof.receipt !== undefined && proof.receipt !== receiptDigest(files)) ||
+      (proof.previous !== undefined && !shaPattern.test(proof.previous))
+    )
+      throw Error('receipt');
+    return proof;
+  }
   if (sha !== authority.initialSha || sha !== authority.sha) throw Error('release-verification');
   const { installedRuntime } = require('./install-production.js');
   const initial = {
     checks: 'pinned',
     workflow: authority.initialWorkflow,
     runtime: await installedRuntime(authority),
+    receipt: receiptDigest(files),
   };
   if (files['base/system-install-layout.js'] !== initial.runtime.planner)
     throw Error('release-verification');
   await atomicRecord(proofFile, initial);
   return initial;
+}
+
+function receiptDigest(files) {
+  return createHash('sha256')
+    .update(
+      JSON.stringify(
+        Object.keys(files)
+          .sort()
+          .map((name) => [name, files[name]]),
+      ),
+    )
+    .digest('hex');
+}
+
+async function savedCurrentMetadata(paths, updates, { current: sha, previous }, authority) {
+  const files = await readInventory(path.join(paths.accepted, sha + '.json'), sha, paths.uid);
+  const stage = path.join(paths.data, 'install-staging');
+  const manifestDir = path.join(stage, sha, 'release');
+  for (const dir of [stage, path.join(stage, sha), manifestDir]) await directory(dir, paths.uid);
+  const saved = await readMetadata(path.join(manifestDir, 'manifest.json'), paths.uid, files);
+  const proof = await releaseProof(paths, updates, sha, authority, files);
+  if (
+    saved.manifest.schema !== 'foliome-release/1' ||
+    (previous && proof.previous !== undefined && proof.previous !== previous) ||
+    (authority.sha === sha && authority.version !== saved.manifest.version)
+  )
+    throw Error('receipt');
+  return saved;
 }
 
 function boundaryChanges(from, to) {
@@ -605,13 +731,16 @@ async function stageOwnerRelease(paths, updates, selection, authority, activeVer
       await ownerPayload(materialized),
     );
     const planner = stage.tree.find(({ path }) => path === 'base/system-install-layout.js').sha256;
+    const metadata = await trustedMetadata(paths, stage.sha);
     const proof = {
       checks: stage.checks,
       workflow: stage.workflow,
       runtime: { ...stage.runtime, planner },
+      receipt: receiptDigest(metadata.files),
+      previous: paths.state.current,
     };
     await atomicRecord(path.join(updates, stage.sha + '.json'), proof);
-    return { password, proof, tree: stage.tree, ...(await trustedMetadata(paths, stage.sha)) };
+    return { password, proof, tree: stage.tree, ...metadata };
   } finally {
     await fs.rm(scratch, { recursive: true, force: true });
   }
@@ -667,11 +796,7 @@ async function ownOffer(paths, updates, authority, active, kind, rejected) {
       target = { ...metadata, proof, password, tree };
     }
   } catch (error) {
-    const code = ownerCode(error);
-    if (
-      kind === 'update' &&
-      ['release-verification', 'incompatible', 'boundary-failed'].includes(code)
-    )
+    if (kind === 'update' && ['release-invalid', 'incompatible'].includes(error.message))
       await atomicRecord(path.join(updates, 'rejected', selection.commit), selection.commit);
     throw error;
   }
@@ -724,7 +849,21 @@ async function askAdministrator(sha) {
   });
   const code = result.stdout.trim();
   if (code !== 'ok') {
-    if ([...retryable, 'release-verification', 'restore-failed'].includes(code)) throw Error(code);
+    if (
+      [
+        ...retryable,
+        'release-invalid',
+        'release-verification',
+        'restore-failed',
+        'boundary-refused',
+        'boundary-entry',
+        'boundary-permissions',
+        'boundary-base',
+        'self-check',
+        'incompatible',
+      ].includes(code)
+    )
+      throw Error(code);
     throw Error('boundary-failed');
   }
 }
@@ -777,13 +916,37 @@ async function recordHandoff(paths, updates, handoff, code) {
     if (!sameSelection(marker, handoff)) throw Error('restore-failed');
     if (
       handoff.kind === 'update' &&
-      ['self-check', 'incompatible', 'release-verification', 'boundary-failed'].includes(code)
+      ['self-check', 'incompatible', 'release-invalid', 'boundary-refused'].includes(code)
     )
       await atomicRecord(path.join(updates, 'rejected', handoff.sha), handoff.sha);
-    await atomicRecord(path.join(updates, 'result.json'), { code, sha: marker.current });
+    await atomicRecord(path.join(updates, 'result.json'), {
+      code: visibleCode(code),
+      sha: marker.current,
+    });
   }
   await fs.rm(path.join(updates, 'handoff.json'), { force: true });
   await syncDirectory(updates);
+}
+
+async function preflightSelection(paths, handoff, runtimeNode, currentFiles, targetFiles) {
+  const releases = [[handoff.sha, targetFiles]];
+  if (handoff.kind === 'update') releases.unshift([handoff.current, currentFiles]);
+  for (const [sha, expectedFiles] of releases) {
+    await preflightAcceptedRelease({
+      home: paths.home,
+      systemRoot,
+      sha,
+      accept: (requested) => requested === sha,
+      compatible: true,
+      runtimeNode,
+      selection: handoff,
+      expectedFiles,
+    });
+  }
+  for (const [sha, expected] of releases) {
+    const { files } = await trustedMetadata(paths, sha);
+    if (receiptDigest(files) !== receiptDigest(expected)) throw Error('release-verification');
+  }
 }
 
 async function applyOwnerOffer(paths, updates, offer, authority) {
@@ -815,19 +978,13 @@ async function applyOwnerOffer(paths, updates, offer, authority) {
     )) !== handoff.password
   )
     throw Error('boundary-state');
-  await atomicRecord(path.join(updates, 'handoff.json'), handoff);
   let code = 'update-failed';
   let runtimeWork;
   try {
-    const check = (sha, runtimeNode) =>
-      preflightAcceptedRelease({
-        home: paths.home,
-        systemRoot,
-        sha,
-        accept: (requested) => requested === sha,
-        compatible: true,
-        runtimeNode,
-      });
+    if (handoff.kind === 'previous') {
+      const active = await savedCurrentMetadata(paths, updates, handoff, now);
+      if (active.manifest.version !== handoff.fromVersion) throw Error('boundary-state');
+    }
     let runtimeNode;
     if (handoff.kind === 'update') {
       // Build the same known schema and ensure the selected runtime also supports rollback.
@@ -851,21 +1008,11 @@ async function applyOwnerOffer(paths, updates, offer, authority) {
         runtimeNode = path.join(runtimeWork, 'node');
         await fs.writeFile(runtimeNode, binary, { flag: 'wx', mode: 0o700 });
       }
-      await check(handoff.current, runtimeNode);
     }
-    await check(handoff.sha, runtimeNode);
-    for (const [sha, expected] of [
-      [handoff.sha, offer.files],
-      [handoff.current, paths.inventory],
-    ]) {
-      const { files } = await trustedMetadata(paths, sha);
-      if (
-        Object.keys(files).length !== Object.keys(expected).length ||
-        Object.entries(expected).some(([name, digest]) => files[name] !== digest)
-      )
-        throw Error('release-verification');
-    }
-    if (handoff.password) await askAdministrator(handoff.sha);
+    await preflightSelection(paths, handoff, runtimeNode, paths.inventory, offer.files);
+    if (!sameSelection(readActivation(paths.dbPath), handoff)) throw Error('boundary-state');
+    await atomicRecord(path.join(updates, 'handoff.json'), handoff);
+    if (handoff.password) await paths.withoutLease(() => askAdministrator(handoff.sha));
     else readActivation(paths.dbPath, (db) => commitActivation(db, handoff, handoff.sha));
   } catch (error) {
     code = ownerCode(error);
@@ -877,7 +1024,7 @@ async function applyOwnerOffer(paths, updates, offer, authority) {
 
 async function restorePrevious(paths, updates, authority, startupFailed) {
   if (!paths.state.previous) throw Error('previous-unavailable');
-  const active = await trustedMetadata(paths, paths.state.current, paths.inventory);
+  const active = await savedCurrentMetadata(paths, updates, paths.state, authority);
   const rejected = await rejectedShas(path.join(updates, 'rejected'), paths.uid);
   const previous = await ownOffer(paths, updates, authority, active, 'previous', rejected);
   if (!previous) {
@@ -911,25 +1058,56 @@ async function superviseOwner(paths, previousOnly) {
   await requireAcl(path.join(updates, 'rejected'), []);
   const saved = await readRecord(path.join(updates, 'handoff.json'), paths.uid);
   const interrupted = saved && parseHandoff(saved);
-  if (await stat(rootFence)) {
+  const fence = await stat(rootFence);
+  if (fence) {
+    const recoveryFile = path.join(updates, 'recovery-refused.json');
+    const fenceId = [fence.dev, fence.ino, fence.birthtimeMs];
+    const refused = await readRecord(recoveryFile, paths.uid);
+    if (JSON.stringify(refused) === JSON.stringify(fenceId)) return false;
+    if (previousOnly) throw Error('restore-failed');
+    if (!interrupted?.password) {
+      await atomicRecord(recoveryFile, fenceId);
+      throw Error('restore-failed');
+    }
     if (
-      previousOnly ||
-      !interrupted?.password ||
       !(await confirmDialog(
         'Установка прервана. Восстановить системные файлы? Нужен пароль администратора.',
         'Восстановить',
       ))
     )
       throw Error('restore-failed');
-    await askAdministrator(interrupted.sha);
-    if (await stat(rootFence)) throw Error('restore-failed');
+    try {
+      await paths.withoutLease(() => askAdministrator(interrupted.sha));
+      if (await stat(rootFence)) throw Error('restore-failed');
+    } catch (error) {
+      if (
+        ['restore-failed', 'boundary-entry', 'boundary-permissions', 'boundary-base'].includes(
+          error.message,
+        ) &&
+        sameFile(fence, await stat(rootFence))
+      )
+        await atomicRecord(recoveryFile, fenceId);
+      throw error;
+    }
     return true;
   }
   if (interrupted) await recordHandoff(paths, updates, interrupted, 'update-failed');
   if (await stat(rootFence)) throw Error('restore-failed');
+  if (!paths.state) return true;
   const authority = await readInstallationRelease();
   if (authority.ownerUid !== paths.uid) throw Error('boundary-state');
   if (previousOnly) return restorePrevious(paths, updates, authority, false);
+  try {
+    paths.inventory = await verifyInventory(
+      paths.release,
+      path.join(paths.accepted, paths.state.current + '.json'),
+      paths.state.current,
+      paths.uid,
+    );
+  } catch (error) {
+    if (!paths.state.previous) throw error;
+    return restorePrevious(paths, updates, authority, true);
+  }
   const result = await readRecord(path.join(updates, 'result.json'), paths.uid);
   const args = releaseArgs(paths.home, paths.tmpdir, paths.node, paths.release);
   const child = spawn(paths.node, args.slice(5), {
@@ -963,7 +1141,9 @@ async function superviseOwner(paths, previousOnly) {
           send({ type: 'release-card', card: offer.card });
         }
       } catch (error) {
-        if (!result) send({ type: 'release-result', code: ownerCode(error) });
+        if (!result && error.message !== 'ci-awaiting') {
+          send({ type: 'release-result', code: visibleCode(ownerCode(error)) });
+        }
       }
     }
   }
@@ -974,7 +1154,7 @@ async function superviseOwner(paths, previousOnly) {
       if (result?.sha === paths.state.current)
         send({ type: 'release-result', code: result.code, version: result.version });
       discovery = discover().catch((error) => {
-        if (!result) send({ type: 'release-result', code: ownerCode(error) });
+        if (!result) send({ type: 'release-result', code: visibleCode(ownerCode(error)) });
       });
     } else if (message?.type === 'release-accept' && typeof message.sha === 'string') {
       const offer = offers.get(message.sha);
@@ -1007,7 +1187,13 @@ async function superviseOwner(paths, previousOnly) {
   return true;
 }
 
-module.exports = { launchAcceptedRelease, preflightAcceptedRelease, verifyInventory };
+module.exports = {
+  launchAcceptedRelease,
+  preflightAcceptedRelease,
+  preflightSelection,
+  savedCurrentMetadata,
+  verifyInventory,
+};
 
 if (require.main === module) {
   void (async () => {
@@ -1041,11 +1227,16 @@ if (require.main === module) {
     }
     process.umask(0o077);
     const home = os.userInfo().homedir;
-    const relaunch = await launchAcceptedRelease({
-      home,
-      systemRoot,
-      supervise: (paths) => superviseOwner(paths, previousOnly),
-    });
+    const { exclusive } = require('./activation-state.js');
+    const paths = await installedPaths(home, systemRoot);
+    // Serialize launcher sessions while the installed root helper holds the activation lease.
+    const relaunch = await exclusive(path.join(paths.data, 'launcher'), () =>
+      launchAcceptedRelease({
+        home,
+        systemRoot,
+        supervise: (paths) => superviseOwner(paths, previousOnly),
+      }),
+    );
     if (relaunch) {
       const child = spawn(path.join(systemRoot, 'base/launch'), [], {
         cwd: '/',

@@ -185,7 +185,8 @@ function observeTree({
 
   function readObject(type, sha, limit) {
     const remaining = Math.floor(deadline - performance.now());
-    if (remaining < 1 || ++objects > maxFiles * 2 + 1) throw Error();
+    if (remaining < 1) throw Error('network-timeout');
+    if (++objects > maxFiles * 2 + 1) throw Error('release-invalid');
     const bytes = git(repository, ['cat-file', type, sha], limit + 1, remaining);
     const actual = crypto.createHash('sha1').update(`${type} ${bytes.length}\0`).update(bytes);
     if (bytes.length > limit || actual.digest('hex') !== sha) throw Error();
@@ -194,31 +195,32 @@ function observeTree({
 
   function visit(treeSha, prefix = '') {
     const bytes = readObject('tree', treeSha, 4 * 1024 * 1024);
-    if (!bytes.length) throw Error();
+    if (!bytes.length) throw Error('release-invalid');
     const seen = new Set();
     for (let offset = 0; offset < bytes.length;) {
       const end = bytes.indexOf(0, offset);
-      if (end === -1 || end + 21 > bytes.length) throw Error();
+      if (end === -1 || end + 21 > bytes.length) throw Error('release-invalid');
       const entry = /^(40000|100644|100755) ([A-Za-z0-9._-]+)$/.exec(
         bytes.toString('latin1', offset, end),
       );
-      if (!entry) throw Error();
+      if (!entry) throw Error('release-invalid');
       const [, mode, componentName] = entry;
       const objectSha = bytes.toString('hex', end + 1, end + 21);
       offset = end + 21;
       const name = prefix ? `${prefix}/${componentName}` : componentName;
       const folded = componentName.toLowerCase();
-      if (!validPath(name) || seen.has(folded)) throw Error();
+      if (!validPath(name) || seen.has(folded)) throw Error('release-invalid');
       seen.add(folded);
       if (mode === '40000') {
-        if (manifest ? !expectedDirs.has(name) : !prefix && !rootDirs.has(name)) throw Error();
+        if (manifest ? !expectedDirs.has(name) : !prefix && !rootDirs.has(name))
+          throw Error('release-invalid');
         visit(objectSha, name);
       } else {
         if (
           (manifest && !expectedPaths.has(name)) ||
           (!manifest && !prefix && !rootFiles.has(name))
         )
-          throw Error();
+          throw Error('release-invalid');
         readBlob(name, mode, objectSha);
       }
     }
@@ -236,11 +238,15 @@ function observeTree({
         (name !== executable ||
           (allowedExecutablePaths !== undefined && !allowedExecutablePaths.includes(name))))
     )
-      throw Error();
+      throw Error('release-invalid');
     const bytes = readObject('blob', blobSha, maxBlob);
     total += bytes.length;
-    if (total > maxTreeBytes || bytes.includes(0)) throw Error();
-    decoder.decode(bytes);
+    if (total > maxTreeBytes || bytes.includes(0)) throw Error('release-invalid');
+    try {
+      decoder.decode(bytes);
+    } catch {
+      throw Error('release-invalid');
+    }
     const digest = hash('sha256', bytes);
     if (manifest && expected.sha256 !== digest) throw Error();
     result.push({ path: name, mode, blobSha, sha256: digest, bytes });
@@ -248,9 +254,10 @@ function observeTree({
 
   const commitBytes = readObject('commit', commit, maxBlob);
   const head = /^tree ([a-f0-9]{40})\n$/.exec(commitBytes.toString('latin1', 0, 46));
-  if (!head) throw Error();
+  if (!head) throw Error('release-invalid');
   visit(head[1]);
-  if (!result.length || (manifest && result.length !== expectedPaths.size)) throw Error();
+  if (!result.length || (manifest && result.length !== expectedPaths.size))
+    throw Error('release-invalid');
   result.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return result;
 }
@@ -260,7 +267,8 @@ async function observeRelease(input, prepare) {
   try {
     if (!prepare && input.manifest === undefined) throw Error();
     tree = observeTree(input);
-  } catch {
+  } catch (error) {
+    if (input.productionErrors) throw error;
     return { ok: false, code: 'tree' };
   }
   const checked = [];

@@ -298,7 +298,7 @@ async function installedMain() {
 if (require.main === module) {
   installedMain().catch((error) => {
     const code =
-      /^(boundary-(entry|permissions|base|account|config|pf|ssh|program|state)|release-(verification|stage|materialization)|restore-failed|network|network-timeout)$/.test(
+      /^(boundary-(entry|permissions|base|account|config|pf|ssh|program|state|refused)|release-(verification|stage|materialization|invalid|observation)|restore-failed|network|network-timeout|ci-awaiting|self-check(?:-timeout|-unavailable)?|incompatible)$/.test(
         error.message,
       )
         ? error.message

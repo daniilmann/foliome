@@ -3,41 +3,66 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
-const locks = new Set();
+const locks = new Map();
 const shaPattern = /^[a-f0-9]{40}$/;
 
 async function exclusive(file, work) {
   const key = path.resolve(file);
-  if (locks.has(key)) throw new Error('busy');
-  locks.add(key);
   let db;
-  try {
-    const lockPath = `${key}.lease.sqlite`;
+  async function acquire() {
+    if (locks.has(key)) throw new Error('busy');
+    locks.set(key, false);
     try {
-      const handle = await fs.open(lockPath, 'wx', 0o600);
-      await handle.close();
+      const lockPath = `${key}.lease.sqlite`;
+      try {
+        const handle = await fs.open(lockPath, 'wx', 0o600);
+        await handle.close();
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+      }
+      const stat = await fs.lstat(lockPath);
+      if (
+        !stat.isFile() ||
+        stat.isSymbolicLink() ||
+        stat.nlink !== 1 ||
+        stat.uid !== process.getuid?.() ||
+        (stat.mode & 0o077) !== 0
+      )
+        throw new Error('lease');
+      db = new DatabaseSync(lockPath);
+      db.exec('BEGIN EXCLUSIVE');
+      locks.set(key, true);
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      release();
+      throw error;
     }
-    const stat = await fs.lstat(lockPath);
-    if (
-      !stat.isFile() ||
-      stat.isSymbolicLink() ||
-      stat.nlink !== 1 ||
-      stat.uid !== process.getuid?.() ||
-      (stat.mode & 0o077) !== 0
-    )
-      throw new Error('lease');
-    db = new DatabaseSync(lockPath);
-    db.exec('BEGIN EXCLUSIVE');
-    return await work();
-  } finally {
+  }
+  function release() {
     try {
       db?.close();
     } finally {
+      db = undefined;
       locks.delete(key);
     }
   }
+  await acquire();
+  try {
+    return await work(async (outside) => {
+      if (!db) throw Error('lease');
+      release();
+      try {
+        return await outside();
+      } finally {
+        await acquire();
+      }
+    });
+  } finally {
+    if (db) release();
+  }
+}
+
+function holdsExclusive(file) {
+  return locks.get(path.resolve(file)) === true;
 }
 
 function marker(db) {
@@ -67,11 +92,21 @@ function marker(db) {
     throw new Error('state');
   return { current: row.current_sha, previous: row.previous_sha };
 }
+
+function readMarker(file, recover = false) {
+  const db = new DatabaseSync(file, { readOnly: !recover, defensive: true });
+  try {
+    db.exec('PRAGMA trusted_schema = OFF');
+    return marker(db);
+  } finally {
+    db.close();
+  }
+}
 function initialDatabasePaths(data, sha) {
   return { live: path.join(data, 'core.db'), staging: path.join(data, '.initial-' + sha + '.db') };
 }
 
-module.exports = { exclusive, initialDatabasePaths, marker };
+module.exports = { exclusive, holdsExclusive, initialDatabasePaths, marker, readMarker };
 
 function sameSelection(left, right) {
   return left?.current === right.current && left?.previous === right.previous;

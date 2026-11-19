@@ -389,6 +389,20 @@ function run([guid]) {
 }
 `;
 
+const swapScript = String.raw`
+ObjC.import('Foundation');
+ObjC.bindFunction('renamex_np', ['int', ['char *', 'char *', 'unsigned int']]);
+function run([target, staged]) {
+  if ($.renamex_np(target, staged, 2) !== 0) throw Error('install-files');
+}
+`;
+
+/** @param {string} target @param {string} staged */
+async function swapDirectories(target, staged) {
+  if (path.dirname(target) !== path.dirname(staged)) throw Error('install-files');
+  await run('/usr/bin/osascript', ['-l', 'JavaScript', '-e', swapScript, target, staged]);
+}
+
 /** @typedef {{uid: number, guid: string}} AccountIdentity */
 /** @typedef {Awaited<ReturnType<typeof localExecutor>>} LocalExecutor */
 /** @typedef {{sha: string, ownerUid: number, uid: number, guid: string, passwordSet: boolean,
@@ -780,7 +794,7 @@ function canary() {
     });
     conn.once('connect', () => {
       conn.destroy();
-      reject(Error('boundary-pf'));
+      reject(Error('boundary-refused'));
     });
     conn.once('error', (error) => {
       if ('code' in error && error.code === 'ECONNREFUSED') resolve();
@@ -798,7 +812,7 @@ async function checkLiveBoundary(key, agent) {
       live.rules,
     )
   )
-    throw Error('boundary-pf');
+    throw Error('boundary-refused');
   await canary();
   const effective = await output('/usr/sbin/sshd', ['-T', '-f', sshMain]);
   const lines = effective.split('\n');
@@ -816,7 +830,7 @@ async function checkLiveBoundary(key, agent) {
     'hostkey /etc/ssh/ssh_host_ed25519_key',
     'hostkeyalgorithms ssh-ed25519',
   ])
-    if (!lines.includes(expected)) throw Error('boundary-ssh');
+    if (!lines.includes(expected)) throw Error('boundary-refused');
   const users = lines.filter((line) => line.startsWith('allowusers ')).join(' ');
   if (
     ![
@@ -824,16 +838,17 @@ async function checkLiveBoundary(key, agent) {
       `allowusers ${agent.name}@127.0.0.1 dev@127.0.0.1`,
     ].includes(users)
   )
-    throw Error('boundary-ssh');
+    throw Error('boundary-refused');
   if (
     (await output('/usr/bin/ssh-keyscan', ['-T', '3', '-t', 'ed25519', '127.0.0.1'])) !==
     '127.0.0.1 ' + key
   )
-    throw Error('boundary-ssh');
+    throw Error('boundary-refused');
   return live;
 }
 
 module.exports = {
+  swapDirectories,
   acl,
   authorize,
   base,

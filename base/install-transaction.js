@@ -41,7 +41,7 @@ async function writePrivate(file, bytes) {
 
 // The caller authorizes every destination and checks its ancestors before each use.
 // Backup and replacement are siblings so renames preserve metadata and work across volumes.
-function installationJournal(directory, authorize) {
+function installationJournal(directory, authorize, swapDirectories) {
   const record = path.join(directory, 'pending.json');
   const next = path.join(directory, 'pending.next');
   const siblings = (operation) => {
@@ -65,6 +65,30 @@ function installationJournal(directory, authorize) {
       const old = await stat(backup);
       const pending = await stat(staged);
       const installed = await stat(target);
+      if (operation.atomic) {
+        // The sibling changes roles at the swap. Its inode identifies which
+        // side of the swap we reached, even if the journal was never rewritten.
+        if (
+          !swapDirectories ||
+          old ||
+          !installed?.isDirectory() ||
+          installed.uid !== process.getuid() ||
+          (pending && (!pending.isDirectory() || pending.uid !== process.getuid()))
+        )
+          throw Error('restore-failed');
+        if (value.committed) {
+          if (!same(installed, after) || (pending && !same(pending, before)))
+            throw Error('restore-failed');
+        } else if (same(installed, after)) {
+          if (!same(pending, before)) throw Error('restore-failed');
+          await swapDirectories(target, staged);
+        } else if (!same(installed, before) || (pending && after && !same(pending, after))) {
+          throw Error('restore-failed');
+        }
+        if (pending) await fs.rm(staged, { recursive: true });
+        await syncDirectory(parent);
+        continue;
+      }
       if ((old && !same(old, before)) || (pending && after && !same(pending, after)))
         throw Error('restore-failed');
       if (value.committed) {
@@ -119,6 +143,7 @@ function installationJournal(directory, authorize) {
           typeof op.target !== 'string' ||
           !/^[a-f0-9]{32}$/.test(op.token) ||
           typeof op.directory !== 'boolean' ||
+          (op.atomic !== undefined && (op.atomic !== true || !op.tree || !op.before)) ||
           (op.tree !== undefined && (op.tree !== true || !op.directory)),
       )
     )
@@ -126,8 +151,7 @@ function installationJournal(directory, authorize) {
     if (value.activation !== undefined) {
       if (!selectActivation) throw Error('restore-failed');
       const committed = await selectActivation(value.activation);
-      if (typeof committed !== 'boolean' || (value.committed && !committed))
-        throw Error('restore-failed');
+      if (typeof committed !== 'boolean') throw Error('restore-failed');
       value.committed = committed;
     }
     await settle(value, restoreExternal);
@@ -142,6 +166,8 @@ function installationJournal(directory, authorize) {
         await authorize(target);
         const before = await stat(target);
         await validate(before);
+        const atomic = tree && typeof swapDirectories === 'function';
+        if (atomic && !before?.isDirectory()) throw Error('install-files');
         const operation = {
           target,
           token: randomBytes(16).toString('hex'),
@@ -149,19 +175,32 @@ function installationJournal(directory, authorize) {
           after: null,
           directory: isDirectory,
           ...(tree && { tree }),
+          ...(atomic && { atomic }),
         };
         value.operations.push(operation);
         await save(value);
         const { parent, staged, backup } = siblings(operation);
         await prepare(staged);
         const prepared = await fs.lstat(staged);
+        if (
+          atomic &&
+          (!prepared.isDirectory() ||
+            prepared.uid !== before.uid ||
+            prepared.gid !== before.gid ||
+            prepared.mode !== before.mode ||
+            prepared.dev !== before.dev)
+        )
+          throw Error('install-files');
         operation.after = identity(prepared);
         await syncDirectory(parent);
         await save(value);
         const current = await stat(target);
         if (before ? !same(current, operation.before) : current) throw Error('install-files');
-        if (before) await fs.rename(target, backup);
-        await fs.rename(staged, target);
+        if (atomic) await swapDirectories(target, staged);
+        else {
+          if (before) await fs.rename(target, backup);
+          await fs.rename(staged, target);
+        }
         await syncDirectory(parent);
       },
       async external(snapshot) {

@@ -209,26 +209,33 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
   let archive;
   let workflow;
   let pinnedCheckBlobs;
-  let transportFailure;
+  let refusal;
   let runtime;
   const result = await observeRelease(input, async (tree) => {
     const entries = new Map(tree.map((entry) => [entry.path, entry]));
-    const manifestBytes = entries.get('release/manifest.json').bytes;
-    const committed = JSON.parse(manifestBytes.toString('utf8'));
-    version = input.version ?? committed.version;
+    const manifestBytes = entries.get('release/manifest.json')?.bytes;
+    let committed;
+    try {
+      committed = JSON.parse(manifestBytes.toString('utf8'));
+    } catch {
+      refusal = Error('release-invalid');
+      throw refusal;
+    }
+    version = input.version ?? committed?.version;
     if (
-      typeof version !== 'string' ||
-      !versionPattern.test(version) ||
-      committed.version !== version ||
-      !checkBoundary(tree, committed) ||
-      typeof committed.node?.version !== 'string' ||
+      typeof committed?.version !== 'string' ||
+      !versionPattern.test(committed.version) ||
+      typeof committed?.node?.version !== 'string' ||
       !/^26\.13\.(0|[1-9]\d*)$/.test(committed.node.version) ||
       typeof committed.node.sha256 !== 'string' ||
       !sha256Pattern.test(committed.node.sha256) ||
       typeof committed.codex?.sha256 !== 'string' ||
       !sha256Pattern.test(committed.codex.sha256)
-    )
-      throw Error();
+    ) {
+      refusal = Error('release-invalid');
+      throw refusal;
+    }
+    if (committed.version !== version || !checkBoundary(tree, committed)) throw Error();
 
     let observations;
     const origin = await readReleaseOrigin({
@@ -245,7 +252,7 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
         return true;
       },
     }).catch((error) => {
-      transportFailure = error;
+      refusal = error;
       throw error;
     });
     if (!origin.ok) throw Error();
@@ -269,7 +276,7 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
     try {
       provided = await provideArtifacts(observations);
     } catch (error) {
-      if (['network', 'network-timeout'].includes(error.message)) transportFailure = error;
+      if (['network', 'network-timeout'].includes(error.message)) refusal = error;
       throw error;
     }
     const { artifacts, verifyPublisher } = provided;
@@ -299,7 +306,10 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
           },
           policy,
         );
-        if (!decision.ok) return false;
+        if (!decision.ok) {
+          if (['manifest', 'tree'].includes(decision.code)) refusal = Error('release-invalid');
+          return false;
+        }
         await beforeStage();
         checks = decision.checks;
         archive = checkedArchive;
@@ -307,8 +317,9 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
       },
     };
   });
-  if (transportFailure) throw transportFailure;
-  if (!result.ok) return refused();
+  if (refusal && input.productionErrors) throw refusal;
+  if (!result.ok)
+    return input.productionErrors ? { ok: false, code: 'release-observation' } : refused();
   return {
     ...result,
     sha: input.commit,
@@ -485,7 +496,7 @@ async function stageReleaseFromOrigin(selection, installed) {
         )
       )
         throw Error('network');
-      throw error;
+      throw Error('release-observation');
     }
     return await compose(
       {
@@ -503,8 +514,18 @@ async function stageReleaseFromOrigin(selection, installed) {
       removeScratch,
     );
   } catch (error) {
-    if (installed.productionErrors && ['network', 'network-timeout'].includes(error.message))
-      return { ok: false, code: error.message };
+    if (installed.productionErrors)
+      return {
+        ok: false,
+        code:
+          error.code === 'ETIMEDOUT'
+            ? 'network-timeout'
+            : ['ci-awaiting', 'network', 'network-timeout', 'release-invalid'].includes(
+                  error.message,
+                )
+              ? error.message
+              : 'release-observation',
+      };
     return refused();
   } finally {
     if (scratch) await removeScratch().catch(() => {});
