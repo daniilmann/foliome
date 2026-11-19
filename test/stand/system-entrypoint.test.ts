@@ -23,7 +23,7 @@ const cleanEnv = () => ({
 });
 
 async function fixture() {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'system-entry-'));
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'system-entry-')));
   const home = path.join(dir, 'home');
   const homeRoot = path.join(home, 'Library/Application Support/Foliome');
   const app = path.join(homeRoot, 'app');
@@ -261,13 +261,15 @@ test('самопроверка реального Node работает толь
       "CREATE TABLE marker (value TEXT NOT NULL) STRICT; INSERT INTO marker VALUES ('synthetic-original')",
     );
     db.close();
+    await fs.chmod(f.paths.database, 0o600);
     const original = await fs.readFile(f.paths.database);
     const sha = 'a'.repeat(40);
     const copy = path.join(f.paths.app, 'releases', `${sha}.check`, 'data', 'core.db');
-    await fs.mkdir(path.dirname(copy), { recursive: true });
+    await fs.mkdir(path.dirname(copy), { recursive: true, mode: 0o700 });
     const source = new DatabaseSync(f.paths.database, { readOnly: true });
     try {
       await backup(source, copy);
+      await fs.chmod(copy, 0o600);
     } finally {
       source.close();
     }

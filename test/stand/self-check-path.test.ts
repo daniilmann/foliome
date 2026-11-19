@@ -11,7 +11,7 @@ const otherSha = 'b'.repeat(40);
 const env = { HOME: os.tmpdir(), PATH: '/usr/bin:/bin:/usr/sbin:/sbin', TMPDIR: os.tmpdir() };
 
 async function fixture() {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'self-check-path-'));
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'self-check-path-')));
   const home = path.join(dir, 'home');
   const root = path.join(home, 'Library/Application Support/Foliome');
   const app = path.join(root, 'app');
@@ -29,17 +29,19 @@ async function fixture() {
     config: path.join(data, 'config.json'),
   };
   const copy = path.join(app, 'releases', `${sha}.check`, 'data', 'core.db');
-  await fs.mkdir(data, { recursive: true });
-  await fs.mkdir(path.dirname(copy), { recursive: true });
+  await fs.mkdir(data, { recursive: true, mode: 0o700 });
+  await fs.mkdir(path.dirname(copy), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(database);
   db.exec(
     "CREATE TABLE marker (value TEXT NOT NULL) STRICT; INSERT INTO marker VALUES ('synthetic-original')",
   );
   db.close();
+  await fs.chmod(database, 0o600);
   const original = await fs.readFile(database);
   const source = new DatabaseSync(database, { readOnly: true });
   try {
     await backup(source, copy);
+    await fs.chmod(copy, 0o600);
   } finally {
     source.close();
   }
