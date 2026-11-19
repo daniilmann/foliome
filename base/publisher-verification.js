@@ -60,7 +60,7 @@ async function extract(archive, member, destination) {
   }
 }
 
-async function verifyBinary(bytes, entry, scratchRoot) {
+async function verifyBinary(bytes, entry, scratchRoot, returnBytes = false) {
   const root = await fs.lstat(scratchRoot);
   if (
     !root.isDirectory() ||
@@ -107,6 +107,7 @@ async function verifyBinary(bytes, entry, scratchRoot) {
       file,
     ]);
     command('/usr/sbin/spctl', ['-a', '-t', 'install', '--ignore-cache', '--no-cache', file]);
+    if (returnBytes) return await fs.readFile(file);
   } finally {
     await fs.rm(scratch, { recursive: true, force: true });
   }
@@ -235,4 +236,28 @@ function createProductionPublisherVerifier({ entries, registry, scratchRoot = os
   };
 }
 
-module.exports = { createProductionPublisherVerifier, registryReleaseSignature };
+async function verifiedRuntime(bytes, kind, { version, sha256 }, scratchRoot) {
+  if (
+    !Buffer.isBuffer(bytes) ||
+    !bytes.length ||
+    bytes.length > 256 * 1024 * 1024 ||
+    !['node', 'codex'].includes(kind) ||
+    !versionPattern.test(version) ||
+    !hashPattern.test(sha256) ||
+    crypto.createHash('sha256').update(bytes).digest('hex') !== sha256
+  )
+    throw Error('publisher');
+  return verifyBinary(
+    bytes,
+    {
+      member:
+        kind === 'node' ? `node-v${version}-darwin-arm64/bin/node` : 'codex-aarch64-apple-darwin',
+      identifier: kind,
+      team: kind === 'node' ? 'HX7739G8FX' : '2DC432GLL2',
+    },
+    scratchRoot,
+    true,
+  );
+}
+
+module.exports = { createProductionPublisherVerifier, registryReleaseSignature, verifiedRuntime };

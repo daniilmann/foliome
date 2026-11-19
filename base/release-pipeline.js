@@ -15,7 +15,11 @@ const {
   createProductionPublisherVerifier,
   registryReleaseSignature,
 } = require('./publisher-verification.js');
-const { validateReleaseCandidate } = require('../core/domain/release.ts');
+const { validateReleaseCandidate } = require(
+  __dirname === '/Library/Application Support/Foliome/base'
+    ? './release-policy.ts'
+    : '../core/domain/release.ts',
+);
 
 const shaPattern = /^[a-f0-9]{40}$/;
 const sha256Pattern = /^[a-f0-9]{64}$/;
@@ -375,6 +379,7 @@ async function publisherArtifacts({ manifest, registry, codexBytes }, scratchRoo
 
 // The installed caller supplies its policy and state separately from the selected SHA.
 // Initial mode receives the exact locally approved commit and observes its version from Git.
+// Administrative mode observes boundary bytes for the installer to authorize separately.
 async function stageReleaseFromOrigin(selection, installed) {
   let scratch;
   const removeScratch = async () => {
@@ -383,6 +388,7 @@ async function stageReleaseFromOrigin(selection, installed) {
   };
   try {
     const { commit, version } = selection;
+    const scratchRoot = installed.scratchRoot ?? os.tmpdir();
     const { mode, stagingRoot, policy, boundary, rejectedShas } = structuredClone(installed);
     if (
       typeof commit !== 'string' ||
@@ -390,29 +396,30 @@ async function stageReleaseFromOrigin(selection, installed) {
       !isReleaseRepository(policy?.repository) ||
       typeof stagingRoot !== 'string' ||
       !path.isAbsolute(stagingRoot) ||
-      !['initial', 'update'].includes(mode)
+      !['initial', 'update', 'admin'].includes(mode)
     )
       return refused();
     if (mode === 'initial') {
       if (version !== undefined) return refused();
       policy.installedVersion = '0.0.0';
     } else if (
-      typeof version !== 'string' ||
-      !versionPattern.test(version) ||
-      !boundary ||
-      !Array.isArray(rejectedShas) ||
-      rejectedShas.includes(commit) ||
-      rejectedShas.some((sha) => typeof sha !== 'string' || !shaPattern.test(sha))
+      mode === 'update' &&
+      (typeof version !== 'string' ||
+        !versionPattern.test(version) ||
+        !boundary ||
+        !Array.isArray(rejectedShas) ||
+        rejectedShas.includes(commit) ||
+        rejectedShas.some((sha) => typeof sha !== 'string' || !shaPattern.test(sha)))
     ) {
       return refused();
     }
-    scratch = await fs.mkdtemp(path.join(os.tmpdir(), '.release-read-'));
+    scratch = await fs.mkdtemp(path.join(scratchRoot, '.release-read-'));
     await fs.chmod(scratch, 0o700);
     const repository = path.join(scratch, 'git');
     await fetchReleaseCommit(repository, policy.repository, commit);
     return await compose(
       { repository, commit, stagingRoot, policy, version, now: new Date().toISOString() },
-      (tree, manifest) => mode === 'initial' || matchingBoundary(tree, manifest, boundary),
+      (tree, manifest) => mode !== 'update' || matchingBoundary(tree, manifest, boundary),
       (observed) => publisherArtifacts(observed, scratch),
       removeScratch,
     );

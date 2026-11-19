@@ -318,7 +318,7 @@ async function preflightAcceptedRelease({ home, systemRoot: root, sha, accept })
   }
 }
 
-module.exports = { launchAcceptedRelease, preflightAcceptedRelease };
+module.exports = { launchAcceptedRelease, preflightAcceptedRelease, verifyInventory };
 
 if (require.main === module) {
   void (async () => {

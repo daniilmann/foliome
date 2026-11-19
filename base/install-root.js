@@ -209,3 +209,81 @@ async function installInitial(options) {
   }
 }
 module.exports = { installRoot, installInitial };
+
+async function installedMain() {
+  const system = '/Library/Application Support/Foliome';
+  const base = path.join(system, 'base');
+  const entry = path.join(base, 'install-root.js');
+  const node = path.join(base, 'node');
+  const [sha] = process.argv.slice(2);
+  if (
+    process.platform !== 'darwin' ||
+    process.arch !== 'arm64' ||
+    process.getuid() !== 0 ||
+    process.geteuid() !== 0 ||
+    process.getgid() !== 0 ||
+    process.getegid() !== 0 ||
+    process.argv.length !== 3 ||
+    !/^[a-f0-9]{40}$/.test(sha) ||
+    Object.keys(process.env).length !== 0 ||
+    process.execArgv.join(' ') !== '--disable-sigusr1' ||
+    process.cwd() !== '/' ||
+    process.execPath !== node ||
+    process.argv[1] !== entry ||
+    __filename !== entry
+  )
+    throw Error('boundary-entry');
+  process.umask(0o077);
+  async function trusted(file, mode, directory) {
+    const s = await fs.lstat(file);
+    if (
+      (directory ? !s.isDirectory() : !s.isFile() || s.nlink !== 1) ||
+      s.uid !== 0 ||
+      (mode === undefined ? (s.mode & 0o7022) !== 0 : s.gid !== 0 || (s.mode & 0o7777) !== mode)
+    )
+      throw Error('boundary-entry');
+    const { stdout } = await run('/bin/ls', ['-lde', file], { cwd: '/', env: {}, timeout: 3000 });
+    const acl = stdout.trimEnd().split('\n').slice(1);
+    if (
+      acl.some((line) => mode !== undefined || !/^\s*\d+: group:everyone deny delete$/.test(line))
+    )
+      throw Error('boundary-entry');
+  }
+  for (const dir of ['/', '/Library', '/Library/Application Support'])
+    await trusted(dir, undefined, true);
+  for (const dir of [system, base]) await trusted(dir, 0o755, true);
+  for (const name of [
+    'activation-state.js',
+    'install-owner.js',
+    'install-platform.js',
+    'install-production.js',
+    'install-root.js',
+    'install-transaction.js',
+    'launcher.js',
+    'publisher-verification.js',
+    'read-release-file.pl',
+    'release-materialization.js',
+    'release-observation.js',
+    'release-origin.js',
+    'release-pipeline.js',
+    'release-policy.ts',
+    'system-install-layout.js',
+  ])
+    await trusted(path.join(base, name), 0o644, false);
+  for (const file of [node, path.join(base, 'launch')]) await trusted(file, 0o755, false);
+  await trusted(path.join(system, 'bootstrap-root.pl'), 0o644, false);
+  await require('./install-production.js').installApprovedSystem(sha);
+}
+
+if (require.main === module) {
+  installedMain().catch((error) => {
+    const code =
+      /^(boundary-(entry|permissions|base|account|config|pf|ssh|program|state)|release-(verification|stage|materialization)|restore-failed)$/.test(
+        error.message,
+      )
+        ? error.message
+        : 'install-failed';
+    process.stderr.write(code + '\n');
+    process.exitCode = 1;
+  });
+}

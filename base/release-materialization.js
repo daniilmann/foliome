@@ -327,12 +327,11 @@ async function requireAbsent(file) {
 
 // Consumes a trusted stage from release-pipeline. Approval identifies exactly which
 // stage may be composed. Launcher receipts and activation are owned by the caller.
-async function materializeRelease(input) {
+async function materialize(input, owner) {
   let scratch;
   try {
     const { stage, approval, releasesRoot } = input;
-    const owner = process.getuid?.();
-    if (!owner || process.geteuid?.() !== owner || stage?.ok !== true) throw Error();
+    if (owner === undefined || process.geteuid?.() !== owner || stage?.ok !== true) throw Error();
     const { sha, version: releaseVersion, tree, stagingDir, archive } = stage;
     if (
       typeof sha !== 'string' ||
@@ -406,9 +405,17 @@ async function materializeRelease(input) {
   }
 }
 
+function materializeRelease(input) {
+  return materialize(input, process.getuid?.() || undefined);
+}
+
+function materializeForInstaller(input) {
+  return materialize(input, process.getuid?.() === 0 ? 0 : undefined);
+}
+
 // Projection of a successful materialization to the launcher's accepted-file format.
 function releaseReceipt({ sha, inventory }) {
   return { sha, files: Object.fromEntries(inventory.map(({ path, sha256 }) => [path, sha256])) };
 }
 
-module.exports = { materializeRelease, releaseReceipt };
+module.exports = { materializeRelease, materializeForInstaller, releaseReceipt };

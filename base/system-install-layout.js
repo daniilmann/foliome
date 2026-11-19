@@ -13,7 +13,6 @@ const tools = ['current_task', 'snapshot', 'readText'];
 const shaPattern = /^[a-f0-9]{40}$/;
 const nodeVersion = '26.13.1';
 const codexVersion = '0.167.0';
-const nodeMember = `node-v${nodeVersion}-darwin-arm64/bin/node`;
 const codexMember = 'codex-aarch64-apple-darwin';
 
 // Pinned Cloudflare destination ranges supplied for this release. Account-specific
@@ -210,7 +209,7 @@ function sshServer(agent, hostKey) {
   );
 }
 
-function pfRules(owner, agent) {
+function pfRules(agent) {
   return lines(
     `table <foliome_cloudflare4> const { ${cloudflare4.join(', ')} }`,
     `table <foliome_cloudflare6> const { ${cloudflare6.join(', ')} }`,
@@ -218,8 +217,7 @@ function pfRules(owner, agent) {
     'block return in quick on lo0 inet proto tcp from ! 127.0.0.1 to any port 22',
     'block return in quick on lo0 inet proto tcp from any to ! 127.0.0.1 port 22',
     'block return in quick on lo0 inet6 proto tcp from any to any port 22',
-    // The ordinary installed launcher checks the canary with the owner's UID.
-    `block return out quick inet proto tcp from any to 192.0.2.1 port 49151 user { ${owner.uid}, ${agent.uid} }`,
+    'block return out quick inet proto tcp from any to 192.0.2.1 port 49151',
     `pass out quick inet proto tcp from any to <foliome_cloudflare4> port 443 user ${agent.uid} keep state`,
     `pass out quick inet6 proto tcp from any to <foliome_cloudflare6> port 443 user ${agent.uid} keep state`,
     // Darwin PF can attribute TCP and UDP to a socket UID.
@@ -287,6 +285,8 @@ function copyArtifact([source, destination]) {
 // verifies the publisher, the manifest blob and the inventory at the accepted
 // commit, then holds the verified bytes in private staging through copying.
 function releasePlan({ root, base, launch, node, codex, release: appRelease }, release) {
+  const runtime = release.runtime ?? { node: nodeVersion, codex: codexVersion };
+  const nodeMember = `node-v${runtime.node}-darwin-arm64/bin/node`;
   const nodeArchive = path.join(path.dirname(release.codex), 'node');
   const verified = path.join(release.source, 'verified');
   const copies = [
@@ -310,7 +310,7 @@ function releasePlan({ root, base, launch, node, codex, release: appRelease }, r
       publisherVerifier: path.join(base, 'publisher-verification.js'),
       nodeMember,
       codexMember,
-      version: { node: nodeVersion, codex: codexVersion },
+      version: runtime,
       bindToCommit: [root, base, appRelease],
     },
     steps: [
@@ -353,7 +353,9 @@ function compile(root, { owner, agent, keys }, t, release) {
   const ssh = path.dirname(path.dirname(t.agentKeys));
   const hostKey = path.join(ssh, hostKeyName);
   const commands = path.dirname(t.wrapper);
-  const codex = path.join(commands, 'codex');
+  const codex = installed
+    ? path.join(root, 'executor/share', release.sha, 'codex')
+    : path.join(commands, 'codex');
   const work = path.join(commands, 'work');
   const agentData = userRoot(agent.home);
   const codexHome = path.join(agentData, 'codex');
@@ -375,6 +377,8 @@ function compile(root, { owner, agent, keys }, t, release) {
   }
 
   for (const p of [root, base, path.dirname(commands), commands, work]) dir(p, 0, 0o755);
+  if (installed)
+    for (const p of [path.dirname(path.dirname(codex)), path.dirname(codex)]) dir(p, 0, 0o755);
   dir(path.dirname(t.agentKeys), 0, 0o711);
   for (const p of [
     userRoot(owner.home),
@@ -403,6 +407,13 @@ function compile(root, { owner, agent, keys }, t, release) {
     0o644,
     sshServer(agent, installed ? path.join('/etc/ssh', hostKeyName) : hostKey),
   );
+  if (installed)
+    file(
+      path.join(ssh, 'sshd_config'),
+      0,
+      0o644,
+      lines('Include /etc/ssh/sshd_config.d/000-foliome.conf'),
+    );
   const keyOptions = 'restrict,from="127.0.0.1"';
   // sshd opens authorized_keys as the login UID. Give each login read access
   // through a single ACL while retaining root ownership and mode 0600.
@@ -417,7 +428,7 @@ function compile(root, { owner, agent, keys }, t, release) {
     [`user:${agent.name} allow read`],
   );
   file(t.devKeys, 0, 0o600, lines(`${keyOptions} ${keys.dev}`), ['user:dev allow read']);
-  file(t.pfAnchor, 0, 0o644, pfRules(owner, agent));
+  file(t.pfAnchor, 0, 0o644, pfRules(agent));
   file(t.pfTask, 0, 0o644, pfPlist(t.pfAnchor, installed));
   file(
     t.wrapper,
@@ -508,12 +519,22 @@ function planSystemInstall(input) {
 // public keys only, and an independently accepted commit. All targets are fixed.
 function planInstalledSystemInstall(input) {
   try {
-    const { owner, agent, sha } = input;
-    if (!identities(input, systemRoot) || typeof sha !== 'string' || !shaPattern.test(sha))
+    const { owner, agent, sha, runtime } = input;
+    if (
+      agent.name !== 'executor' ||
+      !identities(input, systemRoot) ||
+      typeof sha !== 'string' ||
+      !shaPattern.test(sha) ||
+      (runtime !== undefined &&
+        (typeof runtime.node !== 'string' ||
+          !/^26\.13\.(0|[1-9][0-9]*)$/.test(runtime.node) ||
+          typeof runtime.codex !== 'string' ||
+          !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(runtime.codex)))
+    )
       return boundaryError();
     const source = path.join(userRoot(owner.home), 'data/install-staging', sha);
     const targets = targetsFor(systemRoot, owner, agent, true);
-    return compile(systemRoot, input, targets, releasePaths(source, sha, true));
+    return compile(systemRoot, input, targets, { ...releasePaths(source, sha, true), runtime });
   } catch {
     return boundaryError();
   }

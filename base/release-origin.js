@@ -264,6 +264,20 @@ async function readReleaseArchive(url, limit) {
   return response.body;
 }
 
+async function readProductionWorkflowId() {
+  const workflow = await json(
+    fetchBounded,
+    'https://api.github.com/repos/daniilmann/foliome/actions/workflows/release.yml',
+  );
+  if (
+    workflow?.path !== '.github/workflows/release.yml' ||
+    !Number.isSafeInteger(workflow.id) ||
+    workflow.id <= 0
+  )
+    throw Error('workflow');
+  return workflow.id;
+}
+
 function playwrightArchiveUrl(version) {
   if (typeof version !== 'string' || !/^1\.64\.(0|[1-9]\d*)$/.test(version)) throw Error();
   return `https://registry.npmjs.org/playwright-core/-/playwright-core-${version}.tgz`;
@@ -285,6 +299,7 @@ async function readReleaseArchives(nodeVersion, playwrightVersion, observedTarba
 module.exports = {
   readReleaseOrigin,
   readReleaseArchives,
+  readProductionWorkflowId,
   isReleaseRepository,
   playwrightArchiveUrl,
 };
