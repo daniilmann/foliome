@@ -7,6 +7,7 @@ type NodeFact = {
   visible: boolean;
   role: string;
   text: string;
+  label?: string;
   name?: string;
   state?: string;
   field?: 'empty' | 'filled' | 'sealed';
@@ -240,7 +241,7 @@ function maskedSlice(text: string, start: number, end: number, masks: Range[]): 
   }
   return result;
 }
-type FlowPart = { text: string; ancestors: Iterable<number> };
+type FlowPart = { text: string; ancestors: Iterable<number>; label?: string };
 
 function* flowAncestors(n: number, parents: ReadonlyMap<number, number>) {
   for (let current: number | undefined = n; current !== undefined; current = parents.get(current))
@@ -254,7 +255,7 @@ function maskFlow(parts: readonly FlowPart[], secrets: Secret[]) {
     const start = text.length;
     const normalized = normalize(part.text);
     text += normalized;
-    return { start, end: text.length, normalized, ancestors: part.ancestors };
+    return { start, end: text.length, normalized, ancestors: part.ancestors, label: part.label };
   });
   const masks = ranges(text, secrets);
   const numericSecrets = new Set(
@@ -282,10 +283,17 @@ function maskFlow(parts: readonly FlowPart[], secrets: Secret[]) {
         for (const slice of entry.slices)
           masks.push({ start: slice.start, end: slice.end, kind: 'secret' });
   }
-  return slices.map(({ start, end, normalized }) => ({
-    normalized,
-    filtered: maskedSlice(text, start, end, masks),
-  }));
+  return slices.map(({ start, end, normalized, label }) => {
+    const filtered = maskedSlice(text, start, end, masks);
+    const source = label?.isWellFormed() ? normalize(label) : '';
+    const offset = source ? normalized.indexOf(source) : -1;
+    const exact = offset >= 0 && normalized.indexOf(source, offset + 1) < 0;
+    return {
+      normalized,
+      filtered,
+      label: exact ? maskedSlice(text, start + offset, start + offset + source.length, masks) : '',
+    };
+  });
 }
 
 function paintMasks(parts: readonly FlowPart[], secrets: Secret[]): boolean[] {
@@ -373,7 +381,9 @@ function valid(input: unknown): input is Facts {
     )
       return false;
     if (
-      ['name', 'state', 'href'].some((k) => n[k] !== undefined && typeof n[k] !== 'string') ||
+      ['label', 'name', 'state', 'href'].some(
+        (k) => n[k] !== undefined && typeof n[k] !== 'string',
+      ) ||
       (n.field !== undefined && !['empty', 'filled', 'sealed'].includes(n.field as string))
     )
       return false;
@@ -443,17 +453,19 @@ function filter(input: unknown): Result {
       if (!shown || frame.foreign || frame.unavailable) continue;
       if (node.parent !== undefined) parents.set(node.n, node.parent);
       const document = documents.get(node.frame) ?? [];
+      const isField = node.field || fieldRoles.has(node.role.toLowerCase());
       document.push({
         n: node.n,
-        text: node.field || fieldRoles.has(node.role.toLowerCase()) ? '' : node.text,
+        text: isField ? '' : node.text,
         ancestors: flowAncestors(node.n, parents),
+        label: isField ? undefined : node.label,
       });
       documents.set(node.frame, document);
     }
-    const texts = new Map<number, string>();
+    const texts = new Map<number, ReturnType<typeof maskFlow>[number]>();
     for (const document of documents.values()) {
       const filtered = maskFlow(document, secrets);
-      document.forEach((part, i) => texts.set(part.n, filtered[i].filtered));
+      document.forEach((part, i) => texts.set(part.n, filtered[i]));
     }
     const limit = (value: string) => {
       if ([...value].length <= 500) return value;
@@ -465,7 +477,8 @@ function filter(input: unknown): Result {
     snapshot.page.title = limit(snapshot.page.title);
     for (const frame of snapshot.frames) frame.host = limit(frame.host);
     for (const node of input.nodes) {
-      if (!texts.has(node.n)) continue;
+      const text = texts.get(node.n);
+      if (!text) continue;
       if (snapshot.elements.length === 3000) {
         snapshot.truncated = true;
         break;
@@ -475,7 +488,7 @@ function filter(input: unknown): Result {
         n: node.n,
         frame: framePositions.get(node.frame)!,
         role: limit(mask(node.role, secrets)),
-        text: limit(texts.get(node.n)!),
+        text: limit(text.filtered),
       };
       if (node.field) element.field = node.field;
       if (!isField && node.name !== undefined) element.name = limit(mask(node.name, secrets));
@@ -492,6 +505,10 @@ function filter(input: unknown): Result {
             (!isField || !['name', 'placeholder', 'aria-label'].includes(key))
           )
             element.attrs[key] = limit(tokenMask(mask(value, secrets)));
+      }
+      if (text.label && element.text.includes(text.label)) {
+        element.name = text.label;
+        if (tokenMask(text.label) === text.label) (element.attrs ??= {})['aria-label'] = text.label;
       }
       snapshot.elements.push(element);
     }

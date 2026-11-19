@@ -53,6 +53,8 @@ type NodeFact = {
   visible: boolean;
   role: string;
   text: string;
+  label?: string;
+  snapshotOnly?: boolean;
   state?: string;
   field?: 'empty' | 'filled' | 'sealed';
   href?: string;
@@ -164,8 +166,38 @@ const expression = String.raw`(() => {
   const rectValue = r => ({ x: r.x, y: r.y, width: r.width, height: r.height });
   const forbidden = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT']);
   const fieldRoles = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton', 'slider']);
-  const safeAttrs = ['id', 'name', 'class', 'data-testid', 'type', 'autocomplete', 'placeholder', 'aria-label'];
+  const safeAttrs = ['id', 'name', 'class', 'data-testid', 'type', 'autocomplete', 'placeholder'];
   const html = 'http://www.w3.org/1999/xhtml', svg = 'http://www.w3.org/2000/svg';
+  const scrollingElement = document.scrollingElement;
+  const scrollStyle = getComputedStyle(scrollingElement || document.documentElement);
+  const normalDocumentOrigin = scrollStyle.direction === 'ltr' && scrollStyle.writingMode === 'horizontal-tb';
+  const inDocument = (rect, element) => {
+    if (!normalDocumentOrigin || (rect.right + scrollX > 0 && rect.bottom + scrollY > 0)) return true;
+    // Nested scroll offsets can move recoverable text across the document origin.
+    for (let el = element; el; el = el.assignedSlot || el.parentElement || el.getRootNode().host) {
+      if (el !== scrollingElement && (el.scrollLeft || el.scrollTop)) return true;
+    }
+    return false;
+  };
+  const px = '(-?(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+))px';
+  const legacyClip = new RegExp('^rect\\(' + [px, px, px, px].join(',\\s*') + '\\)$');
+  const emptyClip = (style, bounds, untransformed) => {
+    if (style.clip !== 'auto' && ['absolute', 'fixed'].includes(style.position)) {
+      const legacy = legacyClip.exec(style.clip);
+      if (legacy && (Number(legacy[2]) <= Number(legacy[4]) || Number(legacy[3]) <= Number(legacy[1]))) return true;
+    }
+    const inset = /^inset\(([^()]+)\)$/.exec(style.clipPath);
+    if (!inset || style.display === 'contents' || bounds.width <= 0 || bounds.height <= 0) return false;
+    const sides = inset[1].trim().split(/\s+/);
+    if (sides.length > 4 || !sides.every(side => /^-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:px|%)$/.test(side))) return false;
+    const [top, right = top, bottom = top, left = right] = sides;
+    const fills = (a, b, size) => {
+      if (a.endsWith('%') && b.endsWith('%')) return parseFloat(a) + parseFloat(b) >= 100;
+      const pixels = side => parseFloat(side) * (side.endsWith('%') ? size / 100 : 1);
+      return untransformed && pixels(a) + pixels(b) >= size;
+    };
+    return fills(top, bottom, bounds.height) || fills(left, right, bounds.width);
+  };
   const paintStyle = (style, reflectionBox) => {
     if (style.textTransform !== 'none' || parseFloat(style.webkitTextStrokeWidth) !== 0 ||
         !['1', 'normal'].includes(style.zoom) || style.clipPath !== 'none' ||
@@ -197,7 +229,8 @@ const expression = String.raw`(() => {
     }
     return true;
   };
-  const visit = (element, parent, ancestorsVisible, insideSvg = false) => {
+  let visits = 1;
+  const visit = (element, parent, ancestorsVisible, parentGeometry, insideSvg = false, snapshotOnly = false, unclipped = true, untransformed = true) => {
     if (nodes.length >= 10000) throw new Error();
     const tag = element.tagName.toUpperCase();
     if (forbidden.has(tag)) return;
@@ -206,11 +239,14 @@ const expression = String.raw`(() => {
     if (svgRoot && (element.localName !== 'svg' || !clippedSvg(element, style)) ||
         element.namespaceURI !== html && element.namespaceURI !== svg) unsupported = true;
     const subtreeVisible = ancestorsVisible && style.display !== 'none' && style.visibility === 'visible' && Number(style.opacity) > 0 && !element.hasAttribute('hidden') && !element.hasAttribute('inert') && element.getAttribute('aria-hidden') !== 'true';
-    const visible = subtreeVisible && rect.width > 0 && rect.height > 0;
+    const transformed = !insideSvg && hasTransform(style);
+    untransformed = untransformed && !transformed && ['1', 'normal'].includes(style.zoom);
+    unclipped = unclipped && (element.namespaceURI !== html || !emptyClip(style, rect, untransformed));
+    const visibleBox = subtreeVisible && rect.width > 0 && rect.height > 0;
     const frame = tag === 'IFRAME' || tag === 'FRAME';
     const embed = frame || tag === 'OBJECT' || tag === 'EMBED';
     const frameUrl = frame && element.src ? element.src : null;
-    if (frameUrl) embeds.push({ url: frameUrl, visible });
+    if (frameUrl && !snapshotOnly) embeds.push({ url: frameUrl, visible: visibleBox });
     if (embed) visitedEmbeds.add(element);
     if (!insideSvg && !svgRoot && !['IMG', 'CANVAS', 'VIDEO'].includes(tag) && !['none', 'normal'].includes(style.content))
       unsupported = true;
@@ -248,13 +284,44 @@ const expression = String.raw`(() => {
     const button = tag === 'INPUT' && ['button', 'submit', 'reset'].includes(type);
     const choice = tag === 'INPUT' && ['checkbox', 'radio'].includes(type);
     const field = closedField || tag === 'INPUT' && !button && !choice || tag === 'SELECT' || tag === 'TEXTAREA' || fieldRoles.has(role);
-    let text = button ? element.value : '';
-    if (!field) for (const child of element.childNodes) if (child.nodeType === 3) text += child.nodeValue || '';
+    const root = element.shadowRoot;
+    if (root && !state.watched.has(root)) {
+      state.observer.observe(root, { subtree: true, attributes: true, childList: true, characterData: true });
+      root.addEventListener('slotchange', () => { state.revision++; });
+      state.watched.add(root);
+    }
+    const slot = element instanceof HTMLSlotElement && element.getRootNode() instanceof ShadowRoot;
+    const assigned = slot ? element.assignedNodes() : null;
+    const children = root ? root.childNodes : assigned?.length ? assigned : element.childNodes;
+    visits += children.length;
+    if (visits > 20000) throw new Error();
+    const ranges = new Map();
+    const textVisible = subtreeVisible && unclipped && parseFloat(style.fontSize) >= 2;
+    const buttonText = button ? element.value : '';
+    let text = button && textVisible && inDocument(rect, element) ? buttonText : '';
+    let semanticText = buttonText;
+    for (const child of children) {
+      if (child.nodeType !== Node.TEXT_NODE || field && ['INPUT', 'SELECT', 'TEXTAREA'].includes(tag)) continue;
+      const range = document.createRange(); range.selectNodeContents(child);
+      const clientRects = range.getClientRects();
+      if (clientRects.length > 20001) { unsupported = true; continue; }
+      const boxes = Array.from(clientRects).filter(r => r.width > 0 && r.height > 0);
+      if (!boxes.length) continue;
+      if (!insideSvg && !svgRoot) ranges.set(child, boxes.map(rectValue));
+      if (field) continue;
+      semanticText += child.nodeValue || '';
+      if (textVisible && boxes.some(box => inDocument(box, element))) text += child.nodeValue || '';
+    }
+    const visible = visibleBox || slot && !!text;
     const fact = { visible, role, text: visible ? text : '' };
+    const ariaLabel = element.getAttribute('aria-label');
+    if (!field && text && ariaLabel) fact.label = ariaLabel;
+    // The composed snapshot does not extend the nodes or text admitted by readText.
+    if (snapshotOnly || root && text) fact.snapshotOnly = true;
     if (field) {
       const type = (element.getAttribute('type') || '').toLowerCase();
       const textual = tag === 'TEXTAREA' || tag === 'INPUT' && ['', 'text', 'password', 'email', 'tel', 'url', 'search'].includes(type);
-      const value = !closedField && textual && visible && typeof element.value === 'string' ? element.value : '';
+      const value = !closedField && textual && visibleBox && typeof element.value === 'string' ? element.value : '';
       fact.field = closedField || type === 'password' ? 'sealed' : value ? 'filled' : 'empty';
       if (value) secrets.push({ value, kind: type === 'password' ? 'password' : 'login' });
     }
@@ -268,40 +335,29 @@ const expression = String.raw`(() => {
     if (Object.keys(attrs).length) fact.attrs = attrs;
     if (!state.ids.has(element)) state.ids.set(element, state.next++);
     identities.push(state.ids.get(element));
-    const label = [text, element.getAttribute('aria-label') || '', element.getAttribute('title') || '', (tag === 'BUTTON' || button) ? element.value : ''].join(' ').toLowerCase();
+    const label = [semanticText, ariaLabel || '', element.getAttribute('title') || '', (tag === 'BUTTON' || button) ? element.value : ''].join(' ').toLowerCase();
     semantics.push(JSON.stringify([tag, label, element.getAttribute('type'), element.getAttribute('aria-expanded'), element.getAttribute('aria-haspopup'), element.getAttribute('aria-controls'), element.getAttribute('aria-pressed'), element.getAttribute('autocomplete')]));
     const payment = /(?:pay(?:ment)?|transfer|оплат|плат[её]ж|перевод)/iu.test(label);
     const change = /(?:save|delete|remove|change|сохран|удал|измен)/iu.test(label) || tag === 'INPUT' && ['submit', 'reset'].includes(element.type) || tag === 'BUTTON' && element.type === 'submit';
     classes.push(payment ? 'blocked-payment' : change ? 'blocked-change' : null);
     const index = nodes.length; nodes.push(fact); parents.push(parent);
-    const ancestors = [];
-    for (let current = element; current; current = current.parentElement) {
-      if (!state.ids.has(current)) state.ids.set(current, state.next++);
-      ancestors.push(state.ids.get(current));
-    }
+    const ancestors = [state.ids.get(element), ...(parentGeometry?.ancestors ?? [])];
     const runs = [];
-    geometry.push({ rect: rectValue(rect), runs, button, ancestors, frameUrl,
-      transformed: !insideSvg && hasTransform(style), mask: field || embed || svgRoot,
-      style: appearance, ...(svgRoot ? { svg: true } : {}) });
+    const measured = { rect: rectValue(rect), runs, button, ancestors, frameUrl,
+      transformed, mask: field || embed || svgRoot, style: appearance, ...(svgRoot ? { svg: true } : {}) };
+    geometry.push(measured);
     observePseudo(index, 'before');
-    if (button && !insideSvg && !svgRoot && text && rect.width > 0 && rect.height > 0)
-      pushPaint(index, text, [rectValue(rect)]);
-    for (const child of element.childNodes) {
+    if (button && !insideSvg && !svgRoot && buttonText && rect.width > 0 && rect.height > 0)
+      pushPaint(index, buttonText, [rectValue(rect)]);
+    for (const child of children) {
       if (child.nodeType === Node.ELEMENT_NODE) {
-        if (!field) visit(child, visible ? index : parent, subtreeVisible, insideSvg || svgRoot);
+        if (!field) visit(child, visible ? index : parent, subtreeVisible, measured, insideSvg || svgRoot,
+          snapshotOnly || !!root, unclipped, untransformed);
         else if (tag !== 'SELECT' && !insideSvg) unsupported = true;
-      } else if (!insideSvg && !svgRoot && child.nodeType === Node.TEXT_NODE && child.nodeValue &&
-                 (!field || !['INPUT', 'SELECT', 'TEXTAREA'].includes(tag))) {
-        const range = document.createRange(); range.selectNodeContents(child);
-        const bounds = Array.from(range.getClientRects()).filter(r => r.width > 0 && r.height > 0).map(rectValue);
-        if (!bounds.length) continue;
-        if (field) {
-          // The field value is private. Its drawn overflow is protected without reading it into the flow.
-          for (const boundsRect of bounds) runs.push(boundsRect);
-        } else {
-          for (const boundsRect of bounds) runs.push(boundsRect);
-          pushPaint(index, child.nodeValue, bounds);
-        }
+      } else if (ranges.has(child)) {
+        const bounds = ranges.get(child);
+        for (const boundsRect of bounds) runs.push(boundsRect);
+        if (!field && child.nodeValue) pushPaint(index, child.nodeValue, bounds);
       }
     }
     observePseudo(index, 'after');
@@ -733,12 +789,13 @@ async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: Nod
     nested: boolean;
   }[] = [];
   const seen = new Set<ParticipatingWorld>();
+  let visits = 0;
   const visit = (
     value: unknown,
     world: ParticipatingWorld,
     insideShadow?: (typeof roots)[number],
   ) => {
-    if (!record(value)) throw new Error();
+    if (++visits > 20000 || !record(value)) throw new Error();
     if (
       value.nodeType === 9 &&
       Array.isArray(value.children) &&
@@ -753,11 +810,11 @@ async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: Nod
       if (mode === 'user-agent') continue;
       if (insideShadow) {
         insideShadow.nested = true;
-        continue;
+        if (insideShadow.mode === 'closed') continue;
       }
       if (!positiveId(backend) || (mode !== 'open' && mode !== 'closed') || roots.length >= 256)
         throw new Error();
-      const root: (typeof roots)[number] = { world, backend, mode, nested: false };
+      const root: (typeof roots)[number] = { world, backend, mode, nested: !!insideShadow };
       roots.push(root);
       visit(shadow, world, root);
     }
@@ -769,6 +826,7 @@ async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: Nod
   for (const world of worlds)
     if (world.observation.viewport && !seen.has(world)) world.observation.unsupported = true;
   const touched = new Set<ParticipatingWorld>();
+  const closedHosts = new Map<ParticipatingWorld, Set<number>>();
   for (const { world, backend, mode, nested } of roots) {
     try {
       const value = await inspectNode(cdp, backend, world.context, shadowGeometry);
@@ -778,6 +836,9 @@ async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: Nod
       if (mode === 'closed') {
         const node = nodes[world.base + index];
         node.state = node.state ? node.state + ' unavailable' : 'unavailable';
+        const hosts = closedHosts.get(world) ?? new Set<number>();
+        hosts.add(value.hostId);
+        closedHosts.set(world, hosts);
       }
       const bounds = nested ? null : value.bounds;
       if (
@@ -797,6 +858,15 @@ async function observeShadows(cdp: Cdp, worlds: ParticipatingWorld[], nodes: Nod
       await verifyWorld(cdp, world);
     } catch {
       world.observation.unsupported = true;
+    }
+  }
+  for (const [world, hosts] of closedHosts) {
+    for (const [index, geometry] of world.observation.geometry.entries()) {
+      if (!geometry.ancestors.some((id) => hosts.has(id))) continue;
+      const node = nodes[world.base + index];
+      node.text = '';
+      delete node.label;
+      if (!hosts.has(geometry.ancestors[0])) node.visible = false;
     }
   }
 }
@@ -1434,7 +1504,7 @@ async function prepare(
           nodeNumber: node.n,
           identity: `${rootContext}:${rootIdentities[index]}`,
           descriptor: `${documentDescriptor}:${node.n}`,
-          visible: node.visible && !!element,
+          visible: node.visible && !node.snapshotOnly && !!element,
           enabled: !node.state?.split(' ').includes('disabled'),
           sourceFrame: node.frame === 0,
           secretField: !!node.field,
@@ -1492,6 +1562,7 @@ async function prepare(
           const included = new Set([nodeNumber]);
           const texts: string[] = [];
           for (const node of result.facts.nodes.slice(0, result.rootNodeCount)) {
+            if (node.snapshotOnly) continue;
             if (deep && node.parent !== undefined && included.has(node.parent))
               included.add(node.n);
             if (included.has(node.n)) {
