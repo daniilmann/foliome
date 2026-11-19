@@ -1625,6 +1625,112 @@ test(
   },
 );
 
+test(
+  'составное дерево и локальная видимость текстового снимка',
+  { timeout: 60_000 },
+  async (t: import('node:test').TestContext) => {
+    const { createTextSnapshotStore } =
+      await import('../../core/adapters/store/text-snapshot-store.ts');
+    const cases = [
+      {
+        name: 'открытый shadow и назначенный slot',
+        body: `<div id="host" style="left:10px;top:10px"><span slot="shown">Assigned marker</span><span>Unassigned marker</span></div>
+        <script>document.querySelector('#host').attachShadow({mode:'open'}).innerHTML='<span>Shadow marker</span><slot name="shown">Fallback marker</slot>'</script>`,
+        present: ['Shadow marker', 'Assigned marker'],
+        absent: ['Unassigned marker', 'Fallback marker'],
+      },
+      {
+        name: 'закрытый shadow не раскрывает текст',
+        body: `<div id="host" style="left:10px;top:10px"><span>Closed light marker</span></div>
+        <script>document.querySelector('#host').attachShadow({mode:'closed'}).innerHTML='<span>Closed inner marker</span>'</script>`,
+        present: [],
+        absent: ['Closed light marker', 'Closed inner marker'],
+        unavailable: true,
+      },
+      {
+        name: 'текст и имя в открытом shadow проходят фильтр',
+        body: `<div id="host" style="left:10px;top:10px"></div>
+        <script>document.querySelector('#host').attachShadow({mode:'open'}).innerHTML='<span aria-label="Card 4111 1111 1111 1111">Shadow note 4111 1111 1111 1111</span>'</script>`,
+        present: ['Shadow note', '1111'],
+        absent: ['4111', '4111 1111 1111 1111'],
+      },
+      {
+        name: 'текст вне прокрученного viewport остаётся в документе',
+        body: '<div style="left:10px;top:10px">Scrolled marker</div><div style="left:10px;top:800px;height:20px">Bottom marker</div>',
+        present: ['Scrolled marker'],
+        absent: [],
+        scroll: true,
+      },
+      ...[
+        ['мелкий шрифт', 'font-size:1px'],
+        ['нулевой clip', 'clip:rect(0px, 0px, 0px, 0px)'],
+        ['нулевой clip-path', 'clip-path:inset(50%)'],
+        ['слева от документа', 'left:-300px;top:10px'],
+        ['выше документа', 'left:10px;top:-100px'],
+        ['aria-hidden', 'aria-hidden'],
+        ['inert', 'inert'],
+      ].map(([name, style]) => ({
+        name,
+        body: `<div ${style === 'aria-hidden' ? 'aria-hidden="true"' : style === 'inert' ? 'inert' : ''} style="left:10px;top:10px;width:180px;height:30px;${style}">Invisible edge marker</div>`,
+        present: [],
+        absent: ['Invisible edge marker'],
+      })),
+    ];
+    for (const fixture of cases)
+      await t.test(fixture.name, async () => {
+        await measuredPage(
+          `${fixture.body}<div style="left:250px;top:120px">Visible control marker</div>`,
+          async ({ page, capture }: any) => {
+            if (fixture.scroll) {
+              await page.evaluate(() => window.scrollTo(0, 500));
+              assert.ok((await page.evaluate(() => window.scrollY)) > 0);
+            }
+            const result = await capture.result();
+            assert.equal(result.ok, true);
+            const db = new DatabaseSync(':memory:');
+            try {
+              const store = createTextSnapshotStore(db, () => 1234);
+              store.append({
+                sessionId: 'synthetic-session',
+                sourceId: 'synthetic-source',
+                accessId: 'synthetic-access',
+                result,
+              });
+              const output = db.prepare('SELECT snapshot_json FROM text_snapshots').get()
+                .snapshot_json as string;
+              assert.ok(output.includes('Visible control marker'));
+              for (const marker of fixture.present)
+                assert.ok(output.includes(marker), `missing ${marker}`);
+              for (const marker of fixture.absent)
+                assert.equal(output.includes(marker), false, `exposed ${marker}`);
+              const stored = store.latest({
+                sourceId: 'synthetic-source',
+                accessId: 'synthetic-access',
+                host: 'cabinet.invalid',
+                path: '/overview',
+              });
+              assert.ok(stored);
+              const reconstructed = stored.elements
+                .map((element: any) => `${element.text ?? ''}${element.name ?? ''}`)
+                .join('');
+              for (const marker of fixture.absent)
+                assert.equal(reconstructed.includes(marker), false, `reconstructed ${marker}`);
+              if (fixture.unavailable)
+                assert.ok(
+                  JSON.parse(output).elements.some(
+                    (element: any) =>
+                      element.attrs?.id === 'host' && element.state === 'unavailable',
+                  ),
+                );
+            } finally {
+              db.close();
+            }
+          },
+        );
+      });
+  },
+);
+
 test('закрытый shadow обозначен недоступным в текстовом снимке', { timeout: 60_000 }, async () => {
   await measuredPage(
     '<div id="target" style="left:20px;top:20px;width:120px;height:60px"></div><div id="ordinary" style="left:300px;top:30px">Readable marker</div><script>document.querySelector("#target").attachShadow({mode:"closed"}).append(document.createTextNode("Hidden marker"))</script>',
