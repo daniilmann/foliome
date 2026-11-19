@@ -166,9 +166,12 @@ function artifactEvidence(checked, observations) {
   )
     throw Error();
   return {
-    node: { status: 'verified', sha256: node.sha256 },
-    codex: { status: 'verified', sha256: codex.sha256 },
-    playwrightCore: { status: 'verified', integrity },
+    signatures: {
+      node: { status: 'verified', sha256: node.sha256 },
+      codex: { status: 'verified', sha256: codex.sha256 },
+      playwrightCore: { status: 'verified', integrity },
+    },
+    archive: { sha256: playwright.sha256, integrity },
   };
 }
 
@@ -199,6 +202,7 @@ function matchingBoundary(tree, manifest, installed) {
 async function compose(input, checkBoundary, provideArtifacts, beforeStage = () => {}) {
   let checks;
   let version;
+  let archive;
   const result = await observeRelease(input, async (tree) => {
     const entries = new Map(tree.map((entry) => [entry.path, entry]));
     const manifestBytes = entries.get('release/manifest.json').bytes;
@@ -244,7 +248,7 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
       artifacts,
       verifyPublisher,
       validate: async (checked) => {
-        const signatures = artifactEvidence(checked, observations);
+        const { signatures, archive: checkedArchive } = artifactEvidence(checked, observations);
         const decision = validateReleaseCandidate(
           {
             tag: observations.tag,
@@ -262,12 +266,13 @@ async function compose(input, checkBoundary, provideArtifacts, beforeStage = () 
         if (!decision.ok) return false;
         await beforeStage();
         checks = decision.checks;
+        archive = checkedArchive;
         return true;
       },
     };
   });
   if (!result.ok) return refused();
-  return { ...result, sha: input.commit, version, checks };
+  return { ...result, sha: input.commit, version, checks, archive };
 }
 
 // Local test port. The repository and issuer ports are supplied by the fixture.
