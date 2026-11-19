@@ -160,6 +160,32 @@ test('читает независимые байты метаданных кан
   assert.equal(f.verified(), 1);
 });
 
+test('повторяет наблюдение того же тега после завершения CI без ранней проверки издателя', async () => {
+  const f = fixture();
+  f.run.status = 'in_progress';
+  f.run.conclusion = '';
+  f.setRun();
+  const input = { ...f.input, productionErrors: true };
+  await assert.rejects(port().readReleaseOrigin(input), { message: 'ci-awaiting' });
+  assert.deepEqual(f.requests, [refUrl, manifestUrl, runsUrl]);
+  assert.equal(f.verified(), 0);
+
+  f.run.status = 'completed';
+  f.run.conclusion = 'success';
+  f.setRun();
+  assert.deepEqual(await port().readReleaseOrigin(input), { ok: true, sha, version });
+  assert.equal(f.verified(), 1);
+  assert.deepEqual(f.requests.slice(3), [
+    refUrl,
+    manifestUrl,
+    runsUrl,
+    jobsUrl,
+    npmUrl,
+    codexUrl,
+    assetUrl,
+  ]);
+});
+
 test('отклоняет чужой тег, SHA, проект и прогон без точной привязки', async () => {
   for (const kind of [
     'sha-format',
