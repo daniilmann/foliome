@@ -68,17 +68,33 @@ async function fixture() {
     baseChange: false,
     notesRu: 'Тест',
   };
+  const packageName = 'playwright-core';
+  const packageVersion = manifest.playwrightCore.version;
+  const registryArchive = 'https://registry.npmjs.org/playwright-core/-/playwright-core-1.64.0.tgz';
+  const dependencies = { [packageName]: packageVersion };
+  const engines = { node: manifest.node.version };
   const files: Record<string, Buffer> = {
     '.github/workflows/release.yml': Buffer.from('name: synthetic\n'),
     'README.md': Buffer.from('Synthetic release\n'),
-    'package.json': Buffer.from(JSON.stringify({ dependencies: { 'playwright-core': '1.64.0' } })),
+    'package.json': Buffer.from(
+      JSON.stringify({
+        name: 'synthetic-release',
+        version: manifest.version,
+        type: 'commonjs',
+        engines,
+        dependencies,
+      }),
+    ),
     'package-lock.json': Buffer.from(
       JSON.stringify({
+        name: 'synthetic-release',
+        version: manifest.version,
         lockfileVersion: 3,
         packages: {
-          '': { dependencies: { 'playwright-core': '1.64.0' } },
+          '': { name: 'synthetic-release', version: manifest.version, engines, dependencies },
           'node_modules/playwright-core': {
-            version: '1.64.0',
+            version: packageVersion,
+            resolved: registryArchive,
             integrity: integrity(playwright.bytes),
           },
         },
@@ -138,6 +154,7 @@ async function fixture() {
     'signatures',
     'advisory',
     'migration',
+    'publish',
   ].map((name) => ({
     name,
     run_id: 9,
@@ -153,7 +170,7 @@ async function fixture() {
       '1.64.0': {
         name: 'playwright-core',
         version: '1.64.0',
-        dist: { integrity: integrity(playwright.bytes) },
+        dist: { integrity: integrity(playwright.bytes), tarball: registryArchive },
       },
     },
     time: { '1.64.0': '2026-01-01T00:00:00.000Z' },
