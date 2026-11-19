@@ -30,6 +30,17 @@ function directory(overrides: Record<string, string> = {}) {
   };
   return async (program: string, args: string[]) => {
     assert.equal(program, '/usr/bin/dscl');
+    if (args[1] === '-search') {
+      const names: Record<string, string> = {
+        '100': '_lpoperator',
+        '399': 'com.apple.access_ssh',
+        '702': 'com.apple.sharepoint.group.2',
+      };
+      assert.ok(['.', '/Search'].includes(args[0]));
+      assert.deepEqual(args.slice(2, 4), ['/Groups', 'PrimaryGroupID']);
+      assert.ok(Object.hasOwn(names, args[4]));
+      return names[args[4]] + '\t\tPrimaryGroupID = (\n    ' + args[4] + '\n)';
+    }
     assert.deepEqual(args.slice(0, 2), ['.', '-read']);
     assert.ok(Object.hasOwn(groupRecords, args[2]));
     return groupRecords[args[2]];

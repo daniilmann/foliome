@@ -308,6 +308,18 @@ async function executorExists() {
   );
 }
 
+/** @param {string} name @param {number} gid @param {typeof output} read */
+async function requireUniqueGroup(name, gid, read) {
+  const expected = name + '\t\tPrimaryGroupID = (\n    ' + gid + '\n)';
+  for (const node of ['.', '/Search']) {
+    if (
+      (await read('/usr/bin/dscl', [node, '-search', '/Groups', 'PrimaryGroupID', String(gid)])) !==
+      expected
+    )
+      throw Error('boundary-account');
+  }
+}
+
 /**
  * macOS reports these groups even for a non-admin local account.
  * Verify the directory records rather than treating their GIDs as sufficient.
@@ -320,6 +332,7 @@ async function checkExecutorGroups(effective, guid, read = output) {
 
   const fields = ['RecordName', 'PrimaryGroupID'];
   if (groups.includes(399)) {
+    await requireUniqueGroup('com.apple.access_ssh', 399, read);
     const required = [...fields, 'GroupMembership', 'GroupMembers'];
     const sshGroup = accountAttributes(
       await read('/usr/bin/dscl', ['.', '-read', '/Groups/com.apple.access_ssh', ...required]),
@@ -341,6 +354,7 @@ async function checkExecutorGroups(effective, guid, read = output) {
     { gid: 702, name: 'com.apple.sharepoint.group.2', parents: [builtIn('0C')] },
   ]) {
     if (!groups.includes(gid)) continue;
+    await requireUniqueGroup(name, gid, read);
     const required = [...fields, 'NestedGroups'];
     const ownMembers = ['GroupMembership', 'GroupMembers'];
     const inherited = accountAttributes(
