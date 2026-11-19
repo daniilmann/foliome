@@ -10,10 +10,11 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "lint": "eslint core base scripts/checks test",
-    "format:check": "prettier --check 'core/**/*.ts' 'base/*.js' 'scripts/checks/**/*.ts' 'test/**/*.ts' package.json tsconfig.json eslint.config.mjs .prettierrc.json",
-    "test": "node --test --test-concurrency=1 scripts/checks/unit/*.test.ts",
-    "test:stand": "node --test --test-concurrency=1 test/stand/*.test.ts",
-    "test:attacks": "node --test --test-concurrency=1 test/attacks/*.test.ts"
+    "format:check": "prettier --check 'core/**/*.ts' 'base/*.js' 'scripts/checks/**/*.{cjs,ts}' 'test/**/*.ts' package.json tsconfig.json eslint.config.mjs .prettierrc.json",
+    "test": "node --require ./scripts/checks/check-set.cjs --test --test-concurrency=1 scripts/checks/unit/*.test.ts",
+    "test:stand": "node --require ./scripts/checks/check-set.cjs --test --test-concurrency=1 test/stand/*.test.ts",
+    "test:attacks": "node --require ./scripts/checks/check-set.cjs --test --test-concurrency=1 test/attacks/*.test.ts",
+    "test:migration": "node --require ./scripts/checks/check-set.cjs --test --test-concurrency=1 test/stand/update.test.ts"
   },
   "dependencies": {
     "playwright-core": "1.64.1"

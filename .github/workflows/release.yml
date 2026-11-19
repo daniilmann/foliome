@@ -122,7 +122,7 @@ jobs:
         with:
           node-version: '26.13.1'
       - run: npm ci --ignore-scripts
-      - run: node --test --test-concurrency=1 test/stand/update.test.ts
+      - run: npm run test:migration
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [typescript, eslint, prettier, unit, stand, protective, signatures, advisory, migration]
