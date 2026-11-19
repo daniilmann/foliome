@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
-const { DatabaseSync } = require('node:sqlite');
+const { DatabaseSync, backup } = require('node:sqlite');
 
 // Proposed public surface for B:
 // core/system-entrypoint.ts exports runProgram({ argv, env, paths, ports }) and
@@ -262,20 +262,30 @@ test('самопроверка реального Node работает толь
     );
     db.close();
     const original = await fs.readFile(f.paths.database);
-    const copy = path.join(f.dir, 'staging', 'isolated.db');
-    await fs.mkdir(path.dirname(copy));
-    await fs.copyFile(f.paths.database, copy);
+    const sha = 'a'.repeat(40);
+    const copy = path.join(f.paths.app, 'releases', `${sha}.check`, 'data', 'core.db');
+    await fs.mkdir(path.dirname(copy), { recursive: true });
+    const source = new DatabaseSync(f.paths.database, { readOnly: true });
+    try {
+      await backup(source, copy);
+    } finally {
+      source.close();
+    }
     const hook = path.join(f.dir, 'observe-import.cjs');
     const marker = path.join(f.dir, 'browser-imported');
     await fs.writeFile(
       hook,
       `const Module = require('node:module'); const load = Module._load; Module._load = function(id, ...args) { if (id === 'playwright-core' || id.startsWith('playwright-core/')) require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'imported'); return load.call(this, id, ...args); };`,
     );
-    const { stdout, stderr } = await execFileAsync(
-      process.execPath,
-      ['--require', hook, entry, '--self-check', '--database', copy],
-      { env: cleanEnv(), timeout: 10000 },
+    const harness = path.join(f.dir, 'self-check.cjs');
+    await fs.writeFile(
+      harness,
+      `require(${JSON.stringify(entry)}).runProgram(${JSON.stringify({ argv: ['--self-check', '--database', copy], env: cleanEnv(), paths: f.paths, selfCheckSha: sha })}).then(result => { if (result.ok) console.log('ok'); else { console.error(result.code); process.exitCode = 1; } });`,
     );
+    const { stdout, stderr } = await execFileAsync(process.execPath, ['--require', hook, harness], {
+      env: cleanEnv(),
+      timeout: 10000,
+    });
     assert.equal(stdout.trim(), 'ok');
     assert.equal(stderr.trim(), '');
     await assert.rejects(fs.stat(marker), { code: 'ENOENT' });
@@ -288,6 +298,7 @@ test('самопроверка реального Node работает толь
       argv: ['--self-check', '--database', copy],
       env: cleanEnv(),
       paths: f.paths,
+      selfCheckSha: sha,
       ports: {
         launchChrome: async () => {
           browserCalls++;
