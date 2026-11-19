@@ -2,11 +2,13 @@
 
 This fork develops a trusted local application for controlled reading of a source in Chrome. Its kernel mediates preparation sessions, filters page snapshots, controls permitted reads, and records decisions. An owner interface and an isolated executor channel are included. The current implementation is an early local candidate, not a complete financial synchronization product.
 
-The first-install command below prepares the local application, the system boundary, and a Codex sign-in for the local executor. An authorized end-to-end installation and sign-in on a separate Mac still require verification. Bank integrations, scheduled collection, transaction accounting, and the legacy dashboard are not part of the trusted application. The retained legacy source is not the trusted execution path; its standalone dashboard dependency manifests are not included.
+The first-install command below prepares the local application, the system boundary, and a Codex sign-in for the local executor. End-to-end acceptance uses a synthetic source in the owner's session on the intended Mac. Failure and interruption cases run in tests or CI with synthetic state. Bank integrations, scheduled collection, transaction accounting, and the legacy dashboard are not part of the trusted application. The retained legacy source is not the trusted execution path; its standalone dashboard dependency manifests are not included.
 
 ## First install on macOS
 
 Run this from the owner's administrator account in the Mac's local Terminal on Apple silicon. Use the reviewed command and the full 40-character Git commit SHA independently supplied by the release operator for the approved first release. Use that exact SHA on every retry. The release must have its version tag on that SHA and a successful release workflow for the tag. Stock Git must be available, Google Chrome must be installed, and the ChatGPT account or workspace must allow [Codex device-code sign-in](https://learn.chatgpt.com/docs/auth?surface=cli#login-on-headless-devices).
+
+First installation replaces SSH configuration and managed authorization files, installs a packet-filter anchor and its startup job, and requires a compatible local executor account if one already exists. Before running the command, verify the existing account and SSH settings against the installer and record how to restore any affected local SSH configuration from the Mac's Terminal. After installation and reboot, verify the normal developer SSH connection and try controlled reading with the synthetic source.
 
 Prepare `~/foliome-first-install.json` in the owner's private home with mode `0600`. Replace all illustrative values with the approved public key for the local `dev` account and the source settings supplied for this installation. An HTTPS synthetic fixture can supply the source. Keep passwords, tokens, and private SSH keys out of this file. The installed boundary supplies the executor UID.
 
