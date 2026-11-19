@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   typescript:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -20,7 +20,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
   eslint:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -33,7 +33,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run lint
   prettier:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -46,7 +46,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run format:check
   unit:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -59,7 +59,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
   stand:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -72,7 +72,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run test:stand
   protective:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -85,7 +85,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run test:attacks
   signatures:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -98,7 +98,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm audit signatures
   advisory:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
@@ -111,7 +111,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm audit
   migration:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     permissions:
       contents: read
     steps:
