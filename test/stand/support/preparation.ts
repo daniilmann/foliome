@@ -66,6 +66,9 @@ async function runStand(run: (f: any) => Promise<void>) {
   const closeGate = deferred();
   const closing = deferred();
   let delayClose = false;
+  let failCapture = false;
+  let failCollect = false;
+  let failClose = false;
   let collector: Collector | undefined;
   let sourcePage: any;
   let replaceOnObserve = false;
@@ -121,10 +124,14 @@ async function runStand(run: (f: any) => Promise<void>) {
       async closeSource() {
         closing.resolve();
         if (delayClose) await closeGate.promise;
+        if (failClose) throw new Error('synthetic close failure');
         await collector?.close();
         await sourcePage?.close();
       },
-      collectFrame: (n) => collector!.collectFrame(n),
+      collectFrame: (n) => {
+        if (failCollect) throw new Error('synthetic collection failure');
+        return collector!.collectFrame(n);
+      },
       async observeTargets(n) {
         if (replaceOnObserve) {
           replaceOnObserve = false;
@@ -140,7 +147,10 @@ async function runStand(run: (f: any) => Promise<void>) {
       },
       loginObservations: () => collector!.loginObservations(),
       finishLoginObservation: () => collector!.finishLoginObservation(),
-      capturePng: (viewport) => captureViewportPng(cdp, viewport),
+      capturePng: (viewport) => {
+        if (failCapture) throw new Error('synthetic capture unavailable');
+        return captureViewportPng(cdp, viewport);
+      },
     };
     const protocol = createActionProtocol(db, () => 1234);
     const store = createTextSnapshotStore(db, () => 1234);
@@ -234,6 +244,15 @@ async function runStand(run: (f: any) => Promise<void>) {
         delayClose = true;
       },
       releaseClose: closeGate.resolve,
+      setCaptureFailure: (value: boolean) => {
+        failCapture = value;
+      },
+      setCollectFailure: (value: boolean) => {
+        failCollect = value;
+      },
+      setCloseFailure: (value: boolean) => {
+        failClose = value;
+      },
       executorRunning: () => executorRunning,
       sends,
       clearSends: () => {
@@ -245,7 +264,7 @@ async function runStand(run: (f: any) => Promise<void>) {
     closeGate.resolve();
     for (const client of clients) client.destroy();
     if (server?.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
-    await runtime?.shutdown();
+    await runtime?.shutdown().catch(() => {});
     db.close();
     await ownerBrowser?.close();
     await sourceBrowser.close();

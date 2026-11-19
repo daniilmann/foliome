@@ -269,3 +269,52 @@ test(
     );
   },
 );
+
+test(
+  'установленное ядро удаляет только устаревшие заменённые тексты',
+  { timeout: 60_000 },
+  async () => {
+    await executorStand({}, async ({ kernel, paths }: any) => {
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(paths.database);
+      try {
+        const insert = db.prepare(
+          'INSERT INTO text_snapshots (at_ms, session_id, source_id, access_id, snapshot_number, host, path, snapshot_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        );
+        const old = 1;
+        const recent = 4_102_444_800_000; // Fixed synthetic timestamp in 2100.
+        for (const [n, at, path] of [
+          [1, old, '/a'],
+          [2, old, '/a'],
+          [3, recent, '/a'],
+          [4, old, '/b'],
+          [5, recent, '/c'],
+          [6, recent, '/c'],
+        ] as [number, number, string][]) {
+          insert.run(
+            at,
+            'synthetic-retention',
+            'source',
+            'access',
+            n,
+            'cabinet.invalid',
+            path,
+            '{}',
+          );
+        }
+        await kernel.openSource();
+        const rows = db
+          .prepare(
+            "SELECT snapshot_number FROM text_snapshots WHERE session_id = 'synthetic-retention' ORDER BY snapshot_number",
+          )
+          .all();
+        assert.deepEqual(
+          rows.map((row: any) => row.snapshot_number),
+          [3, 4, 5, 6],
+        );
+      } finally {
+        db.close();
+      }
+    });
+  },
+);

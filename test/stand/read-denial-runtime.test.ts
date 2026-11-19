@@ -31,12 +31,35 @@ test(
         return { snapshotNumber: snapshot.snapshot, nodeNumber: element.n };
       }
       const byText = (text: string) => target((element) => element.text.trim() === text);
-      async function deny(args: { snapshotNumber: number; nodeNumber: number }, reason: string) {
+      async function deny(
+        args: { snapshotNumber: number; nodeNumber: number },
+        reason: string,
+        revoked = false,
+      ) {
         const response = await client.call('readText', args);
-        assert.deepEqual(response.result, {
-          content: [{ type: 'text', text: reason }],
-          isError: true,
-        });
+        assert.equal(response.result.isError, true);
+        assert.equal(response.result.content[0].text, reason);
+        if (revoked) {
+          assert.equal(response.result.content.length, 1);
+        } else {
+          assert.ok(
+            response.result.content[1],
+            'ordinary refusal must include the committed snapshot',
+          );
+          const snapshot = JSON.parse(response.result.content[1].text);
+          assert.equal(snapshot.snapshot, args.snapshotNumber + 1);
+          const stored = fixture.db
+            .prepare('SELECT snapshot_json FROM text_snapshots WHERE snapshot_number = ?')
+            .get(snapshot.snapshot);
+          assert.deepEqual(JSON.parse(stored.snapshot_json), snapshot);
+          assert.ok(
+            response.result.content.some(
+              (part: any) =>
+                part.type === 'image' ||
+                ['login-step', 'unstable', 'limit', 'error'].includes(part.text),
+            ),
+          );
+        }
       }
 
       const safe = await client.call('readText', {
@@ -61,7 +84,7 @@ test(
       await deny(await byText('Preview form'), 'blocked-payment');
       const recipient = await target((element) => element.attrs?.id === 'protected-control');
       fixture.clearSends();
-      await deny(recipient, 'blocked-payment');
+      await deny(recipient, 'blocked-payment', true);
       await fixture.closing.promise;
       assert.equal(
         fixture.sends.some((call: { method: string }) => call.method === 'Page.captureScreenshot'),
@@ -117,6 +140,42 @@ test(
         fixture.runtime.rows().map((row: { reason: string }) => row.reason),
         [...Array(10).fill('blocked-change'), 'limit'],
       );
+    });
+  },
+);
+
+test(
+  'обычный отказ обновляет снимок и отменяет ссылку прежнего снимка',
+  { timeout: 60_000 },
+  async () => {
+    await stand(async (fixture) => {
+      await fixture.runtime.open();
+      await fixture.login();
+      await fixture
+        .sourcePage()
+        .setContent('<button type="button">Settings</button><p>Visible marker</p>');
+      const client = await fixture.connect();
+      const before = JSON.parse((await client.call('snapshot')).result.content[0].text);
+      const target = before.elements.find((item: { text: string }) => item.text === 'Settings');
+      const args = { snapshotNumber: before.snapshot, nodeNumber: target.n };
+      const denied = await client.call('readText', args);
+      assert.equal(denied.result.isError, true);
+      assert.equal(denied.result.content[0].text, 'blocked-change');
+      assert.ok(denied.result.content[1], 'ordinary refusal must include the committed snapshot');
+      const next = JSON.parse(denied.result.content[1].text);
+      assert.equal(next.snapshot, before.snapshot + 1);
+      const stored = fixture.db
+        .prepare('SELECT snapshot_json FROM text_snapshots WHERE snapshot_number = ?')
+        .get(next.snapshot);
+      assert.deepEqual(JSON.parse(stored.snapshot_json), next);
+      assert.ok(
+        denied.result.content.some(
+          (part: any) =>
+            part.type === 'image' ||
+            ['login-step', 'unstable', 'limit', 'error'].includes(part.text),
+        ),
+      );
+      assert.equal((await client.call('readText', args)).result.content[0].text, 'stale');
     });
   },
 );

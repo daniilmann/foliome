@@ -185,3 +185,20 @@ test(
     );
   },
 );
+
+test(
+  'закрывает окно и отказывает старому и новому соединениям пока исполнитель работает: ошибка закрытия',
+  { timeout: 60_000 },
+  async () => {
+    await stand(async (fixture: any) => {
+      await fixture.runtime.open();
+      await fixture.login();
+      const oldPage = fixture.sourcePage();
+      fixture.setCloseFailure(true);
+      await assert.rejects(fixture.runtime.closeSource(), /source-close-failed/);
+      assert.equal(oldPage.isClosed(), false);
+      await assert.rejects(fixture.runtime.open(), /session-unavailable/);
+      assert.equal(fixture.sourcePage(), oldPage);
+    });
+  },
+);

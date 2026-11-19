@@ -160,3 +160,134 @@ test(
     );
   },
 );
+
+test(
+  'сквозной снимок сохраняет привязку при отказе изображения и закрывает отказ сбора текста',
+  { timeout: 60_000 },
+  async () => {
+    await stand(async (fixture: any) => {
+      await fixture.runtime.open();
+      await fixture.login();
+      const client = await fixture.connect();
+      fixture.setCaptureFailure(true);
+      const response = await client.call('snapshot');
+      const snapshot = snapshotFrom(response);
+      assert.ok(
+        snapshot.elements.some((element: any) => element.text.includes('Synthetic visible text')),
+      );
+      assert.ok(response.result.content.some((part: any) => part.text === 'error'));
+      assert.equal(
+        response.result.content.some((part: any) => part.type === 'image'),
+        false,
+      );
+      const row = fixture.db
+        .prepare(
+          'SELECT session_id, source_id, access_id, snapshot_number, snapshot_json FROM text_snapshots',
+        )
+        .get();
+      assert.deepEqual(
+        [row.session_id, row.source_id, row.access_id, row.snapshot_number],
+        [scope.sessionId, scope.sourceId, scope.accessId, snapshot.snapshot],
+      );
+      assert.deepEqual(JSON.parse(row.snapshot_json), snapshot);
+      const target = snapshot.elements.find((element: any) =>
+        element.text.includes('Synthetic visible text'),
+      );
+      const read = await client.call('readText', {
+        snapshotNumber: snapshot.snapshot,
+        nodeNumber: target.n,
+      });
+      assert.ok(read.result.content.some((part: any) => part.text === 'Synthetic visible text'));
+      assert.equal(
+        fixture.db
+          .prepare('SELECT snapshot_number FROM action_verdicts ORDER BY id DESC LIMIT 1')
+          .get().snapshot_number,
+        snapshot.snapshot,
+      );
+      fixture.setCaptureFailure(false);
+      fixture.setCollectFailure(true);
+      const failed = await client.call('snapshot');
+      assert.deepEqual(failed.result, {
+        content: [{ type: 'text', text: 'internal' }],
+        isError: true,
+      });
+      assert.equal(fixture.db.prepare('SELECT count(*) AS n FROM text_snapshots').get().n, 2);
+    });
+  },
+);
+
+test('сквозное глубокое чтение ограничено и помечает обрезку', { timeout: 60_000 }, async () => {
+  await stand(async (fixture: any) => {
+    await fixture.runtime.open();
+    await fixture.login();
+    const page = fixture.sourcePage();
+    const leaves = Array.from({ length: 120 }, () => `<span>${'я'.repeat(200)}🙂</span>`).join('');
+    await page.setContent(`<main aria-label="Synthetic long text">${leaves}</main>`);
+    const client = await fixture.connect();
+    const snapshot = snapshotFrom(await client.call('snapshot'));
+    const target = snapshot.elements.find((element: any) => element.role === 'main');
+    assert.ok(target);
+    const response = await client.call('readText', {
+      snapshotNumber: snapshot.snapshot,
+      nodeNumber: target.n,
+      options: { deep: true },
+    });
+    const text = response.result.content[0].text;
+    assert.ok(Buffer.byteLength(text, 'utf8') <= 32 * 1024);
+    assert.match(text, /trunc|обрез/i);
+    assert.equal(text.includes('�'), false);
+    assert.equal(Buffer.from(text, 'utf8').toString('utf8'), text);
+    const outcome = fixture.db
+      .prepare(
+        'SELECT v.decision, v.reason, o.status FROM action_verdicts v JOIN action_outcomes o ON o.verdict_id = v.id ORDER BY v.id DESC LIMIT 1',
+      )
+      .get();
+    assert.deepEqual({ ...outcome }, { decision: 'allowed', reason: 'allowed', status: 'ok' });
+  });
+});
+
+test(
+  'после завершения ручного входа защищает программное значение синтетического поля',
+  { timeout: 60_000 },
+  async () => {
+    await stand(async (fixture: any) => {
+      await fixture.runtime.open();
+      const page = fixture.sourcePage();
+      await page.setContent(
+        `<input type="password" aria-label="Synthetic password"><input id="custom" aria-label="Custom field"><script>document.querySelector('#custom').value = 'synthetic-custom-marker';</script><p>Visible marker</p>`,
+      );
+      await fixture.login();
+      const response = await (await fixture.connect()).call('snapshot');
+      assert.ok(
+        snapshotFrom(response).elements.some((element: any) =>
+          element.text.includes('Visible marker'),
+        ),
+      );
+      assert.equal(JSON.stringify(response).includes('synthetic-custom-marker'), false);
+      assert.equal(
+        JSON.stringify(fixture.db.prepare('SELECT * FROM text_snapshots').all()).includes(
+          'synthetic-custom-marker',
+        ),
+        false,
+      );
+    });
+  },
+);
+
+test(
+  'ошибка сбора текста закрывает сквозной ответ без снимка и изображения',
+  { timeout: 60_000 },
+  async () => {
+    await stand(async (fixture: any) => {
+      await fixture.runtime.open();
+      await fixture.login();
+      fixture.setCollectFailure(true);
+      const response = await (await fixture.connect()).call('snapshot');
+      assert.deepEqual(response.result, {
+        content: [{ type: 'text', text: 'internal' }],
+        isError: true,
+      });
+      assert.equal(fixture.db.prepare('SELECT count(*) AS n FROM text_snapshots').get().n, 0);
+    });
+  },
+);
