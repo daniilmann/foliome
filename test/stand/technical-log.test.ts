@@ -1,6 +1,15 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } = require('node:fs/promises');
+const {
+  mkdtemp,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { createTechnicalLog } = require('../../core/adapters/technical-log.ts');
@@ -144,4 +153,56 @@ test('log failure reports one compact code per session without stopping later wr
     assert.ok((await records(directory)).rows.some((row: any) => row.code === 'browser-event'));
     assert.deepEqual(unavailable, ['log-unavailable', 'log-unavailable']);
   });
+});
+
+test('technical log rotates on local date, file size, total size and retention age', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'technical-log-rotation-'));
+  const directory = join(root, 'logs');
+  try {
+    await mkdir(directory, { mode: 0o700 });
+    const full = 10_000_000;
+    for (const name of [
+      '2025-11-01.0000.jsonl',
+      '2026-01-02.0000.jsonl',
+      ...Array.from(
+        { length: 10 },
+        (_, i) => '2026-01-01.' + String(i).padStart(4, '0') + '.jsonl',
+      ),
+    ]) {
+      const file = await open(join(directory, name), 'wx', 0o600);
+      try {
+        await file.truncate(full);
+      } finally {
+        await file.close();
+      }
+    }
+    let date = new Date(2026, 0, 2, 12);
+    const unavailable: string[] = [];
+    const log = createTechnicalLog({
+      directory,
+      now: () => date,
+      onUnavailable: (code: string) => unavailable.push(code),
+    });
+    log.beginSession('synthetic-rotation');
+    log.setLevel('info');
+    log.write({ level: 'info', code: 'started' });
+    await log.drain();
+    const afterSize: string[] = await readdir(directory);
+    assert.ok(!afterSize.includes('2025-11-01.0000.jsonl'));
+    assert.ok(!afterSize.includes('2026-01-01.0000.jsonl'));
+    assert.ok(afterSize.includes('2026-01-02.0001.jsonl'));
+    const sizes = await Promise.all(
+      afterSize.map(async (name) => (await stat(join(directory, name))).size),
+    );
+    assert.ok(sizes.every((size) => size <= full));
+    assert.ok(sizes.reduce((total, size) => total + size, 0) <= 100_000_000);
+    date = new Date(2026, 0, 3, 12);
+    log.write({ level: 'info', code: 'started' });
+    await log.drain();
+    const newest = JSON.parse(await readFile(join(directory, '2026-01-03.0000.jsonl'), 'utf8'));
+    assert.equal(newest.code, 'started');
+    assert.deepEqual(unavailable, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
