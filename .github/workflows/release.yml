@@ -1,6 +1,7 @@
 name: Release checks
 on:
   push:
+    branches: ['codex/first-controlled-read']
     tags: ['v*']
   pull_request:
 permissions:
