@@ -483,7 +483,7 @@ async function ownerActivation(mode, paths) {
         runtimeNode = path.join(runtimeWork, 'node');
         await fs.writeFile(runtimeNode, selectedNode, { flag: 'wx', mode: 0o700 });
       }
-      await preflightSelection({ home }, selection, runtimeNode, active.files, targetFiles);
+      await preflightSelection(home, selection, runtimeNode, active.files, targetFiles);
       await prepare(paths, payload, true);
     } finally {
       if (runtimeWork) await fs.rm(runtimeWork, { recursive: true });

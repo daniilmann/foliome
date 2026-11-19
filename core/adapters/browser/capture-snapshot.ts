@@ -26,6 +26,7 @@ type Frame = Readonly<{
   maskAnimationActive: boolean;
   participatingWorlds?: unknown;
 }>;
+type TextFrame = Pick<Frame, 'facts' | 'binding'>;
 type DeviationCode = 'retake' | 'unstable' | 'limit' | 'error';
 export type SnapshotDeviationFlag =
   'flow' | 'rectangles' | 'animations' | 'observer' | 'visualViewport';
@@ -39,7 +40,7 @@ type Deviation = Readonly<{
   elapsedMs: number;
 }>;
 type Ports = Readonly<{
-  collect: () => Promise<Frame>;
+  collect: (reportText: (frame: TextFrame) => void) => Promise<Frame>;
   requireBinding?: boolean;
   capturePng: (viewport?: Viewport) => Promise<Buffer>;
   now: () => number;
@@ -218,20 +219,48 @@ async function capture(
   let flags: readonly SnapshotDeviationFlag[] = [];
   let text: { snapshot: Filtered; binding?: Binding } | undefined;
   let collectingText = false;
-  const filter = (frame: Frame) => {
+  const filter = (frame: TextFrame) => {
+    if (!currentSession()) throw new SessionRevoked();
+    if (remaining() <= 0) throw new Deadline();
     const result = filterTextSnapshot(frame.facts);
     if (!result.ok) throw new Error('internal');
-    const { binding } = frame;
+    const binding = structuredClone(frame.binding);
     if (
       binding === undefined
         ? ports.requireBinding || text?.binding
         : !validBinding(binding, result.snapshot)
     )
       throw new Error('internal');
+    if (remaining() <= 0) throw new Deadline();
     text = { snapshot: result.snapshot, ...(binding === undefined ? {} : { binding }) };
     collectingText = false;
     return text;
   };
+  const collectFrame = async () => {
+    collectingText = true;
+    let listening = true;
+    let reported: { frame: TextFrame; text: ReturnType<typeof filter> } | undefined;
+    try {
+      const frame = await bounded(() => {
+        if (!currentSession()) throw new SessionRevoked();
+        return ports.collect((frame) => {
+          if (listening && !reported) reported = { frame, text: filter(frame) };
+        });
+      }, remaining());
+      if (
+        reported &&
+        (frame.facts !== reported.frame.facts || frame.binding !== reported.frame.binding)
+      ) {
+        collectingText = true;
+        throw new Error('internal');
+      }
+      return { frame, text: reported?.text ?? filter(frame) };
+    } finally {
+      listening = false;
+    }
+  };
+  const pngGate = (session: Session) =>
+    decidePngGate({ ...session, stable: true, withinLimits: true, maskApplied: true });
   const record = async (code: DeviationCode): Promise<boolean> => {
     if (!text) return false;
     const { snapshot } = text;
@@ -258,7 +287,12 @@ async function capture(
     }
   };
   const fail = async (code: 'unstable' | 'limit' | 'error'): Promise<Result> => {
+    const session = currentSession();
+    if (!session) return revoked();
     if (!text) return { ok: false, code: 'internal' };
+    const gate = pngGate(session);
+    if (!gate.ok && gate.code === 'login-step')
+      return { ok: true, ...text, image: { code: 'login-step' } };
     const recorded = await record(code);
     if (!currentSession()) return revoked();
     if (!recorded) return { ok: false, code: 'protocol-unavailable' };
@@ -267,20 +301,10 @@ async function capture(
   try {
     while (true) {
       if (!currentSession()) return revoked();
-      collectingText = true;
-      const first = await bounded(() => {
-        if (!currentSession()) throw new SessionRevoked();
-        return ports.collect();
-      }, remaining());
+      const { frame: first, text: firstText } = await collectFrame();
       const session = currentSession();
       if (!session) return revoked();
-      const firstText = filter(first);
-      const login = decidePngGate({
-        ...session,
-        stable: true,
-        withinLimits: true,
-        maskApplied: true,
-      });
+      const login = pngGate(session);
       if (!login.ok)
         return login.code === 'login-step'
           ? { ok: true, ...firstText, image: { code: 'login-step' } }
@@ -298,14 +322,9 @@ async function capture(
         return ports.capturePng(baseline.viewport);
       }, remaining());
       if (!currentSession()) return revoked();
-      collectingText = true;
-      const second = await bounded(() => {
-        if (!currentSession()) throw new SessionRevoked();
-        return ports.collect();
-      }, remaining());
+      const { frame: second, text: latestText } = await collectFrame();
       const latest = currentSession();
       if (!latest) return revoked();
-      const latestText = filter(second);
       if (!validFrame(second) || !validPlan(second.plan)) return await fail('error');
       const differences: SnapshotDeviationFlag[] = [];
       if (
@@ -350,12 +369,7 @@ async function capture(
       if (!protectedImage.ok) return await fail(protectedImage.code);
       const finalSession = currentSession();
       if (!finalSession) return revoked();
-      const gate = decidePngGate({
-        ...finalSession,
-        stable: true,
-        withinLimits: true,
-        maskApplied: true,
-      });
+      const gate = pngGate(finalSession);
       if (!gate.ok)
         return gate.code === 'login-step'
           ? { ok: true, ...latestText, image: { code: 'login-step' } }

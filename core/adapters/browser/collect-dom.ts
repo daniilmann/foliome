@@ -1960,16 +1960,26 @@ async function prepare(
           return { ok: false, code: 'internal' };
         }
       },
-      async collectFrame(snapshot: number) {
+      async collectFrame(
+        snapshot: number,
+        reportText?: (frame: {
+          facts: unknown;
+          binding: {
+            snapshotNumber: number;
+            candidates: ReturnType<typeof projectTargets>['candidates'];
+          };
+        }) => void,
+      ) {
         const collected = await collect(snapshot);
         const { facts, observation: observed, rootContext, participatingWorlds } = collected;
+        const filtered = filterTextSnapshot(facts);
         const binding = {
           snapshotNumber: snapshot,
-          candidates: projectTargets(collected).candidates,
+          candidates: projectTargets(collected, filtered).candidates,
         };
         if (closed) throw new Error('internal');
-        const filtered = filterTextSnapshot(facts);
         if (!observed || !filtered.ok) throw new Error('internal');
+        reportText?.({ facts, binding });
         let plan: Plan | null = null;
         try {
           await observePseudos(cdp, participatingWorlds);

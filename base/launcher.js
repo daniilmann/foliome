@@ -928,12 +928,12 @@ async function recordHandoff(paths, updates, handoff, code) {
   await syncDirectory(updates);
 }
 
-async function preflightSelection(paths, handoff, runtimeNode, currentFiles, targetFiles) {
+async function preflightSelection(home, handoff, runtimeNode, currentFiles, targetFiles) {
   const releases = [[handoff.sha, targetFiles]];
   if (handoff.kind === 'update') releases.unshift([handoff.current, currentFiles]);
   for (const [sha, expectedFiles] of releases) {
     await preflightAcceptedRelease({
-      home: paths.home,
+      home,
       systemRoot,
       sha,
       accept: (requested) => requested === sha,
@@ -943,6 +943,8 @@ async function preflightSelection(paths, handoff, runtimeNode, currentFiles, tar
       expectedFiles,
     });
   }
+  const paths = await installedPaths(home, systemRoot);
+  if (paths.releases !== (await fs.realpath(paths.releases))) throw Error('boundary');
   for (const [sha, expected] of releases) {
     const { files } = await trustedMetadata(paths, sha);
     if (receiptDigest(files) !== receiptDigest(expected)) throw Error('release-verification');
@@ -1009,7 +1011,7 @@ async function applyOwnerOffer(paths, updates, offer, authority) {
         await fs.writeFile(runtimeNode, binary, { flag: 'wx', mode: 0o700 });
       }
     }
-    await preflightSelection(paths, handoff, runtimeNode, paths.inventory, offer.files);
+    await preflightSelection(paths.home, handoff, runtimeNode, paths.inventory, offer.files);
     if (!sameSelection(readActivation(paths.dbPath), handoff)) throw Error('boundary-state');
     await atomicRecord(path.join(updates, 'handoff.json'), handoff);
     if (handoff.password) await paths.withoutLease(() => askAdministrator(handoff.sha));
@@ -1058,17 +1060,8 @@ async function superviseOwner(paths, previousOnly) {
   await requireAcl(path.join(updates, 'rejected'), []);
   const saved = await readRecord(path.join(updates, 'handoff.json'), paths.uid);
   const interrupted = saved && parseHandoff(saved);
-  const fence = await stat(rootFence);
-  if (fence) {
-    const recoveryFile = path.join(updates, 'recovery-refused.json');
-    const fenceId = [fence.dev, fence.ino, fence.birthtimeMs];
-    const refused = await readRecord(recoveryFile, paths.uid);
-    if (JSON.stringify(refused) === JSON.stringify(fenceId)) return false;
-    if (previousOnly) throw Error('restore-failed');
-    if (!interrupted?.password) {
-      await atomicRecord(recoveryFile, fenceId);
-      throw Error('restore-failed');
-    }
+  if (await stat(rootFence)) {
+    if (previousOnly || !interrupted?.password) throw Error('restore-failed');
     if (
       !(await confirmDialog(
         'Установка прервана. Восстановить системные файлы? Нужен пароль администратора.',
@@ -1076,19 +1069,8 @@ async function superviseOwner(paths, previousOnly) {
       ))
     )
       throw Error('restore-failed');
-    try {
-      await paths.withoutLease(() => askAdministrator(interrupted.sha));
-      if (await stat(rootFence)) throw Error('restore-failed');
-    } catch (error) {
-      if (
-        ['restore-failed', 'boundary-entry', 'boundary-permissions', 'boundary-base'].includes(
-          error.message,
-        ) &&
-        sameFile(fence, await stat(rootFence))
-      )
-        await atomicRecord(recoveryFile, fenceId);
-      throw error;
-    }
+    await paths.withoutLease(() => askAdministrator(interrupted.sha));
+    if (await stat(rootFence)) throw Error('restore-failed');
     return true;
   }
   if (interrupted) await recordHandoff(paths, updates, interrupted, 'update-failed');

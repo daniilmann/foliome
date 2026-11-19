@@ -196,7 +196,7 @@ function create(ports: Ports, scope: Scope) {
   async function capture(session: Session, number: number) {
     return captureCabinetSnapshot(
       {
-        collect: () => ports.browser.collectFrame(number),
+        collect: (reportText) => ports.browser.collectFrame(number, reportText),
         requireBinding: true,
         capturePng: (viewport) => ports.browser.capturePng(viewport),
         now: ports.now,

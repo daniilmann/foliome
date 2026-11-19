@@ -757,14 +757,26 @@ async function apply(sha, initialInstall, scratch, journal, accounts) {
 }
 
 async function publishRootFence() {
-  const fence = await fs.open(rootFence, 'wx', 0o644);
+  if (await stat(rootFence)) throw Error('restore-failed');
+  const temporary = path.join(admin, '.update-pending');
+  const pending = await stat(temporary);
+  if (pending) {
+    if (pending.size !== 0 || ![0o600, 0o644].some((mode) => fileMode(pending, 0, mode, 0)))
+      throw Error('boundary-base');
+    await requireAcl(temporary, []);
+    await fs.unlink(temporary);
+  }
+  const fence = await fs.open(temporary, 'wx', 0o600);
   try {
     await fence.chmod(0o644);
+    await trustedFile(temporary, 0o644);
     await fence.sync();
   } finally {
     await fence.close();
   }
+  await fs.rename(temporary, rootFence);
   await syncDirectory(root);
+  await syncDirectory(admin);
 }
 
 async function installApprovedSystem(sha, initialInstall) {
