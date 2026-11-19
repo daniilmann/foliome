@@ -54,6 +54,7 @@ type NodeFact = {
   role: string;
   text: string;
   label?: string;
+  labelRefs?: number[];
   snapshotOnly?: boolean;
   state?: string;
   field?: 'empty' | 'filled' | 'sealed';
@@ -133,6 +134,7 @@ const hasTransform = `style => style.transform !== 'none' || style.perspective !
   style.scale !== 'none' || style.rotate !== 'none' || style.translate !== 'none' || style.offsetPath !== 'none'`;
 const expression = String.raw`(() => {
   const nodes = [], parents = [], identities = [], classes = [], semantics = [], secrets = [], embeds = [], geometry = [], paint = [];
+  const visitedElements = new WeakMap(), labelReferences = [];
   const visitedEmbeds = new Set(), hasTransform = ${hasTransform};
   const state = globalThis.__foliomeObservation || (globalThis.__foliomeObservation = (() => {
     const state = { revision: 0, ids: new WeakMap(), next: 1, watched: new WeakSet() };
@@ -341,6 +343,14 @@ const expression = String.raw`(() => {
     const change = /(?:save|delete|remove|change|сохран|удал|измен)/iu.test(label) || tag === 'INPUT' && ['submit', 'reset'].includes(element.type) || tag === 'BUTTON' && element.type === 'submit';
     classes.push(payment ? 'blocked-payment' : change ? 'blocked-change' : null);
     const index = nodes.length; nodes.push(fact); parents.push(parent);
+    visitedElements.set(element, index);
+    const referenceIds = !field && visible ? element.getAttribute('aria-labelledby') : null;
+    if (referenceIds && referenceIds.length <= 4096) {
+      const tokens = referenceIds.trim().split(/\s+/u);
+      const tree = element.getRootNode();
+      if (tokens.length <= 16 && (tree instanceof Document || tree instanceof ShadowRoot))
+        labelReferences.push({ fact, tree, tokens });
+    }
     const ancestors = [state.ids.get(element), ...(parentGeometry?.ancestors ?? [])];
     const runs = [];
     const measured = { rect: rectValue(rect), runs, button, ancestors, frameUrl,
@@ -364,6 +374,12 @@ const expression = String.raw`(() => {
   };
   if (!document.documentElement) throw new Error();
   visit(document.documentElement, null, true);
+  for (const { fact, tree, tokens } of labelReferences) {
+    const references = tokens
+      .map(token => visitedElements.get(tree.getElementById(token)))
+      .filter(index => Number.isSafeInteger(index));
+    if (references.length) fact.labelRefs = references;
+  }
   const animations = document.getAnimations().filter(a => a.playState === 'running' || a.playState === 'pending');
   const animationIds = animations.map(a => { if (!state.ids.has(a)) state.ids.set(a, state.next++); return String(state.ids.get(a)); }).sort();
   const animationTargets = animations.map(a => {
@@ -1380,8 +1396,19 @@ async function prepare(
                     (!Number.isSafeInteger(parent) || parent < 0 || parent >= i)
                   )
                     throw new Error();
+                  const { labelRefs, ...node } = data.nodes[i];
+                  if (
+                    labelRefs !== undefined &&
+                    (!Array.isArray(labelRefs) ||
+                      labelRefs.length > 16 ||
+                      labelRefs.some(
+                        (ref) => !Number.isSafeInteger(ref) || ref < 0 || ref >= data.nodes.length,
+                      ))
+                  )
+                    throw new Error();
                   nodes.push({
-                    ...data.nodes[i],
+                    ...node,
+                    ...(labelRefs ? { labelRefs: labelRefs.map((ref) => base + ref + 1) } : {}),
                     n: base + i + 1,
                     frame: index,
                     ...(parent === null ? {} : { parent: base + parent + 1 }),

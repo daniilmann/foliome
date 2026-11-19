@@ -8,6 +8,7 @@ type NodeFact = {
   role: string;
   text: string;
   label?: string;
+  labelRefs?: number[];
   name?: string;
   state?: string;
   field?: 'empty' | 'filled' | 'sealed';
@@ -400,6 +401,16 @@ function valid(input: unknown): input is Facts {
     nodeFrames.set(n.n as number, n.frame as number);
     nodes.add(n.n as number);
   }
+  for (const node of input.nodes) {
+    const refs = node.labelRefs;
+    if (
+      refs !== undefined &&
+      (!Array.isArray(refs) ||
+        refs.length > 16 ||
+        refs.some((ref) => !Number.isSafeInteger(ref) || nodeFrames.get(ref) !== node.frame))
+    )
+      return false;
+  }
   return input.secrets.every(
     (s) =>
       isRecord(s) &&
@@ -509,6 +520,13 @@ function filter(input: unknown): Result {
       if (text.label && element.text.includes(text.label)) {
         element.name = text.label;
         if (tokenMask(text.label) === text.label) (element.attrs ??= {})['aria-label'] = text.label;
+      }
+      if (!isField && node.labelRefs?.length) {
+        const referenced = node.labelRefs
+          .map((ref) => texts.get(ref)?.filtered)
+          .filter(Boolean)
+          .join(' ');
+        if (referenced) element.name = limit(mask(referenced, secrets));
       }
       snapshot.elements.push(element);
     }

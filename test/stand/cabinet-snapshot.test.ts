@@ -1661,6 +1661,13 @@ test(
         absent: ['4111', '4111 1111 1111 1111'],
       },
       {
+        name: 'aria-labelledby использует видимые фильтрованные срезы',
+        body: '<button id="named" aria-labelledby="public invisible digits">Open</button><span id="public">Synthetic label</span><span id="invisible" aria-hidden="true">Hidden label marker</span><span id="digits">4111 1111 1111 1111</span>',
+        present: ['Synthetic label', '1111'],
+        absent: ['Hidden label marker', '4111'],
+        labelId: 'named',
+      },
+      {
         name: 'текст вне прокрученного viewport остаётся в документе',
         body: '<div style="left:10px;top:10px">Scrolled marker</div><div style="left:10px;top:800px;height:20px">Bottom marker</div>',
         present: ['Scrolled marker'],
@@ -1721,6 +1728,12 @@ test(
                 .join('');
               for (const marker of fixture.absent)
                 assert.equal(reconstructed.includes(marker), false, `reconstructed ${marker}`);
+              if ('labelId' in fixture) {
+                const named = stored.elements.find(
+                  (element: any) => element.attrs?.id === fixture.labelId,
+                );
+                assert.match(named?.name ?? '', /^Synthetic label.*1111$/u);
+              }
               if (fixture.unavailable)
                 assert.ok(
                   JSON.parse(output).elements.some(
