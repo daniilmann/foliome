@@ -19,6 +19,7 @@ type Browser = Pick<
   | 'loginObservations'
   | 'finishLoginObservation'
 > & {
+  checkpointLogin?: Collector['checkpointLogin'];
   openSource(sessionId: string): Promise<void>;
   closeSource(): Promise<void>;
   capturePng(viewport?: import('./adapters/browser/capture-snapshot.ts').Viewport): Promise<Buffer>;
@@ -172,15 +173,21 @@ function create(ports: Ports, scope: Scope) {
       throw error;
     }
   }
-  function confirmLogin(id: string): boolean {
+  async function confirmLogin(id: string): Promise<boolean> {
     const session = current;
-    if (!session?.ready || session.confirmed || id !== session.sessionId) return false;
+    if (!session?.ready || session.confirmed || session.busy || id !== session.sessionId)
+      return false;
+    session.busy = true;
     try {
-      ports.browser.finishLoginObservation();
+      await ports.browser.finishLoginObservation();
+      if (current !== session) return false;
       session.confirmed = true;
       return true;
     } catch {
+      revoke(session);
       return false;
+    } finally {
+      session.busy = false;
     }
   }
   function active(session: Session) {
@@ -190,6 +197,7 @@ function create(ports: Ports, scope: Scope) {
     return captureCabinetSnapshot(
       {
         collect: () => ports.browser.collectFrame(number),
+        requireBinding: true,
         capturePng: (viewport) => ports.browser.capturePng(viewport),
         now: ports.now,
         sleep: ports.sleep,
@@ -223,7 +231,11 @@ function create(ports: Ports, scope: Scope) {
   ) {
     if (!active(session)) throw new Error('session-revoked');
     const observed = result.binding;
-    if (!observed || observed.snapshotNumber !== result.snapshot.snapshot)
+    if (
+      !observed ||
+      observed.snapshotNumber !== result.snapshot.snapshot ||
+      result.snapshot.snapshot !== session.number + 1
+    )
       throw new Error('internal');
     ports.store.append({
       ...scope,
@@ -262,7 +274,14 @@ function create(ports: Ports, scope: Scope) {
     const session = current;
     if (!session?.ready) return unavailable();
     if (!session.confirmed) {
-      ports.browser.loginObservations();
+      try {
+        await ports.browser.checkpointLogin?.();
+        if (current !== session) return unavailable();
+        ports.browser.loginObservations();
+      } catch {
+        revoke(session);
+        return { ok: false as const, code: 'internal' as const };
+      }
       return { ok: false as const, code: 'login-step' as const };
     }
     return snapshot(session);
@@ -376,7 +395,16 @@ function create(ports: Ports, scope: Scope) {
             session.observation,
           );
           changed();
-          if (!result.ok) return result;
+          if (!result.ok) {
+            if (
+              'snapshot' in result &&
+              result.snapshot &&
+              (!active(session) || result.snapshot.snapshot !== session.number)
+            )
+              return { ok: false as const, code: 'session-revoked' as const };
+            return result;
+          }
+          if (!active(session)) return { ok: false as const, code: 'session-revoked' as const };
           return {
             ok: true as const,
             text: result.data.text ?? '',

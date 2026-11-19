@@ -40,6 +40,7 @@ type Deviation = Readonly<{
 }>;
 type Ports = Readonly<{
   collect: () => Promise<Frame>;
+  requireBinding?: boolean;
   capturePng: (viewport?: Viewport) => Promise<Buffer>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -148,6 +149,38 @@ function validFrame(frame: Frame): boolean {
   );
 }
 
+function validBinding(binding: Binding, snapshot: Filtered): boolean {
+  if (
+    !binding ||
+    binding.snapshotNumber !== snapshot.snapshot ||
+    !Array.isArray(binding.candidates)
+  )
+    return false;
+  const numbered = new Set<number>();
+  const visible = new Map(snapshot.elements.map((element) => [element.n, element.text]));
+  for (const candidate of binding.candidates) {
+    if (
+      !candidate ||
+      !Number.isSafeInteger(candidate.nodeNumber) ||
+      candidate.nodeNumber < 1 ||
+      numbered.has(candidate.nodeNumber) ||
+      typeof candidate.identity !== 'string' ||
+      !candidate.identity ||
+      typeof candidate.descriptor !== 'string' ||
+      !candidate.descriptor ||
+      typeof candidate.visible !== 'boolean' ||
+      typeof candidate.text !== 'string' ||
+      (candidate.visible && visible.get(candidate.nodeNumber) !== candidate.text) ||
+      typeof candidate.enabled !== 'boolean' ||
+      typeof candidate.sourceFrame !== 'boolean' ||
+      typeof candidate.secretField !== 'boolean'
+    )
+      return false;
+    numbered.add(candidate.nodeNumber);
+  }
+  return true;
+}
+
 async function capture(
   ports: Ports,
   getSession: () => Session,
@@ -183,10 +216,25 @@ async function capture(
     Math.min(deadlineMs - (ports.now() - start), deadlineMs - (performance.now() - wallStart));
   let retakes = 0;
   let flags: readonly SnapshotDeviationFlag[] = [];
-  let snapshot: Filtered | undefined;
+  let text: { snapshot: Filtered; binding?: Binding } | undefined;
   let collectingText = false;
+  const filter = (frame: Frame) => {
+    const result = filterTextSnapshot(frame.facts);
+    if (!result.ok) throw new Error('internal');
+    const { binding } = frame;
+    if (
+      binding === undefined
+        ? ports.requireBinding || text?.binding
+        : !validBinding(binding, result.snapshot)
+    )
+      throw new Error('internal');
+    text = { snapshot: result.snapshot, ...(binding === undefined ? {} : { binding }) };
+    collectingText = false;
+    return text;
+  };
   const record = async (code: DeviationCode): Promise<boolean> => {
-    if (!snapshot) return false;
+    if (!text) return false;
+    const { snapshot } = text;
     try {
       const elapsed = ports.now() - start;
       if (!Number.isFinite(elapsed)) return false;
@@ -210,11 +258,11 @@ async function capture(
     }
   };
   const fail = async (code: 'unstable' | 'limit' | 'error'): Promise<Result> => {
-    if (!snapshot) return { ok: false, code: 'internal' };
+    if (!text) return { ok: false, code: 'internal' };
     const recorded = await record(code);
     if (!currentSession()) return revoked();
     if (!recorded) return { ok: false, code: 'protocol-unavailable' };
-    return { ok: true, snapshot, image: { code } };
+    return { ok: true, ...text, image: { code } };
   };
   try {
     while (true) {
@@ -226,10 +274,7 @@ async function capture(
       }, remaining());
       const session = currentSession();
       if (!session) return revoked();
-      const filtered = filterTextSnapshot(first.facts);
-      if (!filtered.ok) return { ok: false, code: 'internal' };
-      collectingText = false;
-      snapshot = filtered.snapshot;
+      const firstText = filter(first);
       const login = decidePngGate({
         ...session,
         stable: true,
@@ -238,7 +283,7 @@ async function capture(
       });
       if (!login.ok)
         return login.code === 'login-step'
-          ? { ok: true, snapshot, image: { code: 'login-step' } }
+          ? { ok: true, ...firstText, image: { code: 'login-step' } }
           : await fail(login.code);
       if (!validFrame(first) || !validPlan(first.plan)) return await fail('error');
       const baseline = structuredClone(first);
@@ -260,9 +305,7 @@ async function capture(
       }, remaining());
       const latest = currentSession();
       if (!latest) return revoked();
-      const checked = filterTextSnapshot(second.facts);
-      if (!checked.ok) return { ok: false, code: 'internal' };
-      collectingText = false;
+      const latestText = filter(second);
       if (!validFrame(second) || !validPlan(second.plan)) return await fail('error');
       const differences: SnapshotDeviationFlag[] = [];
       if (
@@ -315,13 +358,12 @@ async function capture(
       });
       if (!gate.ok)
         return gate.code === 'login-step'
-          ? { ok: true, snapshot, image: { code: 'login-step' } }
+          ? { ok: true, ...latestText, image: { code: 'login-step' } }
           : await fail(gate.code);
       return {
         ok: true,
-        snapshot,
-        image: { bytes: protectedImage.bytes, snapshotNumber: snapshot.snapshot },
-        ...(baseline.binding === undefined ? {} : { binding: baseline.binding }),
+        ...latestText,
+        image: { bytes: protectedImage.bytes, snapshotNumber: latestText.snapshot.snapshot },
       };
     }
   } catch (error) {

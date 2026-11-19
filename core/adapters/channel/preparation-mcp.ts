@@ -32,12 +32,15 @@ type Image =
   | { bytes: Buffer; snapshotNumber: number }
   | { code: 'login-step' | 'unstable' | 'limit' | 'error' };
 type SnapshotResult = { ok: true; snapshot: Snapshot; image: Image };
+type ProtectedSnapshot = Omit<SnapshotResult, 'ok'>;
 type Ports = {
   getTask(): Promise<
     Failure | { ok: true; task: { type: 'preparation'; sourceId: string; instruction: string } }
   >;
   getSnapshot(): Promise<Failure | SnapshotResult>;
-  readText(args: ReadArgs): Promise<Failure | (SnapshotResult & { text: string })>;
+  readText(
+    args: ReadArgs,
+  ): Promise<Failure | (Failure & ProtectedSnapshot) | (SnapshotResult & { text: string })>;
   unsupported?(category: 'unsupported'): Promise<Failure | void>;
 };
 export declare const createPreparationMcp: typeof create;
@@ -48,6 +51,18 @@ const METHOD = { code: -32601, message: 'Method not found' };
 const STATE = { code: -32002, message: 'Server not initialized' };
 const INTERNAL = { code: -32603, message: 'Internal error' };
 const failureCodeSet: ReadonlySet<string> = new Set(failureCodes);
+const verdictCodeSet: ReadonlySet<string> = new Set([
+  'stale',
+  'unclassified',
+  'blocked-payment',
+  'blocked-change',
+  'secret-field',
+  'not-found',
+  'ambiguous',
+  'hidden',
+  'disabled',
+  'foreign-frame',
+]);
 const imageCodeSet: ReadonlySet<string> = new Set(['login-step', 'unstable', 'limit', 'error']);
 const numberSchema = { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER };
 const tools = [
@@ -107,6 +122,24 @@ function fields(
 }
 function positive(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+type Content = { type: string; text?: string; mimeType?: string; data?: string };
+function snapshotContent(snapshot: unknown, image: unknown): Content[] | null {
+  if (!object(snapshot) || !positive(snapshot.snapshot) || !object(image)) return null;
+  const text = { type: 'text', text: JSON.stringify(snapshot) };
+  if (
+    fields(image, ['bytes', 'snapshotNumber'], ['bytes', 'snapshotNumber']) &&
+    Buffer.isBuffer(image.bytes) &&
+    image.snapshotNumber === snapshot.snapshot
+  )
+    return [text, { type: 'image', mimeType: 'image/png', data: image.bytes.toString('base64') }];
+  if (
+    fields(image, ['code'], ['code']) &&
+    typeof image.code === 'string' &&
+    imageCodeSet.has(image.code)
+  )
+    return [text, { type: 'text', text: image.code }];
+  return null;
 }
 function validVersion(value: unknown): boolean {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
@@ -221,20 +254,21 @@ function create(ports: Ports) {
         result = await ports.readText(safe);
       } else return error(METHOD);
       if (!object(result) || (result.ok !== true && result.ok !== false)) return error(INTERNAL);
-      if (!result.ok)
+      if (!result.ok) {
+        const code = failureCodeSet.has(result.code) ? result.code : 'internal';
+        const next =
+          p.name === 'readText' &&
+          verdictCodeSet.has(code) &&
+          'snapshot' in result &&
+          'image' in result
+            ? snapshotContent(result.snapshot, result.image)
+            : null;
         return reply({
-          content: [
-            {
-              type: 'text',
-              text:
-                typeof result.code === 'string' && failureCodeSet.has(result.code)
-                  ? result.code
-                  : 'internal',
-            },
-          ],
+          content: [{ type: 'text', text: code }, ...(next ?? [])],
           isError: true,
         });
-      const content: { type: string; text?: string; mimeType?: string; data?: string }[] = [];
+      }
+      const content: Content[] = [];
       if (p.name === 'current_task') {
         if (!('task' in result)) return error(INTERNAL);
         content.push({ type: 'text', text: JSON.stringify(result.task) });
@@ -245,27 +279,9 @@ function create(ports: Ports) {
           if (typeof result.text !== 'string') return error(INTERNAL);
           content.push({ type: 'text', text: result.text });
         }
-        const image: unknown = result.image;
-        if (!object(result.snapshot) || !positive(result.snapshot.snapshot) || !object(image))
-          return error(INTERNAL);
-        content.push({ type: 'text', text: JSON.stringify(result.snapshot) });
-        if (
-          fields(image, ['bytes', 'snapshotNumber'], ['bytes', 'snapshotNumber']) &&
-          Buffer.isBuffer(image.bytes) &&
-          image.snapshotNumber === result.snapshot.snapshot
-        )
-          content.push({
-            type: 'image',
-            mimeType: 'image/png',
-            data: image.bytes.toString('base64'),
-          });
-        else if (
-          fields(image, ['code'], ['code']) &&
-          typeof image.code === 'string' &&
-          imageCodeSet.has(image.code)
-        )
-          content.push({ type: 'text', text: image.code });
-        else return error(INTERNAL);
+        const next = snapshotContent(result.snapshot, result.image);
+        if (!next) return error(INTERNAL);
+        content.push(...next);
       }
       return reply({ content });
     } catch {

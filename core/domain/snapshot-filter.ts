@@ -435,7 +435,10 @@ function eventAddress(raw: string, secrets: Secret[]): { host: string; path: str
     throw new Error('internal');
   return result;
 }
-function filter(input: unknown): Result {
+function filter(
+  input: unknown,
+  onProtectedText?: (nodeNumber: number, text: string) => void,
+): Result {
   try {
     if (!valid(input)) return { ok: false, code: 'internal' };
     const { secrets } = input;
@@ -542,6 +545,9 @@ function filter(input: unknown): Result {
       }
     }
     if (total > 256 * 1024) return { ok: false, code: 'internal' };
+    if (onProtectedText)
+      for (const element of snapshot.elements)
+        onProtectedText(element.n, texts.get(element.n)!.filtered);
     return { ok: true, snapshot };
   } catch {
     return { ok: false, code: 'internal' };

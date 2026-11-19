@@ -105,7 +105,7 @@ function serialize(result: Filtered): { json: string; number: number; host: stri
 }
 
 function create(database: DatabaseSync, clock: () => number) {
-  database.exec(`CREATE TABLE IF NOT EXISTS text_snapshots (
+  const columns = `(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at_ms INTEGER NOT NULL CHECK (at_ms BETWEEN 0 AND 9007199254740991),
     session_id TEXT NOT NULL, source_id TEXT NOT NULL, access_id TEXT NOT NULL,
@@ -113,7 +113,8 @@ function create(database: DatabaseSync, clock: () => number) {
     host TEXT NOT NULL, path TEXT NOT NULL,
     snapshot_json TEXT NOT NULL CHECK (length(CAST(snapshot_json AS BLOB)) <= 262144),
     UNIQUE (session_id, snapshot_number)
-  ) STRICT;
+  ) STRICT`;
+  database.exec(`CREATE TABLE IF NOT EXISTS text_snapshots ${columns};
   CREATE INDEX IF NOT EXISTS text_snapshots_page ON text_snapshots (source_id, access_id, host, path, id DESC);`);
   const insert = database.prepare(
     'INSERT INTO text_snapshots (at_ms, session_id, source_id, access_id, snapshot_number, host, path, snapshot_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -121,10 +122,17 @@ function create(database: DatabaseSync, clock: () => number) {
   const latest = database.prepare(
     'SELECT snapshot_json FROM text_snapshots WHERE source_id = ? AND access_id = ? AND host = ? AND path = ? ORDER BY id DESC LIMIT 1',
   );
-  const prune = database.prepare(`DELETE FROM text_snapshots AS old WHERE old.at_ms < ? AND EXISTS (
-    SELECT 1 FROM text_snapshots AS newer WHERE newer.source_id = old.source_id AND newer.access_id = old.access_id
-      AND newer.host = old.host AND newer.path = old.path AND newer.id > old.id
-  )`);
+  const prune = database.prepare(`DELETE FROM main.text_snapshots AS old
+    WHERE old.at_ms < ?
+      AND EXISTS (SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'text_snapshots' AND sql = ?)
+      AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE type = 'trigger' AND tbl_name = 'text_snapshots')
+      AND NOT EXISTS (SELECT 1 FROM temp.sqlite_schema WHERE type = 'trigger' AND tbl_name = 'text_snapshots')
+      AND EXISTS (
+        SELECT 1 FROM main.text_snapshots AS newer
+        WHERE newer.source_id = old.source_id AND newer.access_id = old.access_id
+          AND newer.host = old.host AND newer.path = old.path AND newer.id > old.id
+      )`);
+  let lastPruneAt = 0;
   function time(): number {
     const now = clock();
     if (!integer(now, 0)) throw new Error('invalid time');
@@ -164,7 +172,10 @@ function create(database: DatabaseSync, clock: () => number) {
       return row ? (JSON.parse(row.snapshot_json as string) as Filtered['snapshot']) : null;
     },
     prune(): void {
-      prune.run(time() - retentionMs);
+      const now = time();
+      if (now < lastPruneAt) return;
+      prune.run(now - retentionMs, `CREATE TABLE text_snapshots ${columns}`);
+      lastPruneAt = now;
     },
   };
 }

@@ -44,7 +44,7 @@ type Options = Readonly<{
   context: Context;
   page: Page;
   rows: (() => readonly Row[]) & { subscribe?: (listener: () => void) => () => void };
-  onLoginComplete: (sessionId: string) => boolean;
+  onLoginComplete: (sessionId: string) => boolean | Promise<boolean>;
   onOpen?: () => Promise<void>;
   logEvents?: () => readonly LogProtocolRow[];
   onRelease?: (sha: string) => Promise<boolean>;
@@ -131,7 +131,7 @@ async function attach({
     ownerFrame: frame,
     origin,
     endpoint,
-    complete: onLoginComplete,
+    complete: () => true,
   });
   const usedNonces = new Set<string>();
   let pending: Pending | null = null;
@@ -403,6 +403,7 @@ async function attach({
         pending = null;
         const result = confirmation.handle({ method: 'POST', path: endpoint, frame, origin, body });
         if (result === null || closed) throw new Error('refused');
+        if (!(await onLoginComplete(result.sessionId)) || closed) throw new Error('refused');
         dirty = false;
         await route.fulfill({ status: 200, headers, body: render() });
         return;

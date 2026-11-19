@@ -4,6 +4,9 @@ const { filterTextSnapshot, filterEventAddress, detectPaintMasks } =
   require('../../domain/snapshot-filter.ts') as typeof import('../../domain/snapshot-filter.ts');
 const { createHmac, randomBytes } = require('node:crypto') as typeof import('node:crypto');
 
+const readLimit = 32 * 1024;
+const readTruncation = ' «обрезано»';
+
 type Cdp = {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
   detach(): Promise<void>;
@@ -622,34 +625,105 @@ const documentObservation = `(() => {
 })()`;
 const bindingName = '__foliomeLoginObservation';
 // Only this adapter-owned script can call the binding in the named isolated world.
-function observationScript(sourceHost: string, approvedHosts: ReadonlySet<string>): string {
+function observationScript(origin: string): string {
   return `(() => {
-    if (globalThis.__foliomeLoginInstalled) return;
-    const allowed = ${JSON.stringify([sourceHost, ...approvedHosts])};
-    const source = allowed[0];
-    let url; try { url = new URL(location.href); } catch { return; }
-    const hostname = url.hostname.toLowerCase().replace(/\\.$/, '');
-    if (url.protocol !== 'https:' || url.port || url.username || url.password ||
-        !(hostname === source || hostname.endsWith('.' + source) || allowed.includes(hostname))) return;
-    globalThis.__foliomeLoginInstalled = true;
-    const field = el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement &&
-      ['text', 'password', 'email', 'tel', 'url', 'search'].includes(el.type);
-    const send = (el, manual) => {
-      if (!field(el)) return;
-      if (!el.getClientRects().length) return;
-      for (let node = el; node; node = node.parentElement) {
-        const style = getComputedStyle(node);
-        if (node.hidden || node.inert || node.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility !== 'visible' || Number(style.opacity) <= 0) return;
-      }
-      const type = el.type === 'password' ? 'password' : el.autocomplete === 'one-time-code' ? 'code' : 'login';
-      globalThis.${bindingName}(JSON.stringify({ manual, value: el.value, kind: type }));
+    if (location.protocol !== 'https:' || location.origin !== ${JSON.stringify(origin)} ||
+        globalThis.__foliomeLogin) return;
+    try {
+      for (let frame = window; frame !== top; frame = frame.parent)
+        if (frame.parent.location.origin !== location.origin) return;
+    } catch { return; }
+    const report = facts => globalThis.${bindingName}(JSON.stringify(facts));
+    const control = el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement &&
+      ['text', 'password', 'email', 'tel', 'url', 'search', 'number'].includes(el.type);
+    let previous = new WeakMap();
+    let stopped = false, valid = true, manualSent = false;
+    let root;
+    const events = ['beforeinput', 'input', 'change', 'paste', 'keydown', 'pointerdown', 'submit', 'click'];
+    const observe = el => {
+      const editable = el.isContentEditable && !el.parentElement?.isContentEditable;
+      if (!editable && !control(el)) return;
+      const value = editable ? el.textContent : el.value;
+      const kind = el.type === 'password' ? 'password' :
+        el.autocomplete === 'one-time-code' ? 'code' : 'login';
+      const last = previous.get(el);
+      if (last?.value === value && last?.kind === kind) return;
+      previous.set(el, { value, kind });
+      if (!value) return;
+      if (value.length > 16384) throw new Error();
+      report({ type: 'field', value, kind });
     };
-    const scan = () => { for (const el of document.querySelectorAll('input,textarea')) send(el, false); };
-    let manualSent = false;
-    for (const type of ['beforeinput', 'input', 'change', 'paste', 'keydown', 'pointerdown'])
-      addEventListener(type, event => { if (!event.isTrusted) return; if (!manualSent) { manualSent = true; globalThis.${bindingName}(JSON.stringify({ manual: true, value: '', kind: 'login' })); } send(event.target, true); if (type === 'keydown' && event.key === 'Enter') scan(); }, true);
-    for (const type of ['submit', 'click', 'pagehide'])
-      addEventListener(type, event => { if (event.isTrusted) scan(); }, true);
+    const scan = () => {
+      if (stopped || !valid) return false;
+      try {
+        if (root !== document.documentElement && document.documentElement) {
+          root = document.documentElement;
+          for (const type of events) addEventListener(type, handle, true);
+          addEventListener('pagehide', hide, true);
+          addEventListener('pageshow', show, true);
+        }
+        const scopes = [document];
+        let visited = 0;
+        for (let i = 0; i < scopes.length; i++) {
+          const walker = document.createTreeWalker(scopes[i], NodeFilter.SHOW_ELEMENT);
+          for (let el = walker.nextNode(); el; el = walker.nextNode()) {
+            if (++visited > 20000) throw new Error();
+            if (el.shadowRoot) scopes.push(el.shadowRoot);
+            observe(el);
+          }
+        }
+        return true;
+      } catch {
+        valid = false;
+        report({ type: 'unknown' });
+        return false;
+      }
+    };
+    function handle(event) {
+      const type = event.type;
+      if (event.isTrusted && !manualSent && !['click', 'submit'].includes(type)) {
+        manualSent = true;
+        report({ type: 'manual' });
+      }
+      if (type === 'submit' || type === 'click' || type === 'keydown' && event.key === 'Enter') {
+        checkpoint();
+        queueMicrotask(checkpoint);
+      } else if (['beforeinput', 'input', 'change', 'paste'].includes(type)) {
+        scan();
+        queueMicrotask(scan);
+      }
+    }
+    function checkpoint() {
+      if (!scan()) return false;
+      report({ type: 'checkpoint' });
+      return true;
+    }
+    function hide() {
+      checkpoint();
+    }
+    function show() {
+      report({ type: 'resumed' });
+      scan();
+    }
+    const observer = new MutationObserver(scan);
+    observer.observe(document, { subtree: true, childList: true, attributes: true });
+    const timer = setInterval(scan, 100);
+    globalThis.__foliomeLogin = {
+      checkpoint,
+      finish() {
+        if (!document.documentElement || !scan()) return false;
+        stopped = true;
+        previous = new WeakMap();
+        clearInterval(timer);
+        observer.disconnect();
+        for (const type of events) removeEventListener(type, handle, true);
+        removeEventListener('pagehide', hide, true);
+        removeEventListener('pageshow', show, true);
+        return true;
+      },
+    };
+    report({ type: 'started' });
+    scan();
   })()`;
 }
 const deadline = 5000;
@@ -1320,7 +1394,7 @@ function trustedUrl(
 
 async function prepare(
   cdp: Cdp,
-  config: { sourceHost: string; approvedHosts?: readonly string[] },
+  config: { sourceHost: string; sourceOrigin?: string; approvedHosts?: readonly string[] },
 ) {
   const descriptorKey = randomBytes(32);
   let closed = false;
@@ -1333,6 +1407,8 @@ async function prepare(
     manualInputSeen = false,
     observationFinished = false;
   let sourceHost = '';
+  let sourceOrigin = '';
+  const loginDocuments = new Map<number, boolean>();
   let approvedHosts = new Set<string>();
   const remember = (secret: Secret) => {
     if (observationFinished || !secret.value) return;
@@ -1350,46 +1426,61 @@ async function prepare(
   }: {
     context: { id: number; name: string; origin: string; auxData?: { frameId?: string } };
   }) => {
-    if (
-      context.name === worldName &&
-      context.auxData?.frameId &&
-      trustedUrl(context.origin, sourceHost, approvedHosts)
-    )
+    if (context.name === worldName && context.auxData?.frameId && trustedPage(context.origin))
       contexts.set(context.id, { frameId: context.auxData.frameId, origin: context.origin });
   };
+  const forgetDocument = (id: number) => {
+    if (!observationFinished && loginDocuments.get(id) === false) overflow = true;
+    loginDocuments.delete(id);
+  };
   const contextDestroyed = ({ executionContextId }: { executionContextId: number }) => {
+    forgetDocument(executionContextId);
     contexts.delete(executionContextId);
   };
   const contextsCleared = () => {
+    for (const id of loginDocuments.keys()) forgetDocument(id);
     contexts.clear();
+  };
+  const trustedPage = (raw: string): boolean => {
+    try {
+      const address = new URL(raw);
+      return config.sourceOrigin !== undefined
+        ? address.protocol === 'https:' &&
+            address.origin === sourceOrigin &&
+            !address.username &&
+            !address.password
+        : trustedUrl(raw, sourceHost, approvedHosts);
+    } catch {
+      return false;
+    }
   };
   const frameNavigated = ({ frame }: { frame: { id: string; url: string } }) => {
     frameUrls.set(frame.id, frame.url);
   };
   const bindingCalled = (event: { name: string; payload: string; executionContextId: number }) => {
-    if (closed || event.name !== bindingName) return;
-    const context = contexts.get(event.executionContextId);
-    const url = context && frameUrls.get(context.frameId);
-    if (
-      !context ||
-      !url ||
-      !trustedUrl(url, sourceHost, approvedHosts) ||
-      new URL(url).origin !== context.origin
-    )
+    if (closed || observationFinished || event.name !== bindingName) return;
+    const id = event.executionContextId;
+    const context = contexts.get(id);
+    if (!context || context.origin !== sourceOrigin) return;
+    const url = frameUrls.get(context.frameId);
+    if (!url || new URL(url).origin !== sourceOrigin) {
+      overflow = true;
       return;
+    }
     try {
       const data: unknown = JSON.parse(event.payload);
-      if (
-        !record(data) ||
-        typeof data.manual !== 'boolean' ||
-        typeof data.value !== 'string' ||
-        !['login', 'password', 'code'].includes(String(data.kind))
+      if (!record(data)) throw new Error();
+      if (data.type === 'started' || data.type === 'resumed') loginDocuments.set(id, false);
+      else if (data.type === 'checkpoint') loginDocuments.set(id, true);
+      else if (data.type === 'manual') manualInputSeen = true;
+      else if (
+        data.type === 'field' &&
+        typeof data.value === 'string' &&
+        (data.kind === 'login' || data.kind === 'password' || data.kind === 'code')
       ) {
-        overflow = true;
-        return;
-      }
-      manualInputSeen ||= data.manual;
-      remember({ value: data.value, kind: data.kind as Secret['kind'] });
+        loginDocuments.set(id, false);
+        remember({ value: data.value, kind: data.kind });
+      } else overflow = true;
     } catch {
       overflow = true;
     }
@@ -1405,6 +1496,14 @@ async function prepare(
   try {
     if (!config || !Array.isArray(config.approvedHosts ?? [])) throw new Error();
     sourceHost = configuredHost(config.sourceHost);
+    sourceOrigin = config.sourceOrigin ?? new URL('https://' + sourceHost).origin;
+    const source = new URL(sourceOrigin);
+    if (
+      source.protocol !== 'https:' ||
+      source.origin !== sourceOrigin ||
+      source.hostname.replace(/\.$/, '') !== sourceHost
+    )
+      throw new Error();
     approvedHosts = new Set((config.approvedHosts ?? []).map(configuredHost));
     cdp.on('Runtime.executionContextCreated', contextCreated);
     cdp.on('Runtime.executionContextDestroyed', contextDestroyed);
@@ -1423,7 +1522,7 @@ async function prepare(
     await bounded(() =>
       cdp.send('Runtime.addBinding', { name: bindingName, executionContextName: worldName }),
     );
-    const script = observationScript(sourceHost, approvedHosts);
+    const script = observationScript(sourceOrigin);
     const registered = await bounded(() =>
       cdp.send('Page.addScriptToEvaluateOnNewDocument', {
         source: script,
@@ -1446,8 +1545,7 @@ async function prepare(
           if (!record(response)) throw new Error();
           const root = tree(response.frameTree);
           const rootHost = host(root.frame.url);
-          if (!rootHost || !trustedUrl(root.frame.url, sourceHost, approvedHosts))
-            throw new Error();
+          if (!rootHost || !trustedPage(root.frame.url)) throw new Error();
           const frames: FrameFact[] = [],
             nodes: NodeFact[] = [],
             secrets: Secret[] = [];
@@ -1469,8 +1567,7 @@ async function prepare(
           ): Promise<void> => {
             if (frames.length >= 256) throw new Error();
             const frameHost = host(frame.frame.url);
-            const foreign =
-              foreignAncestor || !trustedUrl(frame.frame.url, sourceHost, approvedHosts);
+            const foreign = foreignAncestor || !trustedPage(frame.frame.url);
             const index = frames.length;
             const fact: FrameFact = { index, host: frameHost, foreign, unavailable: false };
             frames.push(fact);
@@ -1509,7 +1606,7 @@ async function prepare(
                 )
                   throw new Error();
                 if (
-                  !trustedUrl(data.url, sourceHost, approvedHosts) ||
+                  !trustedPage(data.url) ||
                   new URL(data.url).href !== new URL(frame.frame.url).href ||
                   host(data.url) !== frameHost
                 )
@@ -1586,7 +1683,7 @@ async function prepare(
             const embedHost = host(embed.url);
             if (
               embedHost &&
-              !trustedUrl(embed.url, sourceHost, approvedHosts) &&
+              !trustedPage(embed.url) &&
               !frames.some((f) => f.host === embedHost && f.foreign)
             ) {
               if (frames.length >= 256) throw new Error();
@@ -1631,7 +1728,10 @@ async function prepare(
         throw new Error('internal');
       }
     }
-    function projectTargets(result: Awaited<ReturnType<typeof collect>>) {
+    function projectTargets(
+      result: Awaited<ReturnType<typeof collect>>,
+      filtered = filterTextSnapshot(result.facts),
+    ) {
       const {
         facts,
         rootNodeCount,
@@ -1641,7 +1741,6 @@ async function prepare(
         rootActionFacts,
         rootSemantics,
       } = result;
-      const filtered = filterTextSnapshot(facts);
       if (
         !filtered.ok ||
         closed ||
@@ -1691,20 +1790,114 @@ async function prepare(
           text: element?.text ?? '',
         };
       });
-      return { candidates, elements };
+      return { candidates };
+    }
+    async function verifyLogin(finish: boolean) {
+      try {
+        await bounded(async () => {
+          const response = await cdp.send('Page.getFrameTree');
+          if (!record(response)) throw new Error();
+          const initial = tree(response.frameTree);
+          if (!finish && initial.frame.url === 'about:blank' && !loginDocuments.size) return;
+          if (!trustedPage(initial.frame.url) || new URL(initial.frame.url).origin !== sourceOrigin)
+            throw new Error();
+          let count = 0;
+          const visited = new Map<number, string>();
+          const verify = async (frame: FrameTree): Promise<void> => {
+            if (closed || overflow || ++count > 256) throw new Error();
+            const url = new URL(frame.frame.url);
+            if (url.protocol !== 'https:' || url.origin !== sourceOrigin) return;
+            const entries = [...contexts].filter(
+              ([id, known]) => known.frameId === frame.frame.id && loginDocuments.has(id),
+            );
+            if (entries.length !== 1) throw new Error();
+            const [contextId] = entries[0];
+            const method = finish ? 'finish' : 'checkpoint';
+            const checked = await cdp.send('Runtime.evaluate', {
+              expression: `location.href === ${JSON.stringify(url.href)} && globalThis.__foliomeLogin?.${method}() === true`,
+              contextId,
+              returnByValue: true,
+            });
+            if (
+              !record(checked) ||
+              checked.exceptionDetails ||
+              !record(checked.result) ||
+              checked.result.value !== true
+            )
+              throw new Error();
+            visited.set(contextId, frame.frame.id);
+            for (const child of frame.childFrames ?? []) await verify(child);
+          };
+          await verify(initial);
+          const frames = new Set(visited.values());
+          const dom = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+          if (!record(dom) || !record(dom.root)) throw new Error();
+          const pending: unknown[] = [dom.root];
+          let nodes = 0;
+          while (pending.length) {
+            const node = pending.pop();
+            if (!record(node) || ++nodes > 20000 || node.shadowRootType === 'closed')
+              throw new Error();
+            for (const child of Array.isArray(node.children) ? node.children : [])
+              pending.push(child);
+            for (const root of Array.isArray(node.shadowRoots) ? node.shadowRoots : []) {
+              if (!record(root) || root.shadowRootType !== 'user-agent') pending.push(root);
+            }
+            if (
+              typeof node.frameId === 'string' &&
+              frames.has(node.frameId) &&
+              node.contentDocument
+            )
+              pending.push(node.contentDocument);
+          }
+          if (finish) {
+            if (scriptId)
+              await cdp.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId });
+            scriptId = undefined;
+            await cdp.send('Runtime.removeBinding', { name: bindingName });
+          }
+          const check = await cdp.send('Page.getFrameTree');
+          if (
+            closed ||
+            overflow ||
+            !record(check) ||
+            JSON.stringify(tree(check.frameTree)) !== JSON.stringify(initial) ||
+            [...visited].some(([id, frameId]) => contexts.get(id)?.frameId !== frameId)
+          )
+            throw new Error();
+          // The binding reports from each verified document precede its evaluation reply.
+        });
+      } catch {
+        overflow = true;
+        throw new Error('internal');
+      }
     }
     return {
-      eventAddress(raw: string) {
+      eventAddress(raw: string, configuredEntry = false) {
         if (closed || overflow) throw new Error('internal');
-        return filterEventAddress(raw, [...history.values()]);
+        const address = new URL(raw);
+        if (!observationFinished && !configuredEntry) {
+          if (address.origin !== sourceOrigin) return { host: '…', path: '/…' };
+          address.pathname = '/…';
+        }
+        return filterEventAddress(address.href, [...history.values()]);
       },
       loginObservations() {
         if (closed) throw new Error('internal');
         return { manualInputSeen, hasKnownSecret: history.size > 0 || overflow };
       },
-      finishLoginObservation() {
-        if (closed) throw new Error('internal');
+      async checkpointLogin() {
+        if (closed || overflow) throw new Error('internal');
+        if (!observationFinished) await verifyLogin(false);
+      },
+      async finishLoginObservation() {
+        if (closed || overflow || observationFinished) throw new Error('internal');
+        await verifyLogin(true);
         observationFinished = true;
+        removeListeners();
+        loginDocuments.clear();
+        contexts.clear();
+        frameUrls.clear();
       },
       async collectText(snapshot: number): Promise<unknown> {
         const { facts } = await collect(snapshot);
@@ -1723,7 +1916,26 @@ async function prepare(
       ): Promise<{ ok: true; text: string } | { ok: false; code: 'stale' | 'internal' }> {
         try {
           const result = await collect(snapshot);
-          const { candidates, elements } = projectTargets(result);
+          const included = new Set<number>();
+          for (const node of result.facts.nodes.slice(0, result.rootNodeCount)) {
+            if (node.snapshotOnly) continue;
+            if (
+              node.n === nodeNumber ||
+              (deep && node.parent !== undefined && included.has(node.parent))
+            )
+              included.add(node.n);
+          }
+          const bytes = Buffer.alloc(readLimit);
+          let size = 0;
+          let truncated = false;
+          const filtered = filterTextSnapshot(result.facts, (number, text) => {
+            if (truncated || !included.has(number) || !text) return;
+            const chunk = (size ? ' ' : '') + text;
+            const written = bytes.write(chunk, size, 'utf8');
+            size += written;
+            truncated = written < Buffer.byteLength(chunk);
+          });
+          const { candidates } = projectTargets(result, filtered);
           const matches = candidates.filter((candidate) => candidate.nodeNumber === nodeNumber);
           const target = matches[0];
           if (
@@ -1738,18 +1950,12 @@ async function prepare(
             target.prohibited !== null
           )
             return { ok: false, code: 'stale' };
-          const included = new Set([nodeNumber]);
-          const texts: string[] = [];
-          for (const node of result.facts.nodes.slice(0, result.rootNodeCount)) {
-            if (node.snapshotOnly) continue;
-            if (deep && node.parent !== undefined && included.has(node.parent))
-              included.add(node.n);
-            if (included.has(node.n)) {
-              const element = elements.get(node.n);
-              if (element?.text) texts.push(element.text);
-            }
+          if (truncated) {
+            let end = Math.min(size, readLimit - Buffer.byteLength(readTruncation));
+            while ((bytes[end] & 0b1100_0000) === 0b1000_0000) end--;
+            return { ok: true, text: bytes.toString('utf8', 0, end) + readTruncation };
           }
-          return { ok: true, text: texts.join(' ') };
+          return { ok: true, text: bytes.toString('utf8', 0, size) };
         } catch {
           return { ok: false, code: 'internal' };
         }
@@ -2015,6 +2221,7 @@ async function prepare(
         contexts.clear();
         frameUrls.clear();
         history.clear();
+        loginDocuments.clear();
         historySize = 0;
         let failed = false;
         try {
@@ -2039,6 +2246,7 @@ async function prepare(
     contexts.clear();
     frameUrls.clear();
     history.clear();
+    loginDocuments.clear();
     try {
       await bounded(() => cdp.detach());
     } catch {}

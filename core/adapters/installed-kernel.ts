@@ -20,6 +20,8 @@ const { createAdmittedChannel } =
 const { startExecutor } = require('./executor/start.ts') as typeof import('./executor/start.ts');
 const { prepareDomCollector: prepare } =
   require('./browser/collect-dom.ts') as typeof import('./browser/collect-dom.ts');
+const { protectSourceNetwork } =
+  require('./browser/source-network.ts') as typeof import('./browser/source-network.ts');
 const { attachOwnerWindow: attach } =
   require('./ui/owner-window.ts') as typeof import('./ui/owner-window.ts');
 const { openSystemSocket, createSocketConfiguration } =
@@ -37,10 +39,14 @@ type Page = OwnerPage & {
 };
 type Context = OwnerContext & {
   newPage(): Promise<Page>;
-  newCDPSession(page: Page): Promise<Cdp>;
+  newCDPSession(page: Page): Promise<Cdp & Parameters<typeof protectSourceNetwork>[0]>;
   close(): Promise<void>;
 };
-type Chrome = { newContext(): Promise<Context>; close(): Promise<void> };
+type Chrome = {
+  newContext(options?: { serviceWorkers: 'block' }): Promise<Context>;
+  close(): Promise<void>;
+  isConnected(): boolean;
+};
 type Paths = {
   home: string;
   app: string;
@@ -62,6 +68,8 @@ type Options = {
   observeMacOS(paths: Paths): Promise<Observation>;
   runProcess: Parameters<typeof startExecutor>[0]['run'];
   launchChrome(): Promise<Chrome>;
+  settleChromeLaunch?(): Promise<void>;
+  now?(): number;
   supervisedRelease?: boolean;
   peerUid?: (socket: Socket) => Promise<number>;
   configureSocket?: (file: string) => Promise<void>;
@@ -85,6 +93,9 @@ async function createInstalled(options: Options) {
   await mkdir(path.dirname(options.paths.database), { recursive: true, mode: 0o700 });
   await mkdir(path.dirname(options.paths.socket), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(options.paths.database);
+  const now = options.now ?? Date.now;
+  const retentionCadence = 24 * 60 * 60 * 1000;
+  let retentionTimer: ReturnType<typeof setInterval> | undefined;
   let ownerBrowser: Chrome | undefined, sourceBrowser: Chrome | undefined;
   let ownerContext: Context | undefined, sourceContext: Context | undefined;
   let owner: Page | undefined,
@@ -104,12 +115,13 @@ async function createInstalled(options: Options) {
   let worker: { stop(): void | Promise<void> } | undefined;
   let channelClose: (() => Promise<void>) | undefined;
   let closePromise: Promise<void> | undefined;
+  let closingSource: Promise<void> | undefined;
   let protocol: ReturnType<typeof createActionProtocol> | undefined;
   let firstSession = true;
   let startupLogUnavailable = false;
   const log = createTechnicalLog({
     directory: path.join(options.paths.data, 'logs'),
-    now: () => new Date(),
+    now: () => new Date(now()),
     onUnavailable(code, sessionId) {
       if (closed) return;
       if (firstSession) startupLogUnavailable = true;
@@ -161,41 +173,75 @@ async function createInstalled(options: Options) {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
   });
-  async function closeSource() {
+  async function closeWithin(operation: () => Promise<void>): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        operation(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('source-close-failed')), 5000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  function closeSource(): Promise<void> {
+    if (closingSource) return closingSource;
     generation++;
     log.endSession();
     running = false;
     stopWorker();
-    const oldCollector = collector,
-      oldContext = sourceContext,
-      oldBrowser = sourceBrowser;
+    const oldCollector = collector;
     collector = undefined;
-    sourceContext = undefined;
-    sourceBrowser = undefined;
     sourcePage = undefined;
     cdp = undefined;
-    try {
-      await oldCollector?.close();
-    } catch {
-      /* Continue releasing resources. */
-    }
-    try {
-      await oldContext?.close();
-    } catch {
-      /* Continue releasing resources. */
-    }
-    try {
-      await oldBrowser?.close();
-    } catch {
-      /* Continue releasing resources. */
-    } finally {
-      preparationBusy = false;
-      window?.cancel();
-    }
+    const release = async () => {
+      const privateCleanup: Promise<void>[] = [];
+      if (oldCollector) privateCleanup.push(closeWithin(() => oldCollector.close()));
+      const context = sourceContext;
+      if (context)
+        privateCleanup.push(
+          closeWithin(async () => {
+            await context.close();
+            if (sourceContext === context) sourceContext = undefined;
+          }),
+        );
+      await Promise.allSettled(privateCleanup);
+      const browser = sourceBrowser;
+      if (browser) {
+        await closeWithin(async () => {
+          await browser.close();
+          if (browser.isConnected()) throw new Error('source-close-failed');
+          if (sourceBrowser === browser) {
+            sourceBrowser = undefined;
+            sourceContext = undefined;
+            preparationBusy = false;
+            window?.cancel();
+          }
+        });
+      } else {
+        await closeWithin(async () => {
+          await options.settleChromeLaunch?.();
+          preparationBusy = false;
+          window?.cancel();
+        });
+      }
+    };
+    closingSource = release()
+      .catch(() => {
+        window?.setStatus('session-unavailable');
+        throw new Error('source-close-failed');
+      })
+      .finally(() => {
+        closingSource = undefined;
+      });
+    return closingSource;
   }
   async function close() {
     if (closePromise) return closePromise;
     closed = true;
+    clearInterval(retentionTimer);
     generation++;
     running = false;
     stopWorker();
@@ -206,7 +252,10 @@ async function createInstalled(options: Options) {
       } catch {
         /* Continue releasing resources. */
       }
-      await closeSource();
+      const sourceClosed = await closeSource().then(
+        () => true,
+        () => false,
+      );
       for (const socket of sockets) socket.destroy();
       await channelClose?.();
       try {
@@ -221,20 +270,33 @@ async function createInstalled(options: Options) {
       }
       db.close();
       updates?.close();
+      if (!sourceClosed) throw new Error('source-close-failed');
       if (releasingSha) updates?.finish(releasingSha);
       else if (updates && process.connected) process.disconnect?.();
     })();
     return closePromise;
   }
   try {
-    protocol = createActionProtocol(db, Date.now);
-    const store = createTextSnapshotStore(db, Date.now);
+    protocol = createActionProtocol(db, now);
+    const store = createTextSnapshotStore(db, now);
+    const pruneSnapshots = () => {
+      if (closed) return;
+      try {
+        store.prune();
+      } catch {
+        // Retry at the next scheduled maintenance if the clock or database is unavailable.
+      }
+    };
+    pruneSnapshots();
+    retentionTimer = setInterval(pruneSnapshots, retentionCadence);
+    retentionTimer.unref();
     const browser: Parameters<typeof createPreparationRuntime>[0]['browser'] = {
       async openSource(sessionId) {
         const token = generation;
         const startedAt = performance.now();
         if (firstSession) {
           firstSession = false;
+          pruneSnapshots();
           const unavailable = startupLogUnavailable;
           startupLogUnavailable = false;
           if (unavailable && !runtime!.recordLogUnavailable(sessionId, 'log-unavailable'))
@@ -248,7 +310,7 @@ async function createInstalled(options: Options) {
         try {
           sourceBrowser = await options.launchChrome();
           check();
-          sourceContext = await sourceBrowser.newContext();
+          sourceContext = await sourceBrowser.newContext({ serviceWorkers: 'block' });
           check();
           sourcePage = await sourceContext.newPage();
           check();
@@ -263,14 +325,16 @@ async function createInstalled(options: Options) {
           });
           await sourceContext.route('**/*', async (route) => {
             try {
-              const request = route.request() as ReturnType<typeof route.request> & {
-                isNavigationRequest(): boolean;
-              };
+              const request = route.request();
+              const frame = request.frame() as { page(): unknown };
               const destination = new URL(request.url());
               if (
+                closed ||
+                generation !== token ||
+                frame.page() !== page ||
                 destination.protocol !== 'https:' ||
                 (request.isNavigationRequest() &&
-                  request.frame() === page.mainFrame() &&
+                  frame === page.mainFrame() &&
                   destination.origin !== url.origin)
               )
                 throw new Error('refused');
@@ -284,9 +348,18 @@ async function createInstalled(options: Options) {
             }
           });
           check();
+          await protectSourceNetwork(
+            await sourceContext.newCDPSession(page),
+            url.origin,
+            () => !closed && generation === token,
+            () => {
+              void runtime?.closeSource().catch(() => {});
+            },
+          );
+          check();
           cdp = await sourceContext.newCDPSession(page);
           check();
-          collector = await prepare(cdp, { sourceHost: url.hostname });
+          collector = await prepare(cdp, { sourceHost: url.hostname, sourceOrigin: url.origin });
           check();
           const localCollector = collector;
           let navigationMethod = 'GET';
@@ -300,7 +373,7 @@ async function createInstalled(options: Options) {
             if (closed || generation !== token || collector !== localCollector) return;
             let recorded: boolean;
             try {
-              const address = localCollector.eventAddress(raw);
+              const address = localCollector.eventAddress(raw, raw === url.href);
               const verb =
                 (['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as const).find(
                   (value) => value === method,
@@ -322,10 +395,13 @@ async function createInstalled(options: Options) {
               });
           };
           events.on('framenavigated', ((frame: { url(): string }) => {
-            if (frame !== page.mainFrame() || frame.url() === 'about:blank') return;
+            if (frame !== page.mainFrame()) return;
+            const address = frame.url();
             const method = navigationMethod;
             navigationMethod = 'other';
-            write('main-frame-navigation', method, frame.url());
+            // A refused load can commit Chrome's local error document instead of a source URL.
+            if (address === 'about:blank' || address === 'chrome-error://chromewebdata/') return;
+            write('main-frame-navigation', method, address);
           }) as (value: never) => void);
           events.on('request', ((request: {
             method(): string;
@@ -354,6 +430,7 @@ async function createInstalled(options: Options) {
       observeTargets: (...args) => collector!.observeTargets(...args),
       readObservedTarget: (...args) => collector!.readObservedTarget(...args),
       loginObservations: () => collector!.loginObservations(),
+      checkpointLogin: () => collector!.checkpointLogin(),
       finishLoginObservation: () => collector!.finishLoginObservation(),
       capturePng: (viewport) => captureViewportPng(cdp!, viewport),
     };
@@ -364,7 +441,7 @@ async function createInstalled(options: Options) {
         browser,
         protocol,
         store,
-        now: Date.now,
+        now,
         sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         executorRunning: () => running && !closed,
         protocolUnavailable,
@@ -379,7 +456,7 @@ async function createInstalled(options: Options) {
     ownerContext = await ownerBrowser.newContext();
     owner = await ownerContext.newPage();
     owner.on('close', () => {
-      void close();
+      void close().catch(() => {});
     });
     async function openSource(refresh = true) {
       if (closed || releaseHandoff || preparationBusy) throw new Error('session-unavailable');
@@ -415,9 +492,10 @@ async function createInstalled(options: Options) {
             return true;
           }
         : undefined,
-      onLoginComplete(sessionId) {
-        if (closed || !runtime!.confirmLogin(sessionId)) return false;
+      async onLoginComplete(sessionId) {
         const token = generation;
+        if (closed || !(await runtime!.confirmLogin(sessionId)) || closed || token !== generation)
+          return false;
         workers++;
         void (async () => {
           let observation: Observation | undefined;

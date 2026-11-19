@@ -420,7 +420,11 @@ async function runInstalledImpl(run: typeof runProgram) {
         canary: await canary(),
       });
     };
+    type Chrome = Awaited<ReturnType<Options['launchChrome']>>;
+    let settleLateLaunch: (() => Promise<void>) | undefined;
     const launchChrome: Options['launchChrome'] = async () => {
+      if (settleLateLaunch) throw Error('source-close-failed');
+      let starting: Promise<Chrome> | undefined;
       const result = await startVerifiedChrome(
         {
           verify: async (file, args, signal) => {
@@ -431,18 +435,46 @@ async function runInstalledImpl(run: typeof runProgram) {
               return false;
             }
           },
-          launch: async (options) => {
+          launch: (options) => {
             const playwright = require('playwright-core') as {
-              chromium: {
-                launch(options: object): Promise<Awaited<ReturnType<Options['launchChrome']>>>;
-              };
+              chromium: { launch(options: object): Promise<Chrome> };
             };
-            return playwright.chromium.launch(options);
+            starting = playwright.chromium.launch(options).then((browser) => {
+              let closing: Promise<void> | undefined;
+              return {
+                newContext: browser.newContext.bind(browser),
+                isConnected: browser.isConnected.bind(browser),
+                close() {
+                  if (closing) return closing;
+                  const attempt = browser.close().then(() => {
+                    if (browser.isConnected()) throw Error('source-close-failed');
+                  });
+                  closing = attempt;
+                  void attempt.catch(() => {
+                    closing = undefined;
+                  });
+                  return attempt;
+                },
+              };
+            });
+            return starting;
           },
         },
         15000,
       );
-      if (!result.ok) throw Error(result.code);
+      if (!result.ok) {
+        if (result.code === 'chrome-timeout' && starting) {
+          const launch = starting;
+          const settle = async () => {
+            const browser = await launch.catch(() => undefined);
+            await browser?.close();
+            if (settleLateLaunch === settle) settleLateLaunch = undefined;
+          };
+          settleLateLaunch = settle;
+          void settle().catch(() => {});
+        }
+        throw Error(result.code);
+      }
       return result.browser;
     };
     const runProcess: Options['runProcess'] = async (file, args, options) => {
@@ -497,6 +529,9 @@ async function runInstalledImpl(run: typeof runProgram) {
           if (options.executorUid !== installed.executorUid) throw Error();
           return createInstalledKernel({
             ...options,
+            async settleChromeLaunch() {
+              await settleLateLaunch?.();
+            },
             configureSocket: socketConfiguration(owner.uid, installed.executorName),
             supervisedRelease: process.connected === true,
           });
