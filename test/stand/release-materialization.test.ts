@@ -221,6 +221,11 @@ test('отказывает неверным архивам и метаданны
       if (kind === 'mode') bad[1] = { ...bad[1]!, mode: 0o755 } as any;
       if (kind === 'metadata') bad.shift();
       const archive = tar(bad);
+      if (kind === 'digest') {
+        // The gzip OS field changes the archive bytes without changing its files.
+        archive[9] = archive[9]! ^ 1;
+        assert.deepEqual(zlib.gunzipSync(archive), zlib.gunzipSync(f.archive));
+      }
       await fs.writeFile(path.join(f.stagingDir, '.release-artifacts/playwrightCore'), archive);
       if (kind !== 'digest') {
         f.stage.archive.sha256 = digest(archive);
